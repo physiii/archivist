@@ -18,7 +18,7 @@ SNIPPET_LENGTH = 1500  # Length of text snippet to store with each document
 
 # Embedding Model Configuration
 LOCAL_EMBEDDING_MODEL = "local_model"
-LOCAL_EMBEDDING_DIM = 1536  # Adjusted to match your local model's dimension
+LOCAL_EMBEDDING_DIM = 384  # Adjusted to match the actual embedding service output
 DEFAULT_EMBEDDING_MODEL = LOCAL_EMBEDDING_MODEL
 EMBEDDING_DIMENSIONS = {
     "local_model": LOCAL_EMBEDDING_DIM,
@@ -28,14 +28,14 @@ EMBEDDING_DIMENSIONS = {
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
-def embed_text_to_vector(text_chunks, model, is_local=True):
+def embed_text_to_vector(text_chunks, model, is_local=True, ip_address="localhost", embedding_host="localhost"):
     vectors = []
     for chunk in text_chunks:
         try:
             if is_local:
                 # Use local embedding API
                 response = requests.post(
-                    'http://127.0.0.1:8000/embed',
+                    f'http://{embedding_host}:8000/embed',
                     json={'text': chunk},
                     headers={'Content-Type': 'application/json'}
                 )

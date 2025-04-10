@@ -3,7 +3,7 @@ import os
 import logging
 from datetime import datetime
 from hashlib import sha256
-from pymilvus import connections, FieldSchema, CollectionSchema, DataType
+from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
 from tqdm import tqdm
 import traceback
 
@@ -19,7 +19,6 @@ from utils import (
 logging.basicConfig(level=logging.DEBUG)
 
 def clear_collection(collection_name):
-    from pymilvus import Collection, utility
     if utility.has_collection(collection_name):
         collection = Collection(name=collection_name)
         collection.drop()
@@ -27,8 +26,8 @@ def clear_collection(collection_name):
     else:
         logging.info(f"Collection {collection_name} does not exist. Nothing to clear.")
 
-def clear_vectorstore_collection(collection_name):
-    connections.connect("default", host='localhost', port='19530')
+def clear_vectorstore_collection(collection_name, ip_address="localhost"):
+    connections.connect("default", host=ip_address, port='19530')
 
     # Standardize collection naming
     collection_name = f"documents_{collection_name}"
@@ -176,81 +175,163 @@ def load_to_vectorstore(args):
     logging.info(f"Operation completed in {end_time - start_time}.")
 
 def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
-                             line_by_line=False, chunk_size=1000, overlap=0):
-    connections.connect("default", host='localhost', port='19530')
+                             line_by_line=False, chunk_size=1000, overlap=0, ip_address="localhost", embedding_host="localhost"):
+    logging.info(f"Starting load_text_to_vectorstore: collection={collection_name}, model={embedding_model}, ip={ip_address}")
+    
+    try:
+        logging.info("Connecting to Milvus...")
+        connections.connect("default", host=ip_address, port='19530')
+        logging.info("Connected to Milvus successfully")
 
-    # Use local embedding model as default
-    embedding_model = embedding_model or LOCAL_EMBEDDING_MODEL
-    is_local = embedding_model == LOCAL_EMBEDDING_MODEL
+        # Use local embedding model as default
+        embedding_model = embedding_model or LOCAL_EMBEDDING_MODEL
+        is_local = embedding_model == LOCAL_EMBEDDING_MODEL
+        logging.info(f"Using embedding model: {embedding_model}, is_local={is_local}")
 
-    # Standardize collection naming
-    if collection_name:
-        collection_name = f"documents_{collection_name}"
-    else:
-        collection_name = f"documents_{embedding_model.replace('-', '_')}"
+        # Standardize collection naming
+        if collection_name:
+            collection_name = f"documents_{collection_name}"
+        else:
+            collection_name = f"documents_{embedding_model.replace('-', '_')}"
+        logging.info(f"Using collection name: {collection_name}")
 
-    # Use local embedding dimension if using local model
-    embedding_dim = LOCAL_EMBEDDING_DIM if is_local else EMBEDDING_DIMENSIONS.get(embedding_model, LOCAL_EMBEDDING_DIM)
+        # Use local embedding dimension if using local model
+        embedding_dim = LOCAL_EMBEDDING_DIM if is_local else EMBEDDING_DIMENSIONS.get(embedding_model, LOCAL_EMBEDDING_DIM)
+        logging.info(f"Embedding dimension: {embedding_dim}")
 
-    fields = [
-        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=embedding_dim),
-        FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
-        FieldSchema(name="hash", dtype=DataType.VARCHAR, max_length=64),
-        FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=64),
-        FieldSchema(name="creation_date", dtype=DataType.INT64)
-    ]
-    schema = CollectionSchema(fields, description="Text Collection")
+        # Check if collection exists and has the correct dimension. Drop if incorrect.
+        if utility.has_collection(collection_name):
+            logging.info(f"Collection {collection_name} exists. Checking schema...")
+            existing_collection = Collection(name=collection_name)
+            existing_schema = existing_collection.schema
+            vector_field_exists = False
+            correct_dimension = False
+            for field in existing_schema.fields:
+                if field.name == "vector":
+                    vector_field_exists = True
+                    if field.params.get('dim') == embedding_dim:
+                        correct_dimension = True
+                    else:
+                        logging.warning(f"Existing collection '{collection_name}' vector field dimension ({field.params.get('dim')}) does not match expected dimension ({embedding_dim}).")
+                    break
+            
+            if not vector_field_exists:
+                logging.warning(f"Existing collection '{collection_name}' does not have a 'vector' field. Dropping collection.")
+                existing_collection.drop()
+                logging.info(f"Collection '{collection_name}' dropped.")
+            elif not correct_dimension:
+                logging.warning(f"Existing collection '{collection_name}' has incorrect vector dimension. Dropping collection.")
+                existing_collection.drop()
+                logging.info(f"Collection '{collection_name}' dropped.")
+            else:
+                logging.info(f"Existing collection '{collection_name}' has correct schema.")
 
-    collection = ensure_collection_exists(collection_name, schema)
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=embedding_dim),
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
+            FieldSchema(name="hash", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="creation_date", dtype=DataType.INT64)
+        ]
+        schema = CollectionSchema(fields, description="Text Collection")
+        logging.info(f"Using schema with fields: {[f.name for f in fields]}")
 
-    if not collection.has_index():
-        index_params = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
-        collection.create_index(field_name="vector", index_params=index_params)
+        # SIMPLIFIED COLLECTION HANDLING - No reload
+        if utility.has_collection(collection_name):
+            logging.info(f"Collection {collection_name} already exists - using it")
+            collection = Collection(name=collection_name)
+        else:
+            logging.info(f"Collection {collection_name} does not exist - creating it")
+            collection = Collection(name=collection_name, schema=schema)
+            # Create index if collection is new
+            if not collection.has_index():
+                logging.info("Creating index on new collection...")
+                index_params = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
+                collection.create_index(field_name="vector", index_params=index_params)
+                logging.info("Index created successfully")
 
-    collection.load()
+        # ⚠️ IMPORTANT: Load collection ONLY ONCE at the beginning
+        logging.info("Loading collection (once)...")
+        collection.load()
+        logging.info("Collection loaded successfully")
 
-    results = []
+        # Get the entity count at the start
+        try:
+            initial_count = collection.num_entities
+            logging.info(f"Initial entity count: {initial_count}")
+        except Exception as e:
+            logging.warning(f"Unable to get initial entity count: {e}")
+            initial_count = 0
 
-    if line_by_line:
-        lines = text.split('\n')
-        for line in lines:
-            if line.strip():  # Skip empty lines
-                result = process_and_insert_lines(line, collection, embedding_model, embedding_dim, is_local)
-                results.append(result)
-    else:
-        # Chunking the text
-        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size-overlap)]
-
+        results = []
         creation_date = int(datetime.now().timestamp())
 
-        for chunk in chunks:
-            text_hash = sha256(chunk.encode()).hexdigest()
-            try:
-                vectors = embed_text_to_vector([chunk], embedding_model, is_local)
-                validated_vectors = validate_embeddings(vectors, embedding_dim)
+        # Generate embeddings for all chunks at once instead of one by one
+        if line_by_line:
+            logging.info("Processing text line by line")
+            chunks = [line for line in text.split('\n') if line.strip()]
+        else:
+            logging.info(f"Chunking text with size={chunk_size}, overlap={overlap}")
+            chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size-overlap)]
+        
+        logging.info(f"Generated {len(chunks)} chunks")
+        
+        # Generate all hashes
+        logging.info("Generating text hashes...")
+        hashes = [sha256(chunk.encode()).hexdigest() for chunk in chunks]
+        
+        # Get embeddings for all chunks at once
+        logging.info("Getting embeddings for all chunks...")
+        vectors = embed_text_to_vector(chunks, embedding_model, is_local, ip_address=ip_address, embedding_host=embedding_host)
+        logging.info(f"Got {len(vectors)} embeddings")
+        
+        # Validate all embeddings
+        logging.info("Validating embeddings...")
+        validated_vectors = validate_embeddings(vectors, embedding_dim)
+        valid_count = sum(1 for v in validated_vectors if v is not None)
+        logging.info(f"Validated embeddings: {valid_count} valid out of {len(validated_vectors)}")
 
-                if validated_vectors and validated_vectors[0] is not None:
-                    # Adjust data format to match Milvus's expectations
-                    data = [
-                        [validated_vectors[0]],  # vector field data (list of vectors)
-                        [chunk],                 # text field data
-                        [text_hash],             # hash field data
-                        [embedding_model],       # embedding_model field data
-                        [creation_date]          # creation_date field data
-                    ]
-                    fields = ["vector", "text", "hash", "embedding_model", "creation_date"]
-                    logging.info(f"Number of entities before insertion: {collection.num_entities}")
-                    collection.insert(data, fields=fields)
-                    collection.flush()  # Flush after insertion
-                    collection.load()
-                    logging.info(f"Number of entities after insertion: {collection.num_entities}")
-                    results.append({"status": "success", "hash": text_hash})
-                else:
-                    raise ValueError("Failed to generate valid embedding")
-            except Exception as e:
-                logging.error(f"Error generating embedding for chunk: {e}")
-                results.append({"status": "error", "message": f"Failed to generate valid embedding: {str(e)}"})
+        logging.info(f"Preparing {len(validated_vectors)} valid vectors for insertion.")
+        if not validated_vectors:
+            logging.warning("No valid vectors generated for insertion.")
+            return {"message": "No valid vectors to insert", "details": []}
 
-    connections.disconnect("default")
-    return results
+        # Ensure data structure matches schema field order: vector, text, hash, embedding_model, creation_date
+        data = [
+            validated_vectors, # vector
+            chunks,             # text (original chunks)
+            hashes,            # hash
+            [embedding_model] * len(validated_vectors), # embedding_model
+            [creation_date] * len(validated_vectors)    # creation_date
+        ]
+        logging.info(f"Inserting data into collection {collection_name}")
+        
+        try:
+            mr = collection.insert(data)
+            logging.info(f"Insertion result: {mr}")
+            # Check IDs to confirm insertion
+            inserted_ids = mr.primary_keys
+            results.append(f"Inserted {len(inserted_ids)} entities.")
+            logging.info(f"Successfully inserted {len(inserted_ids)} vectors for text batch.")
+
+            # Flush data immediately after insert
+            logging.info("Flushing inserted data...")
+            collection.flush()
+            logging.info("Data flushed successfully.")
+
+        except Exception as e:
+            logging.error(f"Error during Milvus insertion or flush: {str(e)}")
+            logging.error(traceback.format_exc())
+            # Return error details if insertion fails
+            return {"error": "Milvus insertion failed", "details": str(e), "traceback": traceback.format_exc()}
+
+    finally:
+        try:
+            connections.disconnect("default")
+            logging.info("Disconnected from Milvus")
+        except Exception as e:
+            # Log if disconnection fails but don't raise further
+            logging.warning(f"Failed to disconnect from Milvus: {str(e)}")
+            
+    return {"message": "Text loaded successfully", "details": results}
