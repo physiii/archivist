@@ -6,6 +6,7 @@ import argparse
 import logging
 import traceback
 from pymilvus import connections, utility
+from uuid import uuid4
 import os
 
 app = Flask(__name__)
@@ -82,25 +83,37 @@ def handle_vectorstore_request():
                     overlap=overlap
                 )
                 
+                if isinstance(result, dict) and result.get("error"):
+                    error_payload = {
+                        "error": result.get("error"),
+                        "details": result.get("details"),
+                    }
+                    if debug and result.get("traceback"):
+                        error_payload["traceback"] = result["traceback"]
+                    return jsonify(error_payload), 500
+
                 # For debug requests, add detailed diagnostics
                 if debug:
-                    # Try to fetch the collection info to verify it worked
-                    connections.connect("default", host=ip_address, port='19530')
-                    collection_name_formatted = f"documents_{collection_name}" if collection_name else "documents_local_model"
-                    collection_exists = utility.has_collection(collection_name_formatted)
-                    entity_count = 0
+                    debug_alias = f"debug_{uuid4().hex}"
+                    try:
+                        connections.connect(debug_alias, host=ip_address, port='19530')
+                        collection_name_formatted = f"documents_{collection_name}" if collection_name else "documents_local_model"
+                        collection_exists = utility.has_collection(collection_name_formatted, using=debug_alias)
+                        entity_count = 0
+                        
+                        if collection_exists:
+                            from pymilvus import Collection
+                            collection = Collection(collection_name_formatted, using=debug_alias)
+                            entity_count = collection.num_entities
+                        
+                        debug_info = {
+                            "collection_exists": collection_exists,
+                            "entity_count": entity_count,
+                            "collection_name": collection_name_formatted
+                        }
+                    finally:
+                        connections.disconnect(debug_alias)
                     
-                    if collection_exists:
-                        from pymilvus import Collection
-                        collection = Collection(collection_name_formatted)
-                        entity_count = collection.num_entities
-                    
-                    debug_info = {
-                        "collection_exists": collection_exists,
-                        "entity_count": entity_count,
-                        "collection_name": collection_name_formatted
-                    }
-                    connections.disconnect("default")
                     return jsonify({"message": "Text loaded successfully", "details": result, "debug": debug_info})
                 
                 return jsonify({"message": "Text loaded successfully", "details": result})

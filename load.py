@@ -4,8 +4,10 @@ import logging
 from datetime import datetime
 from hashlib import sha256
 from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
+from pymilvus.exceptions import MilvusException
 from tqdm import tqdm
 import traceback
+from uuid import uuid4
 
 from utils import (
     DEFAULT_EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_DIM,
@@ -18,28 +20,34 @@ from utils import (
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
-def clear_collection(collection_name):
-    if utility.has_collection(collection_name):
-        collection = Collection(name=collection_name)
+def clear_collection(collection_name, using_alias="default"):
+    if utility.has_collection(collection_name, using=using_alias):
+        collection = Collection(name=collection_name, using=using_alias)
         collection.drop()
         logging.info(f"Vector store {collection_name} cleared.")
     else:
         logging.info(f"Collection {collection_name} does not exist. Nothing to clear.")
 
+def _generate_alias(prefix="conn"):
+    return f"{prefix}_{uuid4().hex}"
+
 def clear_vectorstore_collection(collection_name, ip_address="localhost"):
-    connections.connect("default", host=ip_address, port='19530')
+    alias = _generate_alias("clear")
+    connections.connect(alias, host=ip_address, port='19530')
 
     # Standardize collection naming
     collection_name = f"documents_{collection_name}"
 
-    clear_collection(collection_name)
+    clear_collection(collection_name, using_alias=alias)
     logging.info(f"Collection '{collection_name}' has been cleared.")
 
-    connections.disconnect("default")
+    connections.disconnect(alias)
 
 def load_to_vectorstore(args):
     start_time = datetime.now()
-    connections.connect("default", host='localhost', port='19530')
+    # Honor CLI/env host instead of hardcoded localhost so we hit the real Milvus service.
+    milvus_host = getattr(args, "ip_address", None) or os.getenv("MILVUS_HOST", "localhost")
+    connections.connect("default", host=milvus_host, port='19530')
 
     if args.clear:
         if not args.clear_collection:
@@ -57,8 +65,13 @@ def load_to_vectorstore(args):
     embedding_model = args.model if not args.local else LOCAL_EMBEDDING_MODEL
     is_local = embedding_model == LOCAL_EMBEDDING_MODEL
     embedding_dim = EMBEDDING_DIMENSIONS.get(embedding_model, LOCAL_EMBEDDING_DIM)
+    embedding_host = getattr(args, "embedding_host", None) or os.getenv("EMBEDDING_HOST", "localhost")
 
-    collection_name = args.collection if args.collection else f"documents_{embedding_model.replace('-', '_')}"
+    # Standardize naming to match search (documents_<collection>)
+    if args.collection:
+        collection_name = f"documents_{args.collection}"
+    else:
+        collection_name = f"documents_{embedding_model.replace('-', '_')}"
 
     fields = [
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
@@ -97,14 +110,14 @@ def load_to_vectorstore(args):
 
                 logging.debug(f"Processing {filepath} as it is new or modified.")
                 if args.line_by_line:
-                    process_and_insert_lines(filepath, collection, embedding_model, embedding_dim, is_local)
+                    process_and_insert_lines(filepath, collection, embedding_model, embedding_dim, is_local, embedding_host=embedding_host)
                 else:
                     # Delete old entries before processing
                     delete_old_entries(collection, filepath)
                     chunks = process_file(filepath)
                     if chunks:
                         text_snippets = [extract_snippet(chunk) for chunk in chunks]
-                        vectors = embed_text_to_vector(chunks, embedding_model, is_local)
+                        vectors = embed_text_to_vector(chunks, embedding_model, is_local, embedding_host=embedding_host)
                         validated_vectors = validate_embeddings(vectors, embedding_dim)
                         if validated_vectors:
                             # Adjust data format to match Milvus's expectations
@@ -140,14 +153,14 @@ def load_to_vectorstore(args):
             else:
                 logging.debug(f"Processing {path} as it is new or modified.")
                 if args.line_by_line:
-                    process_and_insert_lines(path, collection, embedding_model, embedding_dim, is_local)
+                    process_and_insert_lines(path, collection, embedding_model, embedding_dim, is_local, embedding_host=embedding_host)
                 else:
                     # Delete old entries before processing
                     delete_old_entries(collection, path)
                     chunks = process_file(path)
                     if chunks:
                         text_snippets = [extract_snippet(chunk) for chunk in chunks]
-                        vectors = embed_text_to_vector(chunks, embedding_model, is_local)
+                        vectors = embed_text_to_vector(chunks, embedding_model, is_local, embedding_host=embedding_host)
                         validated_vectors = validate_embeddings(vectors, embedding_dim)
                         if validated_vectors:
                             # Adjust data format to match Milvus's expectations
@@ -177,10 +190,11 @@ def load_to_vectorstore(args):
 def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
                              line_by_line=False, chunk_size=1000, overlap=0, ip_address="localhost", embedding_host="localhost"):
     logging.info(f"Starting load_text_to_vectorstore: collection={collection_name}, model={embedding_model}, ip={ip_address}")
-    
+    alias = _generate_alias("load")
+
     try:
         logging.info("Connecting to Milvus...")
-        connections.connect("default", host=ip_address, port='19530')
+        connections.connect(alias, host=ip_address, port='19530')
         logging.info("Connected to Milvus successfully")
 
         # Use local embedding model as default
@@ -200,9 +214,9 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
         logging.info(f"Embedding dimension: {embedding_dim}")
 
         # Check if collection exists and has the correct dimension. Drop if incorrect.
-        if utility.has_collection(collection_name):
+        if utility.has_collection(collection_name, using=alias):
             logging.info(f"Collection {collection_name} exists. Checking schema...")
-            existing_collection = Collection(name=collection_name)
+            existing_collection = Collection(name=collection_name, using=alias)
             existing_schema = existing_collection.schema
             vector_field_exists = False
             correct_dimension = False
@@ -238,23 +252,25 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
         logging.info(f"Using schema with fields: {[f.name for f in fields]}")
 
         # SIMPLIFIED COLLECTION HANDLING - No reload
-        if utility.has_collection(collection_name):
+        if utility.has_collection(collection_name, using=alias):
             logging.info(f"Collection {collection_name} already exists - using it")
-            collection = Collection(name=collection_name)
+            collection = Collection(name=collection_name, using=alias)
         else:
             logging.info(f"Collection {collection_name} does not exist - creating it")
-            collection = Collection(name=collection_name, schema=schema)
+            collection = Collection(name=collection_name, schema=schema, using=alias)
             # Create index if collection is new
             if not collection.has_index():
                 logging.info("Creating index on new collection...")
                 index_params = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
-                collection.create_index(field_name="vector", index_params=index_params)
-                logging.info("Index created successfully")
+                try:
+                    collection.create_index(field_name="vector", index_params=index_params, timeout=5)
+                    logging.info("Index created successfully")
+                except MilvusException as index_error:
+                    logging.warning(f"Index creation did not finish within timeout ({index_error}). Continuing without waiting for completion.")
 
-        # ⚠️ IMPORTANT: Load collection ONLY ONCE at the beginning
-        logging.info("Loading collection (once)...")
-        collection.load()
-        logging.info("Collection loaded successfully")
+        # Loading the collection is not required before insertion and can block when other jobs are running.
+        # Skip the explicit load to keep API requests responsive.
+        logging.info("Skipping explicit collection.load() before insertion to avoid blocking requests.")
 
         # Get the entity count at the start
         try:
@@ -317,8 +333,11 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
 
             # Flush data immediately after insert
             logging.info("Flushing inserted data...")
-            collection.flush()
-            logging.info("Data flushed successfully.")
+            try:
+                collection.flush(timeout=5)
+                logging.info("Data flushed successfully.")
+            except MilvusException as flush_error:
+                logging.warning(f"Flush did not complete within timeout ({flush_error}). Milvus will continue flushing in the background.")
 
         except Exception as e:
             logging.error(f"Error during Milvus insertion or flush: {str(e)}")
@@ -328,7 +347,7 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
 
     finally:
         try:
-            connections.disconnect("default")
+            connections.disconnect(alias)
             logging.info("Disconnected from Milvus")
         except Exception as e:
             # Log if disconnection fails but don't raise further

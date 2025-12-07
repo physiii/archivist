@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from pymilvus import connections, Collection, utility
 import traceback
+from uuid import uuid4
 
 from utils import (
     DEFAULT_EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_DIM,
@@ -21,10 +22,11 @@ MAX_QUERY_LIMIT = 16384
 def search_vectorstore(query, limit=10, path_filter="", unique=False, collection_name=None, ip_address="localhost", embedding_host="localhost"):
     start_time = datetime.now()
     logging.info(f"Starting search_vectorstore: query='{query}', collection={collection_name}, ip={ip_address}")
+    alias = f"search_{uuid4().hex}"
     
     try:
         logging.info(f"Connecting to Milvus at {ip_address}...")
-        connections.connect("default", host=ip_address, port='19530')
+        connections.connect(alias, host=ip_address, port='19530')
         logging.info("Connected to Milvus successfully")
 
         # Format collection name
@@ -35,12 +37,12 @@ def search_vectorstore(query, limit=10, path_filter="", unique=False, collection
         logging.info(f"Using collection: {collection_name}")
 
         # Check if collection exists
-        if not utility.has_collection(collection_name):
+        if not utility.has_collection(collection_name, using=alias):
             logging.error(f"Collection {collection_name} does not exist.")
             return []
 
         # Open the collection
-        collection = Collection(name=collection_name)
+        collection = Collection(name=collection_name, using=alias)
         collection.load()
         logging.info(f"Collection loaded with {collection.num_entities} entities")
 
@@ -117,7 +119,7 @@ def search_vectorstore(query, limit=10, path_filter="", unique=False, collection
         return []
     finally:
         try:
-            connections.disconnect("default")
+            connections.disconnect(alias)
             logging.info("Disconnected from Milvus")
         except:
             pass

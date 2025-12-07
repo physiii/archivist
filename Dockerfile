@@ -11,7 +11,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download nltk data
-RUN python -m nltk.downloader punkt
+# Include NLTK punkt and punkt_tab to allow sentence tokenization
+RUN python -m nltk.downloader punkt punkt_tab
 
 # Copy the rest of the application code into the container at /app
 COPY . .
@@ -22,5 +23,5 @@ EXPOSE 5050
 # Define environment variable
 ENV NAME Vectorstore
 
-# Run main.py when the container launches
-CMD ["python", "main.py"] 
+# Run the Flask app with multiple workers using Gunicorn
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5050", "main:app"]

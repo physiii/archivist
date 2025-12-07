@@ -10,7 +10,14 @@ from datetime import datetime
 # Constants Configuration
 CHUNK_SIZE = 6
 OVERLAP = 2
+
+# Number of text lines processed per Milvus insert batch (line-by-line mode).
 BATCH_SIZE = 10
+
+# Embedding batching / timeout configuration for calls to the embedding service.
+# These are independent from Milvus insert batching above.
+EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "500"))  # texts per /embed_batch call
+EMBED_TIMEOUT_SECONDS = int(os.environ.get("EMBED_TIMEOUT_SECONDS", "120"))
 INDEX_TYPE = "IVF_FLAT"
 METRIC_TYPE = "L2"
 NLIST = 1024
@@ -18,40 +25,92 @@ SNIPPET_LENGTH = 1500  # Length of text snippet to store with each document
 
 # Embedding Model Configuration
 LOCAL_EMBEDDING_MODEL = "local_model"
-LOCAL_EMBEDDING_DIM = 384  # Adjusted to match the actual embedding service output
+# Updated to match the new local embedding service output dimension (see embedding server logs).
+LOCAL_EMBEDDING_DIM = 1024
 DEFAULT_EMBEDDING_MODEL = LOCAL_EMBEDDING_MODEL
 EMBEDDING_DIMENSIONS = {
     "local_model": LOCAL_EMBEDDING_DIM,
-    "text-embedding-3-large": 3072
+    "text-embedding-3-large": 3072,
 }
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
+
 def embed_text_to_vector(text_chunks, model, is_local=True, ip_address="localhost", embedding_host="localhost"):
+    """
+    Generate embeddings for a list of text chunks.
+
+    - For local models, this uses the batched /embed_batch endpoint on the embedding service.
+    - For remote models (OpenAI, etc.), this function can be extended later.
+
+    Returns a list of embeddings aligned 1:1 with `text_chunks`. Any failures are
+    represented as None and will be filtered out by validate_embeddings().
+    """
+    if not text_chunks:
+        return []
+
     vectors = []
-    for chunk in text_chunks:
+
+    # Currently only the local embedding path is implemented.
+    if not is_local:
+        logging.error("Non-local embedding model requested, but remote embedding is not implemented yet.")
+        return [None] * len(text_chunks)
+
+    for i in range(0, len(text_chunks), EMBED_BATCH_SIZE):
+        batch = text_chunks[i:i + EMBED_BATCH_SIZE]
         try:
-            if is_local:
-                # Use local embedding API
-                response = requests.post(
-                    f'http://{embedding_host}:8000/embed',
-                    json={'text': chunk},
-                    headers={'Content-Type': 'application/json'}
+            response = requests.post(
+                f'http://{embedding_host}:8000/embed_batch',
+                json={'texts': batch},
+                headers={'Content-Type': 'application/json'},
+                timeout=EMBED_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            body = response.json()
+            embeddings = body.get('embeddings')
+
+            if not isinstance(embeddings, list) or len(embeddings) != len(batch):
+                logging.error(
+                    "Embedding service returned mismatched embeddings length. "
+                    f"Expected {len(batch)}, got {len(embeddings) if isinstance(embeddings, list) else 'non-list'}"
                 )
-                response.raise_for_status()
-                embedding = response.json()['embedding']
-                # Ensure embedding is a list of floats, not a nested list
-                if isinstance(embedding, list) and len(embedding) == 1 and isinstance(embedding[0], list):
-                    # Unwrap the outer list if necessary
-                    embedding = embedding[0]
-                vectors.append(embedding)
-            else:
-                # Implement OpenAI API or other embedding logic if needed
-                pass
+                # Preserve alignment: mark this whole sub-batch as failed.
+                vectors.extend([None] * len(batch))
+                continue
+
+            # Normalize each embedding in the sub-batch (handle accidental extra nesting).
+            for emb, text_sample in zip(embeddings, batch):
+                try:
+                    if isinstance(emb, list) and len(emb) == 1 and isinstance(emb[0], list):
+                        emb = emb[0]
+                    vectors.append(emb)
+                except Exception as inner_e:
+                    logging.error(
+                        f"Failed to normalize embedding for chunk '{text_sample[:50]}...' "
+                        f"using model {model}: {inner_e}"
+                    )
+                    vectors.append(None)
+
         except Exception as e:
-            logging.error(f"Embedding generation failed for chunk '{chunk[:50]}...' using model {model}: {e}")
-            vectors.append(None)
+            logging.error(
+                f"Embedding generation failed for batch starting at index {i} "
+                f"using model {model}: {e}"
+            )
+            # Preserve alignment for this sub-batch on failure.
+            vectors.extend([None] * len(batch))
+
+    # Safety: ensure we always return exactly one embedding entry per input chunk.
+    if len(vectors) != len(text_chunks):
+        logging.error(
+            f"Embedding vector count mismatch after batching. "
+            f"Expected {len(text_chunks)}, got {len(vectors)}. Truncating or padding with None."
+        )
+        if len(vectors) > len(text_chunks):
+            vectors = vectors[:len(text_chunks)]
+        else:
+            vectors.extend([None] * (len(text_chunks) - len(vectors)))
+
     return vectors
 
 def validate_embeddings(vectors, expected_dim):
@@ -182,7 +241,7 @@ def delete_old_entries(collection, filepath):
     collection.delete(expr)
     logging.info(f"Deleted old entries for {filepath}")
 
-def process_and_insert_lines(filepath, collection, embedding_model, embedding_dim, use_local=True):
+def process_and_insert_lines(filepath, collection, embedding_model, embedding_dim, use_local=True, embedding_host="localhost"):
     filehash = file_hash(filepath)
     creation_date = get_creation_date(filepath)
 
@@ -194,17 +253,25 @@ def process_and_insert_lines(filepath, collection, embedding_model, embedding_di
 
     for i in range(0, len(lines), BATCH_SIZE):
         batch = lines[i:i + BATCH_SIZE]
-        vectors = embed_text_to_vector(batch, embedding_model, use_local)
+        vectors = embed_text_to_vector(batch, embedding_model, use_local, embedding_host=embedding_host)
         validated_vectors = validate_embeddings(vectors, embedding_dim)
 
+        # Filter out any failed embeddings
+        batch_pairs = [(v, s) for v, s in zip(validated_vectors, batch) if v is not None]
+        if not batch_pairs:
+            logging.warning(f"No valid embeddings for batch starting at line {i} in {filepath}")
+            continue
+
+        filtered_vectors, filtered_snippets = zip(*batch_pairs)
+
         data = {
-            "vector": validated_vectors,
-            "path": [filepath] * len(validated_vectors),
-            "snippet": [line[:SNIPPET_LENGTH] for line in batch],
-            "filehash": [filehash] * len(validated_vectors),
-            "embedding_model": [embedding_model] * len(validated_vectors),
-            "creation_date": [creation_date] * len(validated_vectors)
+            "vector": list(filtered_vectors),
+            "path": [filepath] * len(filtered_vectors),
+            "snippet": [s[:SNIPPET_LENGTH] for s in filtered_snippets],
+            "filehash": [filehash] * len(filtered_vectors),
+            "embedding_model": [embedding_model] * len(filtered_vectors),
+            "creation_date": [creation_date] * len(filtered_vectors)
         }
 
         collection.insert(data)
-        logging.info(f"Inserted {len(validated_vectors)} vectors for lines from {filepath}")
+        logging.info(f"Inserted {len(filtered_vectors)} vectors for lines from {filepath}")

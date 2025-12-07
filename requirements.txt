@@ -4,3 +4,4 @@ pymilvus
 webvtt-py
 nltk
 tqdm
+gunicorn
