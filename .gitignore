@@ -126,3 +126,10 @@ dmypy.json
 # Test data file
 test_data.txt 
 milvus_backup.tar
+
+# UI
+ui/node_modules/
+ui/dist/
+ui/playwright-report/
+ui/test-results/
+ui/.playwright/

@@ -21,3 +21,10 @@ venv.bak/
 volumes/
 
 test_data.txt 
+
+# Frontend build artifacts
+ui/node_modules/
+ui/dist/
+ui/.playwright/
+ui/playwright-report/
+ui/test-results/

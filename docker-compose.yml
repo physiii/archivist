@@ -5,11 +5,21 @@ services:
     build: .
     ports:
       - "5050:5050"
+    volumes:
+      - vectorstore-backups:/backups
+      - milvus-data:/data/milvus:ro
+      - etcd-data:/data/etcd:ro
+      - minio-data:/data/minio:ro
+      # Host mounts for Custodian parity diagnostics/config.
+      - /home/andy/custodian:/host/custodian:ro
+      - /media/mass:/mass:ro
+      - /home/andy/nas_mass:/home/andy/nas_mass
     networks:
       - vectorstore
     environment:
       MILVUS_HOST: milvus
       EMBEDDING_HOST: host.docker.internal
+      CUSTODIAN_CONFIG_PATH: /host/custodian/config.py
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -94,6 +104,7 @@ volumes:
   milvus-data:
   etcd-data:
   minio-data:
+  vectorstore-backups:
 networks:
   vectorstore:
     driver: bridge

@@ -3,7 +3,7 @@ import os
 import logging
 from datetime import datetime
 from hashlib import sha256
-from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
+from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility, Function, FunctionType
 from pymilvus.exceptions import MilvusException
 from tqdm import tqdm
 import traceback
@@ -66,6 +66,7 @@ def load_to_vectorstore(args):
     is_local = embedding_model == LOCAL_EMBEDDING_MODEL
     embedding_dim = EMBEDDING_DIMENSIONS.get(embedding_model, LOCAL_EMBEDDING_DIM)
     embedding_host = getattr(args, "embedding_host", None) or os.getenv("EMBEDDING_HOST", "localhost")
+    embedding_port = getattr(args, "embedding_port", None) or os.getenv("EMBEDDING_PORT", "8000")
 
     # Standardize naming to match search (documents_<collection>)
     if args.collection:
@@ -110,14 +111,28 @@ def load_to_vectorstore(args):
 
                 logging.debug(f"Processing {filepath} as it is new or modified.")
                 if args.line_by_line:
-                    process_and_insert_lines(filepath, collection, embedding_model, embedding_dim, is_local, embedding_host=embedding_host)
+                    process_and_insert_lines(
+                        filepath,
+                        collection,
+                        embedding_model,
+                        embedding_dim,
+                        is_local,
+                        embedding_host=embedding_host,
+                        embedding_port=embedding_port,
+                    )
                 else:
                     # Delete old entries before processing
                     delete_old_entries(collection, filepath)
                     chunks = process_file(filepath)
                     if chunks:
                         text_snippets = [extract_snippet(chunk) for chunk in chunks]
-                        vectors = embed_text_to_vector(chunks, embedding_model, is_local, embedding_host=embedding_host)
+                        vectors = embed_text_to_vector(
+                            chunks,
+                            embedding_model,
+                            is_local,
+                            embedding_host=embedding_host,
+                            embedding_port=embedding_port,
+                        )
                         validated_vectors = validate_embeddings(vectors, embedding_dim)
                         if validated_vectors:
                             # Adjust data format to match Milvus's expectations
@@ -132,8 +147,9 @@ def load_to_vectorstore(args):
                             fields = ["vector", "path", "snippet", "filehash", "embedding_model", "creation_date"]
                             logging.info(f"Number of entities before insertion: {collection.num_entities}")
                             collection.insert(data, fields=fields)
-                            collection.flush()  # Flush after insertion
-                            collection.load()
+                            flush_on_insert = os.getenv("VECTORSTORE_FLUSH_ON_INSERT", "").lower() in {"1", "true", "yes"}
+                            if flush_on_insert:
+                                collection.flush(timeout=30)
                             logging.info(f"Number of entities after insertion: {collection.num_entities}")
                             logging.info(f"Successfully inserted vectors and snippets for {filepath}")
             except Exception as e:
@@ -153,14 +169,28 @@ def load_to_vectorstore(args):
             else:
                 logging.debug(f"Processing {path} as it is new or modified.")
                 if args.line_by_line:
-                    process_and_insert_lines(path, collection, embedding_model, embedding_dim, is_local, embedding_host=embedding_host)
+                    process_and_insert_lines(
+                        path,
+                        collection,
+                        embedding_model,
+                        embedding_dim,
+                        is_local,
+                        embedding_host=embedding_host,
+                        embedding_port=embedding_port,
+                    )
                 else:
                     # Delete old entries before processing
                     delete_old_entries(collection, path)
                     chunks = process_file(path)
                     if chunks:
                         text_snippets = [extract_snippet(chunk) for chunk in chunks]
-                        vectors = embed_text_to_vector(chunks, embedding_model, is_local, embedding_host=embedding_host)
+                        vectors = embed_text_to_vector(
+                            chunks,
+                            embedding_model,
+                            is_local,
+                            embedding_host=embedding_host,
+                            embedding_port=embedding_port,
+                        )
                         validated_vectors = validate_embeddings(vectors, embedding_dim)
                         if validated_vectors:
                             # Adjust data format to match Milvus's expectations
@@ -175,8 +205,9 @@ def load_to_vectorstore(args):
                             fields = ["vector", "path", "snippet", "filehash", "embedding_model", "creation_date"]
                             logging.info(f"Number of entities before insertion: {collection.num_entities}")
                             collection.insert(data, fields=fields)
-                            collection.flush()  # Flush after insertion
-                            collection.load()
+                            flush_on_insert = os.getenv("VECTORSTORE_FLUSH_ON_INSERT", "").lower() in {"1", "true", "yes"}
+                            if flush_on_insert:
+                                collection.flush(timeout=30)
                             logging.info(f"Number of entities after insertion: {collection.num_entities}")
                             logging.info(f"Successfully inserted vectors and snippets for {path}")
         except Exception as e:
@@ -188,7 +219,7 @@ def load_to_vectorstore(args):
     logging.info(f"Operation completed in {end_time - start_time}.")
 
 def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
-                             line_by_line=False, chunk_size=1000, overlap=0, ip_address="localhost", embedding_host="localhost"):
+                             line_by_line=False, chunk_size=1000, overlap=0, ip_address="localhost", embedding_host="localhost", embedding_port=None):
     logging.info(f"Starting load_text_to_vectorstore: collection={collection_name}, model={embedding_model}, ip={ip_address}")
     alias = _generate_alias("load")
 
@@ -213,13 +244,15 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
         embedding_dim = LOCAL_EMBEDDING_DIM if is_local else EMBEDDING_DIMENSIONS.get(embedding_model, LOCAL_EMBEDDING_DIM)
         logging.info(f"Embedding dimension: {embedding_dim}")
 
-        # Check if collection exists and has the correct dimension. Drop if incorrect.
+        # Check if collection exists and has the correct dimension / BM25 schema. Drop if incorrect.
         if utility.has_collection(collection_name, using=alias):
             logging.info(f"Collection {collection_name} exists. Checking schema...")
             existing_collection = Collection(name=collection_name, using=alias)
             existing_schema = existing_collection.schema
             vector_field_exists = False
             correct_dimension = False
+            sparse_field_exists = False
+            text_analyzer_enabled = False
             for field in existing_schema.fields:
                 if field.name == "vector":
                     vector_field_exists = True
@@ -227,7 +260,14 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
                         correct_dimension = True
                     else:
                         logging.warning(f"Existing collection '{collection_name}' vector field dimension ({field.params.get('dim')}) does not match expected dimension ({embedding_dim}).")
-                    break
+                if field.name == "sparse":
+                    sparse_field_exists = True
+                if field.name == "text":
+                    try:
+                        if getattr(field, "enable_analyzer", False) or bool(getattr(field, "params", {}).get("enable_analyzer")):
+                            text_analyzer_enabled = True
+                    except Exception:
+                        pass
             
             if not vector_field_exists:
                 logging.warning(f"Existing collection '{collection_name}' does not have a 'vector' field. Dropping collection.")
@@ -237,18 +277,34 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
                 logging.warning(f"Existing collection '{collection_name}' has incorrect vector dimension. Dropping collection.")
                 existing_collection.drop()
                 logging.info(f"Collection '{collection_name}' dropped.")
+            elif (not sparse_field_exists) or (not text_analyzer_enabled):
+                logging.warning(
+                    f"Existing collection '{collection_name}' is missing BM25 fields/settings "
+                    f"(sparse_field_exists={sparse_field_exists}, text_analyzer_enabled={text_analyzer_enabled}). Dropping collection."
+                )
+                existing_collection.drop()
+                logging.info(f"Collection '{collection_name}' dropped.")
             else:
                 logging.info(f"Existing collection '{collection_name}' has correct schema.")
 
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=embedding_dim),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
+            # BM25 requires analyzer enabled on the input text field.
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535, enable_analyzer=True),
+            # Sparse vector generated by Milvus BM25 function.
+            FieldSchema(name="sparse", dtype=DataType.SPARSE_FLOAT_VECTOR),
             FieldSchema(name="hash", dtype=DataType.VARCHAR, max_length=64),
             FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=64),
             FieldSchema(name="creation_date", dtype=DataType.INT64)
         ]
-        schema = CollectionSchema(fields, description="Text Collection")
+        bm25_fn = Function(
+            name="bm25_fn",
+            function_type=FunctionType.BM25,
+            input_field_names=["text"],
+            output_field_names=["sparse"],
+        )
+        schema = CollectionSchema(fields, description="Text Collection", functions=[bm25_fn])
         logging.info(f"Using schema with fields: {[f.name for f in fields]}")
 
         # SIMPLIFIED COLLECTION HANDLING - No reload
@@ -260,13 +316,28 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
             collection = Collection(name=collection_name, schema=schema, using=alias)
             # Create index if collection is new
             if not collection.has_index():
-                logging.info("Creating index on new collection...")
+                logging.info("Creating indexes on new collection...")
                 index_params = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
                 try:
                     collection.create_index(field_name="vector", index_params=index_params, timeout=5)
-                    logging.info("Index created successfully")
+                    logging.info("Dense index created successfully")
                 except MilvusException as index_error:
                     logging.warning(f"Index creation did not finish within timeout ({index_error}). Continuing without waiting for completion.")
+                try:
+                    collection.create_index(field_name="sparse", index_params={"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}}, timeout=5)
+                    logging.info("BM25 sparse index created successfully")
+                except MilvusException as index_error:
+                    logging.warning(f"BM25 index creation did not finish within timeout ({index_error}). Continuing without waiting for completion.")
+
+        # Best-effort: ensure BM25 index exists even if collection already existed.
+        try:
+            existing = collection.indexes or []
+            has_sparse_index = any(getattr(ix, "field_name", "") == "sparse" for ix in existing)
+            if not has_sparse_index:
+                collection.create_index(field_name="sparse", index_params={"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}}, timeout=5)
+                logging.info("BM25 sparse index created (existing collection).")
+        except Exception as e:
+            logging.warning(f"BM25 index ensure failed (non-fatal): {e}")
 
         # Loading the collection is not required before insertion and can block when other jobs are running.
         # Skip the explicit load to keep API requests responsive.
@@ -299,7 +370,14 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
         
         # Get embeddings for all chunks at once
         logging.info("Getting embeddings for all chunks...")
-        vectors = embed_text_to_vector(chunks, embedding_model, is_local, ip_address=ip_address, embedding_host=embedding_host)
+        vectors = embed_text_to_vector(
+            chunks,
+            embedding_model,
+            is_local,
+            ip_address=ip_address,
+            embedding_host=embedding_host,
+            embedding_port=embedding_port,
+        )
         logging.info(f"Got {len(vectors)} embeddings")
         
         # Validate all embeddings
@@ -331,13 +409,26 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
             results.append(f"Inserted {len(inserted_ids)} entities.")
             logging.info(f"Successfully inserted {len(inserted_ids)} vectors for text batch.")
 
-            # Flush data immediately after insert
-            logging.info("Flushing inserted data...")
-            try:
-                collection.flush(timeout=5)
-                logging.info("Data flushed successfully.")
-            except MilvusException as flush_error:
-                logging.warning(f"Flush did not complete within timeout ({flush_error}). Milvus will continue flushing in the background.")
+            # IMPORTANT PERFORMANCE NOTE:
+            # Flushing after every insert batch is extremely expensive and, on newer Milvus,
+            # can trigger grpc RateLimiter rejections (e.g. "rate limit exceeded[rate=0.1]").
+            #
+            # For bulk / line_by_line loads (our main usage), skip per-batch flush and let
+            # Milvus flush asynchronously. Searches will still work; newly inserted rows
+            # may take a short time to become visible, which is acceptable for background sync.
+            flush_on_insert = os.getenv("VECTORSTORE_FLUSH_ON_INSERT", "").lower() in {"1", "true", "yes"}
+            if flush_on_insert and not line_by_line:
+                logging.info("Flushing inserted data...")
+                try:
+                    collection.flush(timeout=30)
+                    logging.info("Data flushed successfully.")
+                except MilvusException as flush_error:
+                    logging.warning(
+                        "Flush did not complete within timeout (%s). Milvus will continue flushing in the background.",
+                        flush_error,
+                    )
+            else:
+                logging.info("Skipping per-batch flush (line_by_line=%s, flush_on_insert=%s).", line_by_line, flush_on_insert)
 
         except Exception as e:
             logging.error(f"Error during Milvus insertion or flush: {str(e)}")

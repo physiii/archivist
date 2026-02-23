@@ -18,6 +18,7 @@ BATCH_SIZE = 10
 # These are independent from Milvus insert batching above.
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "500"))  # texts per /embed_batch call
 EMBED_TIMEOUT_SECONDS = int(os.environ.get("EMBED_TIMEOUT_SECONDS", "120"))
+EMBED_DEFAULT_PORT = int(os.environ.get("EMBEDDING_PORT", "8000"))
 INDEX_TYPE = "IVF_FLAT"
 METRIC_TYPE = "L2"
 NLIST = 1024
@@ -37,7 +38,14 @@ EMBEDDING_DIMENSIONS = {
 logging.basicConfig(level=logging.DEBUG)
 
 
-def embed_text_to_vector(text_chunks, model, is_local=True, ip_address="localhost", embedding_host="localhost"):
+def embed_text_to_vector(
+    text_chunks,
+    model,
+    is_local=True,
+    ip_address="localhost",
+    embedding_host="localhost",
+    embedding_port=None,
+):
     """
     Generate embeddings for a list of text chunks.
 
@@ -57,11 +65,13 @@ def embed_text_to_vector(text_chunks, model, is_local=True, ip_address="localhos
         logging.error("Non-local embedding model requested, but remote embedding is not implemented yet.")
         return [None] * len(text_chunks)
 
+    port = EMBED_DEFAULT_PORT if embedding_port is None else int(embedding_port)
+
     for i in range(0, len(text_chunks), EMBED_BATCH_SIZE):
         batch = text_chunks[i:i + EMBED_BATCH_SIZE]
         try:
             response = requests.post(
-                f'http://{embedding_host}:8000/embed_batch',
+                f"http://{embedding_host}:{port}/embed_batch",
                 json={'texts': batch},
                 headers={'Content-Type': 'application/json'},
                 timeout=EMBED_TIMEOUT_SECONDS,
@@ -241,7 +251,15 @@ def delete_old_entries(collection, filepath):
     collection.delete(expr)
     logging.info(f"Deleted old entries for {filepath}")
 
-def process_and_insert_lines(filepath, collection, embedding_model, embedding_dim, use_local=True, embedding_host="localhost"):
+def process_and_insert_lines(
+    filepath,
+    collection,
+    embedding_model,
+    embedding_dim,
+    use_local=True,
+    embedding_host="localhost",
+    embedding_port=None,
+):
     filehash = file_hash(filepath)
     creation_date = get_creation_date(filepath)
 
@@ -253,7 +271,13 @@ def process_and_insert_lines(filepath, collection, embedding_model, embedding_di
 
     for i in range(0, len(lines), BATCH_SIZE):
         batch = lines[i:i + BATCH_SIZE]
-        vectors = embed_text_to_vector(batch, embedding_model, use_local, embedding_host=embedding_host)
+        vectors = embed_text_to_vector(
+            batch,
+            embedding_model,
+            use_local,
+            embedding_host=embedding_host,
+            embedding_port=embedding_port,
+        )
         validated_vectors = validate_embeddings(vectors, embedding_dim)
 
         # Filter out any failed embeddings
