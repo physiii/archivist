@@ -97,6 +97,11 @@ export type BackupTargetHealth = {
   destination_writable: boolean;
   destination_separate_mount: boolean;
   ready: boolean;
+  last_backup_at?: string | null;
+  last_backup_run_id?: string | null;
+  last_attempt_at?: string | null;
+  last_attempt_ok?: boolean | null;
+  last_attempt_exit_code?: number | null;
 };
 
 export type StoragePathUsage = {
@@ -207,8 +212,10 @@ export type BackupLogResponse = {
     finished_at: string | null;
     status: string;
     archive_ok: boolean;
-    archive_file: string;
+    archive_file: string | null;
     archive_error?: string | null;
+    include_archive?: boolean;
+    run_type?: string;
     sync_total: number;
     sync_ok: number;
     sync_failed: number;

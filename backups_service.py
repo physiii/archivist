@@ -554,6 +554,49 @@ def _latest_runs(limit: int = 10) -> list[dict[str, Any]]:
     return out
 
 
+def _target_history_index(limit_runs: int = 200) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for run in _latest_runs(limit=limit_runs):
+        run_dir = Path(run["main_log_path"]).parent
+        summary = _read_run_summary(run_dir)
+        if not summary:
+            continue
+        run_id = str(summary.get("run_id") or run.get("run_id") or "")
+        finished_at = summary.get("finished_at")
+        sync_results = summary.get("sync_results") or []
+        if not isinstance(sync_results, list):
+            continue
+        for item in sync_results:
+            if not isinstance(item, dict):
+                continue
+            profile = str(item.get("profile") or "default")
+            source = str(item.get("source") or "").strip()
+            destination = str(item.get("destination") or "").strip()
+            if not source or not destination:
+                continue
+            key = f"{profile}|{source}|{destination}"
+            slot = index.setdefault(
+                key,
+                {
+                    "last_attempt_at": None,
+                    "last_attempt_run_id": None,
+                    "last_attempt_ok": None,
+                    "last_attempt_exit_code": None,
+                    "last_backup_at": None,
+                    "last_backup_run_id": None,
+                },
+            )
+            if slot["last_attempt_at"] is None:
+                slot["last_attempt_at"] = finished_at
+                slot["last_attempt_run_id"] = run_id or None
+                slot["last_attempt_ok"] = bool(item.get("ok"))
+                slot["last_attempt_exit_code"] = item.get("exit_code")
+            if slot["last_backup_at"] is None and bool(item.get("ok")) and finished_at:
+                slot["last_backup_at"] = finished_at
+                slot["last_backup_run_id"] = run_id or None
+    return index
+
+
 def _snapshot_history(limit: int = 40) -> list[dict[str, Any]]:
     out = []
     for run in _latest_runs(limit=40):
@@ -625,7 +668,17 @@ def get_backup_overview() -> dict[str, Any]:
 
     cfg = _load_backup_config()
     target_mappings = cfg["targets"]
-    target_health = [_target_health(t["profile"], t["source"], t["destination"]) for t in target_mappings]
+    target_history = _target_history_index(limit_runs=200)
+    target_health = []
+    for target in target_mappings:
+        item = _target_health(target["profile"], target["source"], target["destination"])
+        history = target_history.get(f"{target['profile']}|{target['source']}|{target['destination']}") or {}
+        item["last_backup_at"] = history.get("last_backup_at")
+        item["last_backup_run_id"] = history.get("last_backup_run_id")
+        item["last_attempt_at"] = history.get("last_attempt_at")
+        item["last_attempt_ok"] = history.get("last_attempt_ok")
+        item["last_attempt_exit_code"] = history.get("last_attempt_exit_code")
+        target_health.append(item)
     source_paths = sorted({t["source"] for t in target_mappings})
     destination_paths = sorted({t["destination"] for t in target_mappings})
     storage_diagnostics = {
@@ -728,19 +781,33 @@ def _build_rsync_excludes(config: dict[str, Any]) -> list[str]:
     return merged
 
 
-def _run_backup_job(run_id: str, run_dir: Path, config: dict[str, Any], backup_name: str, backup_path: Path) -> None:
+def _run_backup_job(
+    run_id: str,
+    run_dir: Path,
+    config: dict[str, Any],
+    backup_name: str,
+    backup_path: Path | None,
+    selected_targets: list[dict[str, Any]] | None = None,
+    include_archive: bool = True,
+    trigger: str = "manual",
+) -> None:
     main_log_path = run_dir / "main.log"
     debug_log_path = run_dir / "debug.log"
-    enabled_targets = [t for t in config.get("targets", []) if t.get("enabled", True)]
-    total_steps = 1 + len(enabled_targets)
+    if selected_targets is None:
+        enabled_targets = [t for t in config.get("targets", []) if t.get("enabled", True)]
+    else:
+        enabled_targets = selected_targets
+    total_steps = (1 if include_archive else 0) + len(enabled_targets)
     summary: dict[str, Any] = {
         "run_id": run_id,
         "started_at": _iso(datetime.now(timezone.utc)),
         "finished_at": None,
         "status": "running",
-        "archive_ok": False,
+        "archive_ok": include_archive is False,
         "archive_file": backup_name,
         "archive_error": None,
+        "run_type": trigger,
+        "include_archive": bool(include_archive),
         "sync_total": len(enabled_targets),
         "sync_ok": 0,
         "sync_failed": 0,
@@ -758,38 +825,43 @@ def _run_backup_job(run_id: str, run_dir: Path, config: dict[str, Any], backup_n
     try:
         with _lock:
             _state.running = True
-            _state.active_step = "archive"
+            _state.active_step = "archive" if include_archive else "sync"
             _state.progress_current = 0
             _state.progress_total = max(total_steps, 1)
-            _state.progress_line = f"Starting archive {backup_name}"
+            _state.progress_line = f"Starting archive {backup_name}" if include_archive else "Starting target sync steps"
 
-        tar_cmd = [
-            "tar",
-            "--warning=no-file-changed",
-            "--ignore-failed-read",
-            "--checkpoint=500",
-            "--checkpoint-action=echo=archive checkpoint %u",
-            "-czf",
-            str(backup_path),
-            "-C",
-            "/data",
-            "milvus",
-            "etcd",
-            "minio",
-        ]
-        rc, last_line = _run_subprocess_with_logs(tar_cmd, main_log_path, debug_log_path, "archive")
-        summary["last_line"] = last_line
-        if rc == 0:
-            summary["archive_ok"] = True
-            _append_log(main_log_path, "Archive step completed.")
+        if include_archive:
+            tar_cmd = [
+                "tar",
+                "--warning=no-file-changed",
+                "--ignore-failed-read",
+                "--checkpoint=500",
+                "--checkpoint-action=echo=archive checkpoint %u",
+                "-czf",
+                str(backup_path),
+                "-C",
+                "/data",
+                "milvus",
+                "etcd",
+                "minio",
+            ]
+            rc, last_line = _run_subprocess_with_logs(tar_cmd, main_log_path, debug_log_path, "archive")
+            summary["last_line"] = last_line
+            if rc == 0:
+                summary["archive_ok"] = True
+                _append_log(main_log_path, "Archive step completed.")
+            else:
+                run_failed = True
+                summary["archive_error"] = f"tar exited with code {rc}"
+                summary["errors"].append(summary["archive_error"])
+                _append_log(main_log_path, f"Archive step failed: {summary['archive_error']}")
         else:
-            run_failed = True
-            summary["archive_error"] = f"tar exited with code {rc}"
-            summary["errors"].append(summary["archive_error"])
-            _append_log(main_log_path, f"Archive step failed: {summary['archive_error']}")
+            summary["archive_ok"] = True
+            summary["archive_file"] = None
+            summary["archive_error"] = "archive skipped for target-only backup"
 
         with _lock:
-            _state.progress_current = 1
+            _state.progress_current = 1 if include_archive else 0
             _state.active_step = "sync"
             _state.progress_line = "Starting target sync steps"
 
@@ -843,13 +915,13 @@ def _run_backup_job(run_id: str, run_dir: Path, config: dict[str, Any], backup_n
                 summary["errors"].append(err)
                 _append_log(main_log_path, err)
             with _lock:
-                _state.progress_current = 1 + idx
+                _state.progress_current = (1 if include_archive else 0) + idx
                 _state.progress_line = f"Completed {idx}/{len(enabled_targets)} sync targets"
             _write_run_summary(run_dir, summary)
             time.sleep(max(int(config.get("sleep_seconds", 5)), 0))
 
         pool = str(config.get("backup_pool") or "").strip()
-        if pool and shutil_which("zfs"):
+        if include_archive and pool and shutil_which("zfs"):
             snapshot_name = f"after_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
             summary["snapshot_name"] = snapshot_name
             with _lock:
@@ -864,9 +936,12 @@ def _run_backup_job(run_id: str, run_dir: Path, config: dict[str, Any], backup_n
                 summary["snapshot_status"] = "failed"
                 summary["snapshot_error"] = f"zfs snapshot exited with code {rc}"
                 summary["errors"].append(summary["snapshot_error"])
-        else:
+        elif include_archive:
             summary["snapshot_status"] = "skipped"
             summary["snapshot_error"] = "zfs command unavailable in runtime"
+        else:
+            summary["snapshot_status"] = "skipped"
+            summary["snapshot_error"] = "snapshot skipped for target-only backup"
 
         if summary["sync_failed"] > 0 or not summary["archive_ok"] or summary["snapshot_status"] == "failed":
             summary["status"] = "failed" if run_failed else "partial"
@@ -901,10 +976,24 @@ def _run_backup_job(run_id: str, run_dir: Path, config: dict[str, Any], backup_n
         _release_run_lock()
 
 
-def start_backup() -> dict[str, Any]:
+def start_backup(
+    target_ids: list[str] | None = None,
+    include_archive: bool = True,
+    trigger: str = "manual",
+) -> dict[str, Any]:
     BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     config = _load_backup_config()
+    selected_targets: list[dict[str, Any]] | None = None
+    if target_ids is not None:
+        requested_ids = {str(target_id).strip() for target_id in target_ids if str(target_id).strip()}
+        if not requested_ids:
+            raise ValueError("target_ids must include at least one target id")
+        selected_targets = [t for t in config.get("targets", []) if t.get("id") in requested_ids]
+        found_ids = {str(t.get("id")) for t in selected_targets}
+        missing_ids = requested_ids - found_ids
+        if missing_ids:
+            raise FileNotFoundError(", ".join(sorted(missing_ids)))
     with _lock:
         if _state.running:
             raise RuntimeError("Backup is already running.")
@@ -917,8 +1006,9 @@ def start_backup() -> dict[str, Any]:
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    backup_name = f"milvus_volumes_{stamp}.tar.gz"
-    backup_path = BACKUP_ROOT / backup_name
+    backup_name = f"milvus_volumes_{stamp}.tar.gz" if include_archive else ""
+    backup_path = BACKUP_ROOT / backup_name if include_archive else None
+    progress_targets = selected_targets if selected_targets is not None else [t for t in config["targets"] if t.get("enabled", True)]
     with _lock:
         _state.process = None
         _state.run_thread = None
@@ -928,15 +1018,15 @@ def start_backup() -> dict[str, Any]:
         _state.started_at = datetime.now(timezone.utc)
         _state.finished_at = None
         _state.exit_code = None
-        _state.active_step = "archive"
+        _state.active_step = "archive" if include_archive else "sync"
         _state.progress_current = 0
-        _state.progress_total = max(1 + len([t for t in config["targets"] if t.get("enabled", True)]), 1)
-        _state.progress_line = f"Backup started: {backup_name}"
+        _state.progress_total = max((1 if include_archive else 0) + len(progress_targets), 1)
+        _state.progress_line = f"Backup started: {backup_name}" if include_archive else "Target backup started."
         _state._run_lock_fd = run_lock_fd
 
     worker = threading.Thread(
         target=_run_backup_job,
-        args=(run_id, run_dir, config, backup_name, backup_path),
+        args=(run_id, run_dir, config, backup_name, backup_path, selected_targets, include_archive, trigger),
         daemon=True,
         name="backup-runner",
     )
@@ -944,6 +1034,13 @@ def start_backup() -> dict[str, Any]:
         _state.run_thread = worker
     worker.start()
     return get_backup_overview()
+
+
+def start_target_backup(target_id: str) -> dict[str, Any]:
+    clean_id = str(target_id or "").strip()
+    if not clean_id:
+        raise ValueError("target_id is required")
+    return start_backup(target_ids=[clean_id], include_archive=False, trigger="target")
 
 
 def stop_backup() -> dict[str, Any]:

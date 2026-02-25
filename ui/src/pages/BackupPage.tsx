@@ -5,6 +5,7 @@ import {
   deleteBackupTarget,
   getBackupOverview,
   getBackupRunLogs,
+  startBackupTarget,
   startBackup,
   stopBackup,
   toApiUrl,
@@ -131,6 +132,18 @@ export default function BackupPage() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete target.");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function onBackupTarget(target: BackupTarget) {
+    setWorking(true);
+    try {
+      await startBackupTarget(target.id);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start target backup.");
     } finally {
       setWorking(false);
     }
@@ -271,6 +284,14 @@ export default function BackupPage() {
                           </span>
                           {linkedTarget && (
                             <>
+                              <button
+                                className="tiny-button"
+                                disabled={working || overview.status.running || !target.ready}
+                                title={overview.status.running ? "A backup is already running." : "Run backup for this target only"}
+                                onClick={() => void onBackupTarget(linkedTarget)}
+                              >
+                                Backup
+                              </button>
                               <button className="tiny-button" onClick={() => void onToggleTarget(linkedTarget)}>
                                 {linkedTarget.enabled ? "Disable" : "Enable"}
                               </button>
@@ -286,6 +307,9 @@ export default function BackupPage() {
                         </div>
                       </div>
                       <p className="muted">{target.destination}</p>
+                      <p className="muted">
+                        Last backup: {target.last_backup_at ? new Date(target.last_backup_at).toLocaleString() : "Never"}
+                      </p>
                       <div className="target-health-meta">
                         <span>{target.source_exists && target.source_readable ? "Source OK" : "Source problem"}</span>
                         <span>{target.destination_exists && target.destination_writable ? "Destination writable" : "Destination problem"}</span>
@@ -447,7 +471,9 @@ export default function BackupPage() {
                   <strong>Status:</strong> {logs.summary.status}
                 </p>
                 <p>
-                  <strong>Archive:</strong> {logs.summary.archive_ok ? "OK" : "Failed"} ({logs.summary.archive_file})
+                  <strong>Archive:</strong>{" "}
+                  {logs.summary.include_archive === false ? "Skipped (target-only run)" : logs.summary.archive_ok ? "OK" : "Failed"}{" "}
+                  {logs.summary.archive_file ? `(${logs.summary.archive_file})` : ""}
                 </p>
                 <p>
                   <strong>Sync:</strong> {logs.summary.sync_ok}/{logs.summary.sync_total} OK, {logs.summary.sync_failed} failed

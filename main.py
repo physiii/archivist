@@ -19,6 +19,7 @@ from backups_service import (
     list_backup_targets,
     start_backup,
     start_scheduler_best_effort,
+    start_target_backup,
     stop_backup,
     update_backup_target,
     update_schedule,
@@ -392,6 +393,15 @@ def api_backup_targets_delete(target_id: str):
         return jsonify({"message": "Deleted"})
     except FileNotFoundError:
         return jsonify({"error": "Target not found"}), 404
+
+@app.route("/api/backups/targets/<target_id>/backup", methods=["POST"])
+def api_backup_target_run(target_id: str):
+    try:
+        return jsonify(start_target_backup(target_id))
+    except FileNotFoundError:
+        return jsonify({"error": "Target not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 409
 
 @app.route("/api/backups/files/<name>", methods=["GET"])
 def api_backup_file(name: str):
