@@ -13,6 +13,7 @@ export default function CollectionDetailPage() {
   const [previewPoints, setPreviewPoints] = useState<EmbeddingsPreviewPoint[]>([]);
   const [previewQueryPoint, setPreviewQueryPoint] = useState<{ vector: number[]; label: string; text?: string; distance?: number } | null>(null);
   const [selectedPointId, setSelectedPointId] = useState<string | number | null>(null);
+  const [selectedResult, setSelectedResult] = useState<SearchResult | null>(null);
   const [previewQueryError, setPreviewQueryError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -56,6 +57,7 @@ export default function CollectionDetailPage() {
       setPreviewPoints(payload.points ?? []);
       setPreviewQueryPoint(payload.query_point ?? null);
       setSelectedPointId(null);
+      setSelectedResult(null);
       setPreviewQueryError(payload.query_error ?? null);
       setError(null);
     } catch (err) {
@@ -152,7 +154,11 @@ export default function CollectionDetailPage() {
             points={previewPoints}
             queryPoint={previewQueryPoint}
             selectedPointId={selectedPointId}
-            onSelectPoint={(pointId) => setSelectedPointId(pointId)}
+            externalSelection={selectedResult ? { id: selectedResult.id, text: selectedResult.text, distance: selectedResult.distance } : null}
+            onSelectPoint={(pointId) => {
+              setSelectedPointId(pointId);
+              setSelectedResult(null);
+            }}
             loading={previewLoading}
           />
         )}
@@ -168,7 +174,10 @@ export default function CollectionDetailPage() {
               <div
                 key={`${String(result.id)}:${result.distance}`}
                 className={`snapshot-row clickable ${String(selectedPointId ?? "") === String(result.id) ? "active" : ""}`}
-                onClick={() => setSelectedPointId(result.id)}
+                onClick={() => {
+                  setSelectedPointId(result.id);
+                  setSelectedResult(result);
+                }}
               >
                 <div className="card-headline">
                   <span className="mono">#{String(result.id)}</span>

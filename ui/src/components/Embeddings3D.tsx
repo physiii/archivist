@@ -34,6 +34,7 @@ type Props = {
   points: EmbeddingsPreviewPoint[];
   queryPoint?: QueryMarker;
   selectedPointId?: string | number | null;
+  externalSelection?: { id: string | number; text?: string; distance?: number } | null;
   onSelectPoint?: (pointId: string | number | null) => void;
   loading?: boolean;
 };
@@ -63,13 +64,13 @@ function percentile(sorted: number[], p: number): number {
 
 function distanceColor(distance: number | null | undefined, minDistance: number, maxDistance: number): THREE.Color {
   if (typeof distance !== "number" || !Number.isFinite(distance)) {
-    return new THREE.Color("#5d75ca");
+    return new THREE.Color("#7f00ff");
   }
   const span = Math.max(maxDistance - minDistance, 1e-9);
   const t = clamp01((distance - minDistance) / span);
-  const h = 0.36 + t * 0.26;
-  const l = 0.56 - t * 0.08;
-  return new THREE.Color().setHSL(h, 0.95, l);
+  // Rainbow scale: red (query/close) -> violet (far).
+  const hue = t * 0.77;
+  return new THREE.Color().setHSL(hue, 1, 0.54);
 }
 
 function buildProjectionContext(raw: EmbeddingsPreviewPoint[]): ProjectionContext {
@@ -156,7 +157,14 @@ function projectQueryPoint(
   );
 }
 
-export default function Embeddings3D({ points, queryPoint, selectedPointId = null, onSelectPoint, loading = false }: Props) {
+export default function Embeddings3D({
+  points,
+  queryPoint,
+  selectedPointId = null,
+  externalSelection = null,
+  onSelectPoint,
+  loading = false
+}: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cloudRef = useRef<THREE.Points | null>(null);
   const selectedMarkerRef = useRef<THREE.Mesh | null>(null);
@@ -174,6 +182,27 @@ export default function Embeddings3D({ points, queryPoint, selectedPointId = nul
   }, [onSelectPoint]);
 
   useEffect(() => {
+    if (externalSelection) {
+      setSelected({
+        kind: "point",
+        point: {
+          id: externalSelection.id,
+          vector: [],
+          text: externalSelection.text,
+          query_distance: typeof externalSelection.distance === "number" ? externalSelection.distance : null
+        }
+      });
+      const matched = projected.find((entry) => String(entry.source.id) === String(externalSelection.id));
+      if (selectedMarkerRef.current && matched) {
+        selectedMarkerRef.current.visible = true;
+        selectedMarkerRef.current.position.set(matched.x, matched.y, matched.z);
+        const markerMat = selectedMarkerRef.current.material as THREE.MeshBasicMaterial;
+        markerMat.color.copy(matched.color);
+      } else if (selectedMarkerRef.current) {
+        selectedMarkerRef.current.visible = false;
+      }
+      return;
+    }
     if (selectedPointId === null || selectedPointId === undefined) {
       setSelected((prev) => (prev?.kind === "point" ? null : prev));
       if (selectedMarkerRef.current) selectedMarkerRef.current.visible = false;
@@ -188,7 +217,7 @@ export default function Embeddings3D({ points, queryPoint, selectedPointId = nul
       const markerMat = selectedMarkerRef.current.material as THREE.MeshBasicMaterial;
       markerMat.color.copy(matched.color);
     }
-  }, [projected, selectedPointId]);
+  }, [externalSelection, projected, selectedPointId]);
 
   useEffect(() => {
     const cloud = cloudRef.current;
@@ -288,7 +317,7 @@ export default function Embeddings3D({ points, queryPoint, selectedPointId = nul
     let queryCloud: THREE.Mesh | null = null;
     if (queryMarker) {
       queryGeometry = new THREE.BoxGeometry(0.07, 0.07, 0.07);
-      queryMaterial = new THREE.MeshBasicMaterial({ color: "#00ff66" });
+      queryMaterial = new THREE.MeshBasicMaterial({ color: "#ff1f1f" });
       queryCloud = new THREE.Mesh(queryGeometry, queryMaterial);
       queryCloud.position.copy(queryMarker);
       scene.add(queryCloud);
@@ -298,44 +327,41 @@ export default function Embeddings3D({ points, queryPoint, selectedPointId = nul
     scene.add(light);
 
     const pointer = new THREE.Vector2();
-    const tmp = new THREE.Vector3();
+    let pointerDownX = 0;
+    let pointerDownY = 0;
+    const raycaster = new THREE.Raycaster();
     const onPointerDown = (event: PointerEvent) => {
+      pointerDownX = event.clientX;
+      pointerDownY = event.clientY;
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      const dxm = event.clientX - pointerDownX;
+      const dym = event.clientY - pointerDownY;
+      if (dxm * dxm + dym * dym > 9) {
+        return;
+      }
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const cloudMat = cloud.material as THREE.PointsMaterial;
+      raycaster.params.Points.threshold = Math.min(0.04, Math.max(0.01, cloudMat.size * 1.1));
 
-      const pixelRadius = 14;
-      const maxNdc = (2 * pixelRadius) / Math.max(1, Math.min(rect.width, rect.height));
-      const maxDist2 = maxNdc * maxNdc;
+      const queryHits = queryCloud ? raycaster.intersectObject(queryCloud, false) : [];
+      const cloudHits = raycaster.intersectObject(cloud, false);
+      const nearestQuery = queryHits[0] ?? null;
+      const nearestCloud = cloudHits[0] ?? null;
 
-      // Query marker selection (if present).
-      if (queryMarker && queryPoint) {
-        tmp.copy(queryMarker).project(camera);
-        const dx = tmp.x - pointer.x;
-        const dy = tmp.y - pointer.y;
-        if (dx * dx + dy * dy <= maxDist2) {
-          setSelected({ kind: "query", query: queryPoint });
-          if (selectedMesh) selectedMesh.visible = false;
-          onSelectPointRef.current?.(null);
-          return;
-        }
+      if (nearestQuery && (!nearestCloud || nearestQuery.distance <= nearestCloud.distance) && queryPoint) {
+        setSelected({ kind: "query", query: queryPoint });
+        if (selectedMesh) selectedMesh.visible = false;
+        onSelectPointRef.current?.(null);
+        return;
       }
 
-      // Robust point picking in screen space.
-      let bestIdx = -1;
-      let bestD2 = Infinity;
-      for (let i = 0; i < projected.length; i++) {
-        tmp.set(projected[i].x, projected[i].y, projected[i].z).project(camera);
-        const dx = tmp.x - pointer.x;
-        const dy = tmp.y - pointer.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < bestD2) {
-          bestD2 = d2;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx >= 0 && bestD2 <= maxDist2) {
-        const picked = projected[bestIdx];
+      const idx = nearestCloud?.index ?? -1;
+      if (idx >= 0 && idx < projected.length) {
+        const picked = projected[idx];
         setSelected({ kind: "point", point: picked.source });
         if (selectedMesh) {
           selectedMesh.visible = true;
@@ -346,6 +372,7 @@ export default function Embeddings3D({ points, queryPoint, selectedPointId = nul
       }
     };
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
+    renderer.domElement.addEventListener("pointerup", onPointerUp);
 
     const resize = () => {
       if (!containerRef.current) return;
@@ -374,6 +401,7 @@ export default function Embeddings3D({ points, queryPoint, selectedPointId = nul
       window.cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+      renderer.domElement.removeEventListener("pointerup", onPointerUp);
       controls.dispose();
       geometry.dispose();
       material.dispose();
@@ -425,7 +453,7 @@ export default function Embeddings3D({ points, queryPoint, selectedPointId = nul
         </label>
       </div>
       <p className="muted">
-        Legend: green = closer, blue = farther (when query distance is present), brightest green = query point. Drag to rotate, scroll to zoom,
+        Legend: red = query/closest, rainbow to violet = farthest (when query distance is present). Drag to rotate, scroll to zoom,
         click points to inspect details.
       </p>
       <div className="embed-3d-shell">
