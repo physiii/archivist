@@ -6,6 +6,8 @@ type Props = {
 };
 
 export default function SearchAdvanced({ value, onChange }: Props) {
+  const metric = (value.metric_type ?? "L2").toUpperCase();
+  const thresholdSupported = metric === "L2" || metric === "COSINE";
   return (
     <details className="advanced-panel">
       <summary>Advanced</summary>
@@ -37,6 +39,30 @@ export default function SearchAdvanced({ value, onChange }: Props) {
             value={value.nprobe ?? 16}
             onChange={(event) => onChange({ ...value, nprobe: Number(event.target.value) || 16 })}
           />
+        </label>
+        <label>
+          <span className="muted">Max distance threshold</span>
+          <input
+            aria-label="Search max distance threshold"
+            type="number"
+            step="0.01"
+            value={value.max_distance ?? ""}
+            placeholder="Optional"
+            disabled={!thresholdSupported}
+            onChange={(event) => {
+              const raw = event.target.value.trim();
+              if (!raw) {
+                const { max_distance: _, ...rest } = value;
+                onChange(rest);
+                return;
+              }
+              const parsed = Number(raw);
+              onChange({ ...value, max_distance: Number.isFinite(parsed) ? parsed : undefined });
+            }}
+          />
+          <span className="muted" style={{ fontSize: "0.8rem" }}>
+            Sphere visualization supports L2/COSINE. Backend filtering applies on dense vector search.
+          </span>
         </label>
         <label>
           <span className="muted">Hybrid fusion</span>

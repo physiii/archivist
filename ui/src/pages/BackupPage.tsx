@@ -26,6 +26,30 @@ function formatBytes(value?: number | null) {
   return `${amount.toFixed(amount >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
 }
 
+function sourceBadge(item: {
+  exists: boolean;
+  readable: boolean;
+  mount_expected?: boolean;
+  mount_ok?: boolean;
+}): { label: string; ok: boolean } {
+  if (!item.exists) return { label: "Missing", ok: false };
+  if (!item.readable) return { label: "Unreadable", ok: false };
+  if (item.mount_expected && item.mount_ok === false) return { label: "Not mounted", ok: false };
+  return { label: "Ready", ok: true };
+}
+
+function destinationBadge(item: {
+  exists: boolean;
+  writable: boolean;
+  mount_expected?: boolean;
+  mount_ok?: boolean;
+}): { label: string; ok: boolean } {
+  if (!item.exists) return { label: "Missing", ok: false };
+  if (!item.writable) return { label: "Not writable", ok: false };
+  if (item.mount_expected && item.mount_ok === false) return { label: "Not mounted", ok: false };
+  return { label: "Writable", ok: true };
+}
+
 export default function BackupPage() {
   const [overview, setOverview] = useState<BackupOverview | null>(null);
   const [logs, setLogs] = useState<BackupLogResponse | null>(null);
@@ -311,9 +335,17 @@ export default function BackupPage() {
                         Last backup: {target.last_backup_at ? new Date(target.last_backup_at).toLocaleString() : "Never"}
                       </p>
                       <div className="target-health-meta">
-                        <span>{target.source_exists && target.source_readable ? "Source OK" : "Source problem"}</span>
-                        <span>{target.destination_exists && target.destination_writable ? "Destination writable" : "Destination problem"}</span>
-                        <span>{target.destination_separate_mount ? "Mounted" : "Not separate mount"}</span>
+                        <span>
+                          {target.source_exists && target.source_readable && (target.source_mount_ok ?? true)
+                            ? "Source OK"
+                            : "Source problem"}
+                        </span>
+                        <span>
+                          {target.destination_exists && target.destination_writable && (target.destination_mount_ok ?? false)
+                            ? "Destination writable"
+                            : "Destination problem"}
+                        </span>
+                        <span>{target.destination_mount_ok ?? target.destination_separate_mount ? "Mounted" : "Not mounted"}</span>
                       </div>
                     </div>
                   );
@@ -385,7 +417,10 @@ export default function BackupPage() {
                       <div key={`source-${item.path}`} className="storage-item">
                         <div className="storage-item-head">
                           <strong>{item.path}</strong>
-                          <span className={item.exists ? "health-badge ready" : "health-badge issue"}>{item.exists ? "Reachable" : "Missing"}</span>
+                          {(() => {
+                            const badge = sourceBadge(item);
+                            return <span className={badge.ok ? "health-badge ready" : "health-badge issue"}>{badge.label}</span>;
+                          })()}
                         </div>
                         <p className="muted">
                           Used {formatBytes(item.used_bytes)} / {formatBytes(item.total_bytes)} ({item.used_percent ?? "?"}%)
@@ -403,9 +438,10 @@ export default function BackupPage() {
                       <div key={`dest-${item.path}`} className="storage-item">
                         <div className="storage-item-head">
                           <strong>{item.path}</strong>
-                          <span className={item.writable ? "health-badge ready" : "health-badge issue"}>
-                            {item.writable ? "Writable" : "Not writable"}
-                          </span>
+                          {(() => {
+                            const badge = destinationBadge(item);
+                            return <span className={badge.ok ? "health-badge ready" : "health-badge issue"}>{badge.label}</span>;
+                          })()}
                         </div>
                         <p className="muted">
                           Used {formatBytes(item.used_bytes)} / {formatBytes(item.total_bytes)} ({item.used_percent ?? "?"}%)

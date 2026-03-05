@@ -37,11 +37,11 @@ SOURCE_DIRS = [
 
 # Seed values copied from current custodian config.
 DEFAULT_EXTERNAL_TARGETS = [
-    {"profile": "nas", "source": "/mass/scripts", "destination": "/home/andy/nas_mass"},
-    {"profile": "nas", "source": "/mass/Pictures", "destination": "/home/andy/nas_mass"},
-    {"profile": "nas", "source": "/mass/Documents", "destination": "/home/andy/nas_mass"},
-    {"profile": "nas", "source": "/mass/Backup/Glasses", "destination": "/home/andy/nas_mass"},
-    {"profile": "nas", "source": "/mass/Backup/Phone", "destination": "/home/andy/nas_mass"},
+    {"profile": "nas", "source": "/media/mass/scripts", "destination": "/home/andy/nas_mass"},
+    {"profile": "nas", "source": "/media/mass/Pictures", "destination": "/home/andy/nas_mass"},
+    {"profile": "nas", "source": "/media/mass/Documents", "destination": "/home/andy/nas_mass"},
+    {"profile": "nas", "source": "/media/mass/Backup/Glasses", "destination": "/home/andy/nas_mass"},
+    {"profile": "nas", "source": "/media/mass/Backup/Phone", "destination": "/home/andy/nas_mass"},
 ]
 
 DEFAULT_RSYNC_EXCLUDES = [
@@ -50,6 +50,9 @@ DEFAULT_RSYNC_EXCLUDES = [
     "--exclude=@eaDir/**",
     "--exclude=.Trash-*/**",
 ]
+
+LEGACY_MASS_PREFIX = "/mass"
+CANONICAL_MASS_PREFIX = "/media/mass"
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -136,7 +139,30 @@ def _get_mount_point(path: str) -> str:
     return current
 
 
-def _path_usage(path: str) -> dict[str, Any]:
+def _is_prefixed_path(path: str, prefix: str) -> bool:
+    clean = str(path or "").strip()
+    return clean == prefix or clean.startswith(f"{prefix}/")
+
+
+def _requires_separate_mount(path: str) -> bool:
+    return _is_prefixed_path(path, LEGACY_MASS_PREFIX) or _is_prefixed_path(path, CANONICAL_MASS_PREFIX)
+
+
+def _normalize_legacy_source_path(path: str) -> tuple[str, bool]:
+    clean = str(path or "").strip()
+    if not _is_prefixed_path(clean, LEGACY_MASS_PREFIX):
+        return clean, False
+    suffix = clean.removeprefix(LEGACY_MASS_PREFIX)
+    candidate = f"{CANONICAL_MASS_PREFIX}{suffix}"
+    legacy_exists = os.path.exists(clean)
+    legacy_is_mounted = os.path.ismount(LEGACY_MASS_PREFIX)
+    candidate_exists = os.path.exists(candidate)
+    if candidate_exists and (not legacy_exists or not legacy_is_mounted):
+        return candidate, True
+    return clean, False
+
+
+def _path_usage(path: str, expect_separate_mount: bool = False) -> dict[str, Any]:
     exists = os.path.exists(path)
     readable = os.access(path, os.R_OK) if exists else False
     writable = os.access(path, os.W_OK) if exists else False
@@ -151,6 +177,8 @@ def _path_usage(path: str) -> dict[str, Any]:
             "used_bytes": None,
             "free_bytes": None,
             "used_percent": None,
+            "mount_expected": bool(expect_separate_mount),
+            "mount_ok": False if expect_separate_mount else True,
         }
 
     try:
@@ -159,28 +187,36 @@ def _path_usage(path: str) -> dict[str, Any]:
         free = stats.f_bavail * stats.f_frsize
         used = total - free
         used_percent = round((used / total) * 100, 1) if total > 0 else 0.0
+        mount_point = _get_mount_point(path)
+        mount_ok = mount_point != "/" if expect_separate_mount else True
         return {
             "path": path,
             "exists": True,
             "readable": readable,
             "writable": writable,
-            "mount_point": _get_mount_point(path),
+            "mount_point": mount_point,
             "total_bytes": total,
             "used_bytes": used,
             "free_bytes": free,
             "used_percent": used_percent,
+            "mount_expected": bool(expect_separate_mount),
+            "mount_ok": mount_ok,
         }
     except OSError:
+        mount_point = _get_mount_point(path)
+        mount_ok = mount_point != "/" if expect_separate_mount else True
         return {
             "path": path,
             "exists": True,
             "readable": readable,
             "writable": writable,
-            "mount_point": _get_mount_point(path),
+            "mount_point": mount_point,
             "total_bytes": None,
             "used_bytes": None,
             "free_bytes": None,
             "used_percent": None,
+            "mount_expected": bool(expect_separate_mount),
+            "mount_ok": mount_ok,
         }
 
 
@@ -410,17 +446,22 @@ def _load_backup_config() -> dict[str, Any]:
         data = json.loads(BACKUP_CONFIG_FILE.read_text(encoding="utf-8"))
         targets = data.get("targets") if isinstance(data.get("targets"), list) else []
         clean_targets = []
+        config_changed = False
         for t in targets:
+            source = str(t.get("source") or "").strip()
+            normalized_source, source_changed = _normalize_legacy_source_path(source)
+            if source_changed:
+                config_changed = True
             clean_targets.append(
                 {
                     "id": str(t.get("id") or _new_target_id()),
                     "profile": str(t.get("profile") or "default"),
-                    "source": str(t.get("source") or "").strip(),
+                    "source": normalized_source,
                     "destination": str(t.get("destination") or "").strip(),
                     "enabled": bool(t.get("enabled", True)),
                 }
             )
-        return {
+        normalized = {
             "version": int(data.get("version", 1)),
             "backup_pool": data.get("backup_pool"),
             "rsync_bwlimit": data.get("rsync_bwlimit"),
@@ -429,6 +470,9 @@ def _load_backup_config() -> dict[str, Any]:
             "excludes": [str(x).strip() for x in (data.get("excludes") or []) if str(x).strip()],
             "targets": [t for t in clean_targets if t["source"] and t["destination"]],
         }
+        if config_changed:
+            _save_backup_config(normalized)
+        return normalized
     except Exception:
         seed = _load_custodian_seed()
         _save_backup_config(seed)
@@ -446,10 +490,11 @@ def list_backup_targets() -> list[dict[str, Any]]:
 
 def add_backup_target(profile: str, source: str, destination: str, enabled: bool = True) -> dict[str, Any]:
     config = _load_backup_config()
+    normalized_source, _ = _normalize_legacy_source_path(str(source or "").strip())
     item = {
         "id": _new_target_id(),
         "profile": str(profile or "default"),
-        "source": str(source or "").strip(),
+        "source": normalized_source,
         "destination": str(destination or "").strip(),
         "enabled": bool(enabled),
     }
@@ -468,7 +513,8 @@ def update_backup_target(target_id: str, payload: dict[str, Any]) -> dict[str, A
         if "profile" in payload:
             target["profile"] = str(payload.get("profile") or "default")
         if "source" in payload:
-            target["source"] = str(payload.get("source") or "").strip()
+            normalized_source, _ = _normalize_legacy_source_path(str(payload.get("source") or "").strip())
+            target["source"] = normalized_source
         if "destination" in payload:
             target["destination"] = str(payload.get("destination") or "").strip()
         if "enabled" in payload:
@@ -634,20 +680,30 @@ def _backup_files(limit: int = 20) -> list[dict[str, Any]]:
 def _target_health(profile: str, source: str, destination: str) -> dict[str, Any]:
     source_exists = os.path.exists(source)
     source_readable = os.access(source, os.R_OK) if source_exists else False
+    source_mount_point = _get_mount_point(source) if source_exists else None
+    source_mount_required = _requires_separate_mount(source)
+    source_mount_ok = bool(source_exists and source_mount_point and source_mount_point != "/") if source_mount_required else source_exists
     destination_exists = os.path.exists(destination)
     destination_writable = os.access(destination, os.W_OK) if destination_exists else False
-    mount_point = _get_mount_point(destination) if destination_exists else "/"
-    destination_separate_mount = mount_point != "/"
-    ready = all([source_exists, source_readable, destination_exists, destination_writable, destination_separate_mount])
+    destination_mount_point = _get_mount_point(destination) if destination_exists else None
+    destination_mount_required = True
+    destination_mount_ok = bool(destination_exists and destination_mount_point and destination_mount_point != "/")
+    ready = all([source_exists, source_readable, source_mount_ok, destination_exists, destination_writable, destination_mount_ok])
     return {
         "profile": profile,
         "source": source,
         "destination": destination,
         "source_exists": source_exists,
         "source_readable": source_readable,
+        "source_mount_point": source_mount_point,
+        "source_mount_required": source_mount_required,
+        "source_mount_ok": source_mount_ok,
         "destination_exists": destination_exists,
         "destination_writable": destination_writable,
-        "destination_separate_mount": destination_separate_mount,
+        "destination_mount_point": destination_mount_point,
+        "destination_mount_required": destination_mount_required,
+        "destination_mount_ok": destination_mount_ok,
+        "destination_separate_mount": destination_mount_ok,
         "ready": ready,
     }
 
@@ -682,8 +738,8 @@ def get_backup_overview() -> dict[str, Any]:
     source_paths = sorted({t["source"] for t in target_mappings})
     destination_paths = sorted({t["destination"] for t in target_mappings})
     storage_diagnostics = {
-        "sources": [_path_usage(path) for path in source_paths],
-        "destinations": [_path_usage(path) for path in destination_paths],
+        "sources": [_path_usage(path, expect_separate_mount=_requires_separate_mount(path)) for path in source_paths],
+        "destinations": [_path_usage(path, expect_separate_mount=True) for path in destination_paths],
         "filesystems": _df_usage(),
         "zfs": _zfs_diagnostics(cfg.get("backup_pool")),
     }

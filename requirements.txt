@@ -1,7 +1,0 @@
-requests
-flask
-pymilvus
-webvtt-py
-nltk
-tqdm
-gunicorn
