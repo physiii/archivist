@@ -22,9 +22,18 @@ volumes/
 
 test_data.txt 
 
+# Large local artifacts (avoid multi-GB docker build contexts)
+milvus_backup.tar
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+.pytest_cache/
+.tmp_backup_logs/
+.tmp_backup_logs_run_*.main.log
+
 # Frontend build artifacts
 ui/node_modules/
-ui/dist/
 ui/.playwright/
 ui/playwright-report/
 ui/test-results/

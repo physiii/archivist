@@ -51,8 +51,7 @@ DEFAULT_RSYNC_EXCLUDES = [
     "--exclude=.Trash-*/**",
 ]
 
-LEGACY_MASS_PREFIX = "/mass"
-CANONICAL_MASS_PREFIX = "/media/mass"
+MASS_PREFIX = "/media/mass"
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -63,8 +62,28 @@ def _tail(path: Path, lines: int = 120) -> str:
     if not path.exists():
         return ""
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as file:
-            return "".join(file.readlines()[-lines:])
+        if lines <= 0:
+            return ""
+        # Read from the end to avoid loading very large logs into memory.
+        with path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            end = file.tell()
+            if end <= 0:
+                return ""
+            chunk_size = 8192
+            position = end
+            buffer = b""
+            newline_count = 0
+            while position > 0 and newline_count <= lines:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                file.seek(position)
+                chunk = file.read(read_size)
+                buffer = chunk + buffer
+                newline_count = buffer.count(b"\n")
+            text = buffer.decode("utf-8", errors="replace")
+            tail_lines = text.splitlines(keepends=True)[-lines:]
+            return "".join(tail_lines)
     except OSError:
         return ""
 
@@ -145,21 +164,7 @@ def _is_prefixed_path(path: str, prefix: str) -> bool:
 
 
 def _requires_separate_mount(path: str) -> bool:
-    return _is_prefixed_path(path, LEGACY_MASS_PREFIX) or _is_prefixed_path(path, CANONICAL_MASS_PREFIX)
-
-
-def _normalize_legacy_source_path(path: str) -> tuple[str, bool]:
-    clean = str(path or "").strip()
-    if not _is_prefixed_path(clean, LEGACY_MASS_PREFIX):
-        return clean, False
-    suffix = clean.removeprefix(LEGACY_MASS_PREFIX)
-    candidate = f"{CANONICAL_MASS_PREFIX}{suffix}"
-    legacy_exists = os.path.exists(clean)
-    legacy_is_mounted = os.path.ismount(LEGACY_MASS_PREFIX)
-    candidate_exists = os.path.exists(candidate)
-    if candidate_exists and (not legacy_exists or not legacy_is_mounted):
-        return candidate, True
-    return clean, False
+    return _is_prefixed_path(path, MASS_PREFIX)
 
 
 def _path_usage(path: str, expect_separate_mount: bool = False) -> dict[str, Any]:
@@ -446,17 +451,12 @@ def _load_backup_config() -> dict[str, Any]:
         data = json.loads(BACKUP_CONFIG_FILE.read_text(encoding="utf-8"))
         targets = data.get("targets") if isinstance(data.get("targets"), list) else []
         clean_targets = []
-        config_changed = False
         for t in targets:
-            source = str(t.get("source") or "").strip()
-            normalized_source, source_changed = _normalize_legacy_source_path(source)
-            if source_changed:
-                config_changed = True
             clean_targets.append(
                 {
                     "id": str(t.get("id") or _new_target_id()),
                     "profile": str(t.get("profile") or "default"),
-                    "source": normalized_source,
+                    "source": str(t.get("source") or "").strip(),
                     "destination": str(t.get("destination") or "").strip(),
                     "enabled": bool(t.get("enabled", True)),
                 }
@@ -470,8 +470,6 @@ def _load_backup_config() -> dict[str, Any]:
             "excludes": [str(x).strip() for x in (data.get("excludes") or []) if str(x).strip()],
             "targets": [t for t in clean_targets if t["source"] and t["destination"]],
         }
-        if config_changed:
-            _save_backup_config(normalized)
         return normalized
     except Exception:
         seed = _load_custodian_seed()
@@ -490,11 +488,10 @@ def list_backup_targets() -> list[dict[str, Any]]:
 
 def add_backup_target(profile: str, source: str, destination: str, enabled: bool = True) -> dict[str, Any]:
     config = _load_backup_config()
-    normalized_source, _ = _normalize_legacy_source_path(str(source or "").strip())
     item = {
         "id": _new_target_id(),
         "profile": str(profile or "default"),
-        "source": normalized_source,
+        "source": str(source or "").strip(),
         "destination": str(destination or "").strip(),
         "enabled": bool(enabled),
     }
@@ -513,8 +510,7 @@ def update_backup_target(target_id: str, payload: dict[str, Any]) -> dict[str, A
         if "profile" in payload:
             target["profile"] = str(payload.get("profile") or "default")
         if "source" in payload:
-            normalized_source, _ = _normalize_legacy_source_path(str(payload.get("source") or "").strip())
-            target["source"] = normalized_source
+            target["source"] = str(payload.get("source") or "").strip()
         if "destination" in payload:
             target["destination"] = str(payload.get("destination") or "").strip()
         if "enabled" in payload:

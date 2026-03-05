@@ -1,0 +1,7 @@
+Flask
+gunicorn
+pymilvus
+nltk
+requests
+tqdm
+webvtt-py

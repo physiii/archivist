@@ -1,0 +1,34 @@
+name: archivist
+
+services:
+  archivist:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: archivist:latest
+    container_name: archivist
+    environment:
+      MILVUS_HOST: host.docker.internal
+      EMBEDDING_HOST: host.docker.internal
+      EMBEDDING_PORT: "8000"
+      VECTORSTORE_METRIC_TYPE: COSINE
+      METRIC_TYPE: COSINE
+      INDEXING_PATH_ALIASES: /media/mass=/media/mass;/home/andy/nas_mass=/home/andy/nas_mass
+      INDEXING_SCAN_TIMEOUT_SECONDS: "900"
+      INDEXING_FILE_DISCOVERY_TIMEOUT_SECONDS: "900"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "5050:5050"
+    volumes:
+      - vectorstore_vectorstore-backups:/backups
+      - vectorstore_vectorstore-indexing:/indexing
+      - /media/mass:/media/mass
+      - /home/andy/nas_mass:/home/andy/nas_mass
+    restart: unless-stopped
+
+volumes:
+  vectorstore_vectorstore-backups:
+    external: true
+  vectorstore_vectorstore-indexing:
+    external: true

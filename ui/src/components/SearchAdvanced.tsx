@@ -6,24 +6,16 @@ type Props = {
 };
 
 export default function SearchAdvanced({ value, onChange }: Props) {
-  const metric = (value.metric_type ?? "L2").toUpperCase();
+  const metric = (value.metric_type ?? "COSINE").toUpperCase();
   const thresholdSupported = metric === "L2" || metric === "COSINE";
   return (
     <details className="advanced-panel">
       <summary>Advanced</summary>
       <div className="advanced-grid">
         <label>
-          <span className="muted">Path filter</span>
-          <input
-            value={value.path ?? ""}
-            onChange={(event) => onChange({ ...value, path: event.target.value })}
-            placeholder="/path/to/file.txt"
-          />
-        </label>
-        <label>
           <span className="muted">Metric</span>
           <select
-            value={(value.metric_type ?? "L2").toUpperCase()}
+            value={(value.metric_type ?? "COSINE").toUpperCase()}
             onChange={(event) => onChange({ ...value, metric_type: event.target.value })}
           >
             <option value="L2">L2</option>

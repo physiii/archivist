@@ -18,7 +18,7 @@ export default function CollectionsPage() {
     limit: 20,
     unique: false,
     path: "",
-    metric_type: "L2",
+    metric_type: "COSINE",
     nprobe: 16,
     hybrid_fusion: "weighted",
     hybrid_dense_weight: 0.65,
@@ -45,6 +45,7 @@ export default function CollectionsPage() {
       const payload = await globalSearchCollections({
         query,
         ...searchOptions,
+        path: "",
         per_collection_limit: Math.max(searchOptions.limit, 20)
       });
       setGlobalResults(payload.results ?? []);

@@ -502,6 +502,9 @@ export default function BackupPage() {
             {!logs?.summary ? (
               <p className="muted">No structured summary found for this run yet.</p>
             ) : (
+              (() => {
+                const syncResults = logs.summary?.sync_results ?? [];
+                return (
               <div className="run-outcome-grid">
                 <p>
                   <strong>Status:</strong> {logs.summary.status}
@@ -524,9 +527,9 @@ export default function BackupPage() {
                     ))}
                   </div>
                 )}
-                {logs.summary.sync_results?.length > 0 && (
+                {syncResults.length > 0 && (
                   <div className="run-list">
-                    {logs.summary.sync_results.map((item) => (
+                    {syncResults.map((item) => (
                       <div key={`${item.source}-${item.destination}`} className="snapshot-row">
                         <span>
                           {item.source} → {item.destination}
@@ -539,6 +542,8 @@ export default function BackupPage() {
                   </div>
                 )}
               </div>
+                );
+              })()
             )}
           </div>
 
