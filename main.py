@@ -7,6 +7,10 @@ import logging
 import traceback
 import math
 import time
+try:
+    import numpy as np
+except Exception:
+    np = None
 from pymilvus import connections, utility, Collection, DataType
 from uuid import uuid4
 import os
@@ -168,6 +172,19 @@ def _vector_dim_from_collection(collection: Collection) -> int | None:
         pass
     return None
 
+def _vector_index_metric_from_collection(collection: Collection) -> str | None:
+    try:
+        for index in (collection.indexes or []):
+            if getattr(index, "field_name", "") != "vector":
+                continue
+            params = getattr(index, "params", {}) or {}
+            metric = params.get("metric_type")
+            if metric:
+                return str(metric).strip().upper()
+    except Exception:
+        pass
+    return None
+
 def _vector_norm(values: list[float]) -> float:
     return math.sqrt(sum(v * v for v in values))
 
@@ -193,6 +210,136 @@ def _metric_distance(metric_type: str, vector: list[float], query_vector: list[f
             cosine_sim = _cosine_similarity(vector, query_vector)
         return None if cosine_sim is None else max(0.0, 1.0 - cosine_sim)
     return None
+
+def _sample_vector_dimensions(values: list[float], target_dim: int) -> list[float]:
+    if not values:
+        return values
+    if len(values) <= target_dim:
+        return [float(v) for v in values]
+    if target_dim <= 1:
+        return [float(values[0])]
+    out = []
+    last = len(values) - 1
+    for i in range(target_dim):
+        src_idx = int(round((i / (target_dim - 1)) * last))
+        out.append(float(values[src_idx]))
+    return out
+
+
+def _normalize_matrix_rows(matrix):
+    if np is None or matrix.size == 0:
+        return matrix
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-9)
+    return matrix / norms
+
+def _normalize_vector_row(vector):
+    if np is None:
+        return vector
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-9:
+        return vector
+    return vector / norm
+
+def _append_orthonormal_axis(existing_axes: list, candidate, axis_count: int) -> bool:
+    if np is None:
+        return False
+    if candidate is None or candidate.size == 0:
+        return False
+    axis = candidate.astype(np.float32, copy=True)
+    for prev in existing_axes:
+        axis = axis - float(np.dot(axis, prev)) * prev
+    norm = float(np.linalg.norm(axis))
+    if norm <= 1e-7:
+        return False
+    existing_axes.append(axis / norm)
+    return len(existing_axes) >= axis_count
+
+def _project_embedding_preview(
+    vectors: list[list[float]],
+    preview_dim_target: int,
+    query_vector: list[float] | None = None,
+    metric_type: str | None = None,
+):
+    if not vectors:
+        return {
+            "vectors": [],
+            "query_vector": _sample_vector_dimensions(query_vector or [], preview_dim_target) if query_vector else None,
+            "axis_labels": [f"Axis {idx + 1}" for idx in range(preview_dim_target)],
+            "method": "sampled_dimensions",
+        }
+
+    if np is None:
+        return {
+            "vectors": [_sample_vector_dimensions(vector, preview_dim_target) for vector in vectors],
+            "query_vector": _sample_vector_dimensions(query_vector or [], preview_dim_target) if query_vector else None,
+            "axis_labels": [f"Axis {idx + 1}" for idx in range(preview_dim_target)],
+            "method": "sampled_dimensions",
+        }
+
+    matrix = np.asarray(vectors, dtype=np.float32)
+    query = np.asarray(query_vector, dtype=np.float32) if query_vector is not None else None
+    metric = str(metric_type or "COSINE").strip().upper()
+    if metric in {"COSINE", "IP"}:
+        matrix = _normalize_matrix_rows(matrix)
+        if query is not None:
+            query = _normalize_vector_row(query)
+
+    fit_origin = matrix.mean(axis=0, keepdims=True)
+    centered = matrix - fit_origin
+    query_centered = (query - fit_origin[0]) if query is not None else None
+
+    fit_matrix = centered
+    max_fit_rows = 192
+    if centered.shape[0] > max_fit_rows:
+        fit_indices = np.linspace(0, centered.shape[0] - 1, num=max_fit_rows, dtype=np.int32)
+        fit_matrix = centered[fit_indices]
+
+    axes = []
+    axis_labels: list[str] = []
+    method = "query_origin_global_pca" if query is not None else "pca"
+
+    if fit_matrix.shape[0] > 0 and fit_matrix.shape[1] > 0:
+        try:
+            _, _, vh = np.linalg.svd(fit_matrix, full_matrices=False)
+            for candidate in vh:
+                done = _append_orthonormal_axis(axes, candidate, preview_dim_target)
+                if len(axis_labels) < len(axes):
+                    axis_labels.append(f"Semantic PC {len(axis_labels) + 1}")
+                if done:
+                    break
+        except Exception:
+            pass
+
+    if len(axes) < preview_dim_target:
+        basis = np.eye(matrix.shape[1], dtype=np.float32)
+        for candidate in basis:
+            done = _append_orthonormal_axis(axes, candidate, preview_dim_target)
+            if len(axis_labels) < len(axes):
+                axis_labels.append(f"Axis {len(axis_labels) + 1}")
+            if done:
+                break
+
+    axis_matrix = np.stack(axes[:preview_dim_target], axis=1).astype(np.float32, copy=False)
+    projected = centered @ axis_matrix
+    query_projected = (query_centered @ axis_matrix) if query_centered is not None else None
+    if query_projected is not None:
+        projected = projected - query_projected
+        query_projected = np.zeros(preview_dim_target, dtype=np.float32)
+
+    scale_source = projected
+    scales = np.percentile(np.abs(scale_source), 90, axis=0)
+    scales = np.maximum(scales, 1e-6)
+    projected = projected / scales
+    if query_projected is not None:
+        query_projected = query_projected / scales
+
+    return {
+        "vectors": projected.astype(np.float32).tolist(),
+        "query_vector": query_projected.astype(np.float32).tolist() if query_projected is not None else None,
+        "axis_labels": axis_labels[:preview_dim_target],
+        "method": method,
+    }
 
 def _pick_first_value(row: dict, keys: list[str]):
     for key in keys:
@@ -330,7 +477,7 @@ def api_collection_embeddings_preview(name: str):
     limit = max(10, min(_as_int(request.args.get("limit"), 1000) or 1000, 10000))
     offset = max(0, _as_int(request.args.get("offset"), 0) or 0)
     query = (request.args.get("query") or "").strip()
-    metric_type = str(request.args.get("metric_type") or "COSINE").strip().upper()
+    metric_type = str(request.args.get("metric_type") or "").strip().upper()
     preview_dim_target = _as_int(request.args.get("preview_dim"), 3) or 3
     preview_dim_target = max(3, min(preview_dim_target, 12))
     embedding_host = request.args.get("embedding_host", EMBEDDING_HOST)
@@ -346,6 +493,8 @@ def api_collection_embeddings_preview(name: str):
         # Milvus may unload collections during heavy ingest; ensure it's loaded before query.
         coll.load()
         vector_dim = _vector_dim_from_collection(coll)
+        vector_index_metric = _vector_index_metric_from_collection(coll)
+        effective_metric_type = metric_type or vector_index_metric or "COSINE"
         field_names = {f.name for f in coll.schema.fields}
         if "vector" not in field_names:
             return jsonify({"error": "Collection does not contain a 'vector' field"}), 422
@@ -358,28 +507,98 @@ def api_collection_embeddings_preview(name: str):
             output_fields.append(field_name)
         output_fields.insert(0, "vector")
 
+        query_error = None
+        query_point = None
+        query_vector_full = None
+        if query:
+            try:
+                query_vectors = embed_text_to_vector(
+                    [query],
+                    LOCAL_EMBEDDING_MODEL,
+                    is_local=True,
+                    embedding_host=embedding_host,
+                    embedding_port=embedding_port,
+                )
+                expected_dim = vector_dim or 0
+                validated = validate_embeddings(query_vectors, expected_dim)
+                query_vector_full = validated[0] if validated else None
+                if query_vector_full is None:
+                    query_error = "Could not generate a query embedding with matching dimensions."
+            except Exception as e:
+                query_error = f"Query embedding failed: {str(e)}"
+
         started = time.time()
         rows = []
-        iterator = None
-        try:
-            iterator = coll.query_iterator(
-                batch_size=min(128, max(16, limit)),
-                limit=offset + limit,
-                expr="id >= 0",
-                output_fields=output_fields,
-                timeout=25,
-            )
-            while len(rows) < (offset + limit):
-                batch_rows = iterator.next()
-                if not batch_rows:
+        seen_row_ids: set[str] = set()
+
+        def _append_preview_row(row: dict) -> None:
+            row_id = str(row.get("id"))
+            if not row_id or row_id in seen_row_ids:
+                return
+            seen_row_ids.add(row_id)
+            rows.append(row)
+
+        if query_vector_full is not None:
+            try:
+                neighbor_limit = min(max(limit // 3, 200), max(limit - 50, 1))
+                search_rows = coll.search(
+                    data=[[float(v) for v in query_vector_full]],
+                    anns_field="vector",
+                    param={"metric_type": effective_metric_type, "params": {"nprobe": 16}},
+                    limit=min(max(offset + neighbor_limit, neighbor_limit), 10000),
+                    output_fields=output_fields,
+                )
+                for hits in search_rows or []:
+                    for hit in hits:
+                        row = {"id": hit.id}
+                        for field_name in output_fields:
+                            row[field_name] = hit.get(field_name)
+                        _append_preview_row(row)
+            except Exception as e:
+                app.logger.exception("Query-centered embeddings preview search failed for %s", raw_name)
+                query_error = f"Preview neighborhood search failed: {str(e)}"
+                rows = []
+                seen_row_ids.clear()
+
+        context_target = max(offset + limit, limit)
+        if len(rows) < context_target:
+            iterator = None
+            context_pool = []
+            try:
+                iterator = coll.query_iterator(
+                    batch_size=min(128, max(16, limit)),
+                    limit=min(max(context_target * 3, context_target), 6000),
+                    expr="id >= 0",
+                    output_fields=output_fields,
+                    timeout=25,
+                )
+                while len(context_pool) < min(max(context_target * 3, context_target), 6000):
+                    batch_rows = iterator.next()
+                    if not batch_rows:
+                        break
+                    context_pool.extend(batch_rows)
+            finally:
+                if iterator is not None:
+                    try:
+                        iterator.close()
+                    except Exception:
+                        pass
+
+            if query_vector_full is None:
+                candidate_rows = context_pool
+            else:
+                # Blend query-nearest rows with a stable background sample so searched views
+                # still make sense relative to the default plot context the user saw first.
+                step = max(1, len(context_pool) // max(context_target - len(rows), 1))
+                candidate_rows = context_pool[::step]
+                if len(candidate_rows) < (context_target - len(rows)):
+                    candidate_rows = context_pool
+
+            for row in candidate_rows:
+                _append_preview_row(row)
+                if len(rows) >= context_target:
                     break
-                rows.extend(batch_rows)
-        finally:
-            if iterator is not None:
-                try:
-                    iterator.close()
-                except Exception:
-                    pass
+
         if offset > 0:
             rows = rows[offset : offset + limit]
         else:
@@ -388,26 +607,11 @@ def api_collection_embeddings_preview(name: str):
         points = []
         full_vectors: list[list[float]] = []
 
-        def _compress_vector(values: list[float]) -> list[float]:
-            if not values:
-                return values
-            if len(values) <= preview_dim_target:
-                return values
-            if preview_dim_target <= 1:
-                return [values[0]]
-            out = []
-            last = len(values) - 1
-            for i in range(preview_dim_target):
-                src_idx = int(round((i / (preview_dim_target - 1)) * last))
-                out.append(float(values[src_idx]))
-            return out
-
         for row in rows:
             row_vector = row.get("vector")
             if not isinstance(row_vector, list) or not row_vector:
                 continue
             full_vector = [float(v) for v in row_vector]
-            vector = _compress_vector(full_vector)
             text_raw = row.get("text") or row.get("snippet") or ""
             text = str(text_raw)[:180]
             metadata = {
@@ -421,7 +625,7 @@ def api_collection_embeddings_preview(name: str):
             outlier_value = _as_float(_pick_first_value(row, ["outlier", "outlier_score", "anomaly_score"]))
             point = {
                 "id": row.get("id"),
-                "vector": vector,
+                "vector": [],
                 "text": text,
                 "embedding_model": row.get("embedding_model") or "",
                 "creation_date": row.get("creation_date"),
@@ -433,46 +637,44 @@ def api_collection_embeddings_preview(name: str):
                 "density": density_value,
                 "outlier_score": outlier_value,
                 "metadata": metadata,
-                "magnitude": _vector_norm(vector),
+                "magnitude": None,
                 "full_magnitude": _vector_norm(full_vector),
                 "similarity": None,
                 "query_distance": None,
             }
             points.append(point)
-            if query:
-                full_vectors.append(full_vector)
+            full_vectors.append(full_vector)
 
-        query_error = None
-        query_point = None
-        if query and full_vectors:
-            try:
-                query_vectors = embed_text_to_vector(
-                    [query],
-                    LOCAL_EMBEDDING_MODEL,
-                    is_local=True,
-                    embedding_host=embedding_host,
-                    embedding_port=embedding_port,
-                )
-                expected_dim = vector_dim or len(full_vectors[0])
-                validated = validate_embeddings(query_vectors, expected_dim)
-                query_vector_full = validated[0] if validated else None
-                if query_vector_full is None:
-                    query_error = "Could not generate a query embedding with matching dimensions."
-                else:
-                    query_vector_preview = _compress_vector([float(v) for v in query_vector_full])
-                    query_point = {
-                        "vector": query_vector_preview,
-                        "magnitude": _vector_norm(query_vector_preview),
-                        "label": "query",
-                        "text": query,
-                        "distance": 0.0,
-                    }
-                    for idx, point in enumerate(points):
-                        similarity = _cosine_similarity(full_vectors[idx], query_vector_full)
-                        point["similarity"] = similarity
-                        point["query_distance"] = _metric_distance(metric_type, full_vectors[idx], query_vector_full, similarity)
-            except Exception as e:
-                query_error = f"Query embedding failed: {str(e)}"
+        if query_vector_full is not None:
+            query_point = {
+                "vector": [],
+                "magnitude": None,
+                "label": "query",
+                "text": query,
+                "distance": 0.0,
+            }
+            for idx, point in enumerate(points):
+                similarity = _cosine_similarity(full_vectors[idx], query_vector_full)
+                point["similarity"] = similarity
+                point["query_distance"] = _metric_distance(effective_metric_type, full_vectors[idx], query_vector_full, similarity)
+
+        projection = _project_embedding_preview(
+            vectors=full_vectors,
+            preview_dim_target=preview_dim_target,
+            query_vector=[float(v) for v in query_vector_full] if query_vector_full is not None else None,
+            metric_type=effective_metric_type,
+        )
+
+        projected_vectors = projection.get("vectors") or []
+        for idx, point in enumerate(points):
+            vector = projected_vectors[idx] if idx < len(projected_vectors) else [0.0] * preview_dim_target
+            point["vector"] = [float(v) for v in vector]
+            point["magnitude"] = _vector_norm(point["vector"])
+
+        projected_query_vector = projection.get("query_vector")
+        if query_point is not None:
+            query_point["vector"] = [float(v) for v in (projected_query_vector or [0.0] * preview_dim_target)]
+            query_point["magnitude"] = _vector_norm(query_point["vector"])
 
         preview_vector_dim = len(points[0]["vector"]) if points and isinstance(points[0].get("vector"), list) else (vector_dim or 0)
 
@@ -491,6 +693,9 @@ def api_collection_embeddings_preview(name: str):
                     "returned": len(points),
                     "has_similarity": bool(query and not query_error),
                     "preview_dim": preview_vector_dim,
+                    "metric_type": effective_metric_type,
+                    "projection_method": projection.get("method"),
+                    "axis_labels": projection.get("axis_labels") or [],
                 },
             }
         )

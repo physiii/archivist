@@ -5,6 +5,10 @@ import SearchAdvanced from "../components/SearchAdvanced";
 import { globalSearchCollections, listCollections } from "../lib/api";
 import type { CollectionCard, SearchAdvancedOptions, SearchResult } from "../types";
 
+function getResultPath(result: SearchResult): string {
+  return String(result.path || result.source_id || "").trim();
+}
+
 export default function CollectionsPage() {
   const [collections, setCollections] = useState<CollectionCard[]>([]);
   const [loading, setLoading] = useState(true);
@@ -18,7 +22,6 @@ export default function CollectionsPage() {
     limit: 20,
     unique: false,
     path: "",
-    metric_type: "COSINE",
     nprobe: 16,
     hybrid_fusion: "weighted",
     hybrid_dense_weight: 0.65,
@@ -106,31 +109,39 @@ export default function CollectionsPage() {
             </span>
           </div>
           <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
-            {globalResults.map((r) => (
-              <div key={`${r.collection ?? "unknown"}:${String(r.id)}:${r.distance}`} className="card">
-                <div className="card-headline">
-                  <h3 className="mono" title={String(r.id)}>
-                    #{r.id}
-                  </h3>
-                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                    <span className="pill">{r.collection ?? "unknown"}</span>
-                    <span className="pill">
-                      <span className="status-dot warning" />
-                      <span>{Number.isFinite(r.distance) ? r.distance.toFixed(4) : "—"}</span>
-                    </span>
+            {globalResults.map((r) => {
+              const resultPath = getResultPath(r);
+              return (
+                <div key={`${r.collection ?? "unknown"}:${String(r.id)}:${r.distance}`} className="card">
+                  <div className="card-headline">
+                    <h3 className="mono" title={String(r.id)}>
+                      #{r.id}
+                    </h3>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span className="pill">{r.collection ?? "unknown"}</span>
+                      <span className="pill">
+                        <span className="status-dot warning" />
+                        <span>{Number.isFinite(r.distance) ? r.distance.toFixed(4) : "—"}</span>
+                      </span>
+                    </div>
+                  </div>
+                  <div className="muted mono" style={{ fontSize: "0.84rem" }}>
+                    {r.creation_date ? `Indexed ${r.creation_date}` : ""}
+                  </div>
+                  {resultPath && (
+                    <div className="muted mono" style={{ fontSize: "0.84rem" }} title={resultPath}>
+                      {resultPath}
+                    </div>
+                  )}
+                  <pre className="terminal">{(r.text ?? "").trim() || "—"}</pre>
+                  <div>
+                    <Link className="button-link" to={`/collections/${encodeURIComponent(r.collection ?? "")}`}>
+                      Open Collection
+                    </Link>
                   </div>
                 </div>
-                <div className="muted mono" style={{ fontSize: "0.84rem" }}>
-                  {r.creation_date ?? ""}
-                </div>
-                <pre className="terminal">{(r.text ?? "").trim() || "—"}</pre>
-                <div>
-                  <Link className="button-link" to={`/collections/${encodeURIComponent(r.collection ?? "")}`}>
-                    Open Collection
-                  </Link>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

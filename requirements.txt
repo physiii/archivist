@@ -5,3 +5,4 @@ nltk
 requests
 tqdm
 webvtt-py
+numpy

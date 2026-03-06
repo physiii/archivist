@@ -20,8 +20,18 @@ export type SearchResult = {
   distance: number;
   text?: string;
   creation_date?: string;
+  filehash?: string;
+  path?: string;
+  source_id?: string;
+  chunk_duration_s?: number;
+  level?: number;
+  t_start_ms?: number;
+  t_end_ms?: number;
+  doc_type?: string;
+  source_type?: string;
   collection?: string;
   collection_raw?: string;
+  tags?: unknown;
 };
 
 export type CollectionCard = {
@@ -263,6 +273,7 @@ export type EmbeddingsPreviewPoint = {
   id: string | number;
   vector: number[];
   text?: string;
+  tags?: unknown;
   label?: string | null;
   cluster?: string | number | null;
   similarity?: number | null;
@@ -285,5 +296,8 @@ export type EmbeddingsPreviewResponse = {
   query_error?: string | null;
   meta?: {
     returned?: number;
+    metric_type?: string;
+    projection_method?: string;
+    axis_labels?: string[];
   };
 };

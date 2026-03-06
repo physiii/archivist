@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -48,6 +49,16 @@ SUPPORTED_EXTS = {".vtt", ".srt", ".tsv", ".txt"}
 INDEXING_CONTENT_VERSION = "transcript_v6"
 HOST_MOUNT_ROOT = Path(os.getenv("HOST_MOUNT_ROOT", "/host"))
 INDEXING_HOST_PATH_FALLBACK = os.getenv("INDEXING_HOST_PATH_FALLBACK", "1").strip().lower() in {"1", "true", "yes"}
+LEGACY_PATH_PREFIX_ALIASES = {
+    "/mass": "/media/mass",
+}
+TRANSCRIPT_EXT_PRIORITY = {
+    ".vtt": 0,
+    ".srt": 1,
+    ".tsv": 2,
+    ".txt": 3,
+}
+TRANSCRIPT_PATH_SUFFIX_RE = re.compile(r"(?i)(?:\.ts)?\.(vtt|srt|tsv|txt)$")
 # Container path aliases for host paths users commonly enter in the UI.
 # Format: "/host/prefix=/container/prefix;/other/host=/other/container"
 INDEXING_PATH_ALIASES = os.getenv(
@@ -265,6 +276,10 @@ def _alias_pairs() -> list[tuple[str, str]]:
         container_prefix = str(Path(container_prefix.strip()).as_posix()).rstrip("/")
         if host_prefix and container_prefix:
             pairs.append((host_prefix, container_prefix))
+    existing_hosts = {host_prefix for host_prefix, _ in pairs}
+    for legacy_prefix, canonical_prefix in LEGACY_PATH_PREFIX_ALIASES.items():
+        if legacy_prefix not in existing_hosts:
+            pairs.append((legacy_prefix, canonical_prefix))
     return pairs
 
 
@@ -284,6 +299,52 @@ def _to_runtime_path(path: str) -> str:
             suffix = clean[len(host_prefix) :]
             return f"{container_prefix}{suffix}"
     return clean
+
+
+def _legacy_path_variants(path: str) -> set[str]:
+    clean = str(Path(str(path or "")).as_posix())
+    variants = {clean}
+    for legacy_prefix, canonical_prefix in LEGACY_PATH_PREFIX_ALIASES.items():
+        if clean == legacy_prefix or clean.startswith(legacy_prefix + "/"):
+            variants.add(canonical_prefix + clean[len(legacy_prefix) :])
+        if clean == canonical_prefix or clean.startswith(canonical_prefix + "/"):
+            variants.add(legacy_prefix + clean[len(canonical_prefix) :])
+    return {item for item in variants if item}
+
+
+def _canonicalize_transcript_path(path: str) -> str:
+    clean = str(Path(str(path or "")).as_posix())
+    for legacy_prefix, canonical_prefix in LEGACY_PATH_PREFIX_ALIASES.items():
+        if clean == legacy_prefix or clean.startswith(legacy_prefix + "/"):
+            return canonical_prefix + clean[len(legacy_prefix) :]
+    return clean
+
+
+def _transcript_family_key(path: str) -> str:
+    return TRANSCRIPT_PATH_SUFFIX_RE.sub("", _canonicalize_transcript_path(path))
+
+
+def _transcript_job_sort_key(job: dict[str, Any]) -> tuple[int, int, str]:
+    suffix = Path(str(job.get("path") or "")).suffix.lower()
+    return (TRANSCRIPT_EXT_PRIORITY.get(suffix, 99), len(str(job.get("path") or "")), str(job.get("path") or ""))
+
+
+def _dedupe_file_jobs(file_jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    selected: dict[str, dict[str, Any]] = {}
+    skipped_paths: list[str] = []
+    for job in sorted(file_jobs, key=lambda item: str(item.get("path") or "")):
+        family_key = _transcript_family_key(str(job.get("path") or ""))
+        current = selected.get(family_key)
+        if current is None:
+            selected[family_key] = job
+            continue
+        if _transcript_job_sort_key(job) < _transcript_job_sort_key(current):
+            skipped_paths.append(str(current.get("path") or ""))
+            selected[family_key] = job
+        else:
+            skipped_paths.append(str(job.get("path") or ""))
+    deduped_jobs = sorted(selected.values(), key=lambda item: str(item.get("path") or ""))
+    return deduped_jobs, skipped_paths
 
 
 def _target_scan_count(path: str, recursive: bool) -> tuple[int, bool]:
@@ -717,6 +778,9 @@ def _source_id_candidates(display_path: str, read_path: str) -> list[str]:
         _source_id_for_path(_to_host_display_path(read_path)),
         _source_id_for_path(_to_runtime_path(display_path)),
     }
+    for raw_path in list(candidates):
+        for variant in _legacy_path_variants(raw_path):
+            candidates.add(_source_id_for_path(variant))
     return [item for item in candidates if item]
 
 
@@ -896,11 +960,15 @@ def _run_indexing_job(
                 _state.progress_total = max(len(file_jobs), 1)
                 _state.progress_current = 0
 
+        file_jobs, duplicate_family_paths = _dedupe_file_jobs(file_jobs)
         file_jobs.sort(key=lambda item: item["path"])
         summary["files_total"] = len(file_jobs)
         _append_log(main_log_path, f"[{run_id}] indexing run started with {len(file_jobs)} candidate files")
+        if duplicate_family_paths:
+            _append_log(main_log_path, f"Skipped {len(duplicate_family_paths)} lower-priority sibling transcript files")
 
         parsed_jobs: list[dict[str, Any]] = []
+        seen_filehash_paths: dict[str, str] = {}
         with _lock:
             _state.active_step = "scan"
             _state.files_total = len(file_jobs)
@@ -922,8 +990,14 @@ def _run_indexing_job(
             if chunks:
                 job["chunks"] = chunks
                 job["filehash"] = _file_hash(str(job["read_path"]))
-                parsed_jobs.append(job)
-                summary["chunks_total"] += len(chunks)
+                duplicate_of = seen_filehash_paths.get(str(job["filehash"]))
+                if duplicate_of:
+                    summary["files_skipped"] += 1
+                    _append_log(main_log_path, f"Skipped {job['path']}: duplicate transcript content of {duplicate_of}")
+                else:
+                    seen_filehash_paths[str(job["filehash"])] = str(job["path"])
+                    parsed_jobs.append(job)
+                    summary["chunks_total"] += len(chunks)
             else:
                 summary["files_skipped"] += 1
                 if reason:

@@ -79,13 +79,50 @@ def _ensure_collection_schema(alias: str, collection_name: str) -> Collection:
         names = {f.name for f in coll.schema.fields}
         vector_dim = 0
         text_has_analyzer = False
+        vector_index_metric = None
         for f in coll.schema.fields:
             if f.name == "vector":
                 vector_dim = int(getattr(f, "params", {}).get("dim", 0) or 0)
             if f.name == "text":
                 params = getattr(f, "params", {}) or {}
                 text_has_analyzer = bool(getattr(f, "enable_analyzer", False) or params.get("enable_analyzer"))
+        try:
+            for index in coll.indexes or []:
+                params = getattr(index, "params", {}) or {}
+                field_name = getattr(index, "field_name", "") or params.get("field_name")
+                if field_name == "vector":
+                    vector_index_metric = str(params.get("metric_type") or "").strip().upper() or None
+                    break
+        except Exception:
+            vector_index_metric = None
         if required.issubset(names) and vector_dim == LOCAL_EMBEDDING_DIM and text_has_analyzer:
+            expected_metric = str(METRIC_TYPE or "COSINE").strip().upper()
+            if vector_index_metric and vector_index_metric != expected_metric:
+                logging.warning(
+                    "Rebuilding dense index for %s due to metric mismatch (existing=%s expected=%s).",
+                    collection_name,
+                    vector_index_metric,
+                    expected_metric,
+                )
+                try:
+                    coll.release()
+                except Exception:
+                    pass
+                try:
+                    coll.drop_index(index_name="vector")
+                except Exception:
+                    try:
+                        coll.drop_index()
+                    except Exception as exc:
+                        logging.warning("Dense index drop warning for %s: %s", collection_name, exc)
+                try:
+                    coll.create_index(
+                        field_name="vector",
+                        index_params={"index_type": INDEX_TYPE, "metric_type": expected_metric, "params": {"nlist": NLIST}},
+                        timeout=10,
+                    )
+                except Exception as exc:
+                    logging.warning("Dense index recreate warning for %s: %s", collection_name, exc)
             return coll
         logging.warning(
             "Dropping collection %s due to schema mismatch (required=%s present=%s dim=%s analyzer=%s).",

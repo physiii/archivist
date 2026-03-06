@@ -22,6 +22,10 @@ logging.basicConfig(level=logging.DEBUG)
 BATCH_SIZE = 10
 NPROBE = 16
 MAX_QUERY_LIMIT = 16384
+LEGACY_PATH_PREFIX_ALIASES = {
+    "/mass": "/media/mass",
+}
+TRANSCRIPT_PATH_SUFFIX_RE = re.compile(r"(?i)(?:\.ts)?\.(vtt|srt|tsv|txt)$")
 
 
 def _indexing_alias_pairs() -> list[tuple[str, str]]:
@@ -45,6 +49,22 @@ def _to_display_path(path: str) -> str:
         if clean == container_prefix or clean.startswith(container_prefix + "/"):
             return host_prefix + clean[len(container_prefix) :]
     return clean
+
+
+def _canonicalize_path_key(path: str) -> str:
+    clean = str(Path(str(path or "")).as_posix()).strip()
+    for legacy_prefix, canonical_prefix in LEGACY_PATH_PREFIX_ALIASES.items():
+        if clean == legacy_prefix or clean.startswith(legacy_prefix + "/"):
+            clean = canonical_prefix + clean[len(legacy_prefix) :]
+            break
+    return _to_display_path(clean)
+
+
+def _transcript_source_group(item: dict) -> str:
+    source_id = _canonicalize_path_key(str(item.get("source_id") or item.get("path") or ""))
+    if not source_id:
+        return ""
+    return TRANSCRIPT_PATH_SUFFIX_RE.sub("", source_id)
 
 
 def _is_informative_result_text(text: str) -> bool:
@@ -102,15 +122,26 @@ def _metric_fallback_from_error(error: Exception, active_metric: str) -> str | N
     return None
 
 
+def _is_embedding_failure(error: Exception) -> bool:
+    message = str(error or "").lower()
+    return any(
+        marker in message
+        for marker in [
+            "embedding request failed",
+            "failed to generate valid query vector",
+            "/v1/embeddings",
+            "/embed",
+            "tei backend error",
+            "cuda_error_launch_failed",
+        ]
+    )
+
+
 def _dedupe_repeated_chunks(results: list[dict], prefers_lower: bool = True) -> list[dict]:
     deduped: dict[tuple[str, str], dict] = {}
     passthrough: list[dict] = []
     for item in results:
-        source_id = str(item.get("source_id") or item.get("path") or "")
-        source_group = source_id
-        if source_group:
-            p = Path(source_group)
-            source_group = str(p.with_suffix(""))
+        source_group = _transcript_source_group(item)
         text_norm = " ".join(str(item.get("text") or "").split()).lower()
         if not source_group or not text_norm:
             # Collections like command templates often don't carry source/path metadata.
@@ -118,6 +149,35 @@ def _dedupe_repeated_chunks(results: list[dict], prefers_lower: bool = True) -> 
             passthrough.append(item)
             continue
         key = (source_group, text_norm)
+        current = deduped.get(key)
+        item_distance = float(item.get("distance", 1e18 if prefers_lower else -1e18))
+        current_distance = float(current.get("distance", 1e18 if prefers_lower else -1e18)) if current is not None else None
+        if current is None or _is_better(item_distance, current_distance, prefers_lower):
+            deduped[key] = item
+    if not passthrough and len(deduped) == len(results):
+        return results
+    out = list(deduped.values()) + passthrough
+    out.sort(key=lambda item: float(item.get("distance", 1e18 if prefers_lower else -1e18)), reverse=not prefers_lower)
+    return out
+
+
+def _dedupe_transcript_copies(results: list[dict], prefers_lower: bool = True) -> list[dict]:
+    deduped: dict[tuple[str, int, int, int, str], dict] = {}
+    passthrough: list[dict] = []
+    for item in results:
+        filehash = str(item.get("filehash") or "").strip()
+        text_norm = " ".join(str(item.get("text") or "").split()).lower()
+        try:
+            start_ms = int(item.get("t_start_ms"))
+            end_ms = int(item.get("t_end_ms"))
+            level = int(item.get("level"))
+        except (TypeError, ValueError):
+            passthrough.append(item)
+            continue
+        if not filehash or not text_norm:
+            passthrough.append(item)
+            continue
+        key = (filehash, start_ms, end_ms, level, text_norm)
         current = deduped.get(key)
         item_distance = float(item.get("distance", 1e18 if prefers_lower else -1e18))
         current_distance = float(current.get("distance", 1e18 if prefers_lower else -1e18)) if current is not None else None
@@ -216,6 +276,7 @@ def search_vectorstore(
         if "path" in field_names:
             output_fields.append("path")
         for optional_field in [
+            "filehash",
             "tags",
             "chunk_duration_s",
             "level",
@@ -257,121 +318,135 @@ def search_vectorstore(
             # Dense vector query via local embedding server
             model = LOCAL_EMBEDDING_MODEL
             dim = collection_vector_dim or LOCAL_EMBEDDING_DIM
-            query_vectors = embed_text_to_vector(
-                [query],
-                model,
-                is_local=True,
-                ip_address=ip_address,
-                embedding_host=embedding_host,
-                embedding_port=embedding_port,
-            )
-            validated_query_vectors = validate_embeddings(query_vectors, dim)
-            if not validated_query_vectors or validated_query_vectors[0] is None:
-                raise RuntimeError("Failed to generate valid query vector for hybrid search.")
-
-
-            # Default: weighted fusion (tunable via env)
-            dense_w = (
-                float(hybrid_dense_weight)
-                if hybrid_dense_weight is not None
-                else float(os.environ.get("VECTORSTORE_HYBRID_DENSE_WEIGHT", "0.65"))
-            )
-            sparse_w = (
-                float(hybrid_sparse_weight)
-                if hybrid_sparse_weight is not None
-                else float(os.environ.get("VECTORSTORE_HYBRID_SPARSE_WEIGHT", "0.35"))
-            )
-            fusion = str(hybrid_fusion or os.environ.get("VECTORSTORE_HYBRID_FUSION", "weighted")).strip().lower()
-            if fusion == "rrf":
-                k = int(hybrid_rrf_k if hybrid_rrf_k is not None else os.environ.get("VECTORSTORE_HYBRID_RRF_K", "60"))
-                rerank = RRFRanker(k=k)
-            else:
-                rerank = WeightedRanker(dense_w, sparse_w)
-
-            results = None
-            while True:
-                try:
-                    dense_req = AnnSearchRequest(
-                        data=[validated_query_vectors[0]],
-                        anns_field="vector",
-                        param={"metric_type": active_metric_type, "params": {"nprobe": effective_nprobe}},
-                        limit=min(max(limit, 10) * 4, MAX_QUERY_LIMIT),
-                        expr=expr,
-                    )
-                    sparse_req = AnnSearchRequest(
-                        data=[str(query)],
-                        anns_field="sparse",
-                        param={"metric_type": "BM25", "params": {}},
-                        limit=min(max(limit, 10) * 4, MAX_QUERY_LIMIT),
-                        expr=expr,
-                    )
-                    results = collection.hybrid_search(
-                        reqs=[dense_req, sparse_req],
-                        rerank=rerank,
-                        limit=min(limit, MAX_QUERY_LIMIT),
-                        output_fields=output_fields,
-                    )
-                    break
-                except Exception as e:
-                    fallback_metric = _metric_fallback_from_error(e, active_metric_type)
-                    if not fallback_metric:
-                        raise
+            try:
+                query_vectors = embed_text_to_vector(
+                    [query],
+                    model,
+                    is_local=True,
+                    ip_address=ip_address,
+                    embedding_host=embedding_host,
+                    embedding_port=embedding_port,
+                )
+                validated_query_vectors = validate_embeddings(query_vectors, dim)
+                if not validated_query_vectors or validated_query_vectors[0] is None:
+                    raise RuntimeError("Failed to generate valid query vector for hybrid search.")
+            except Exception as e:
+                if _is_embedding_failure(e):
                     logging.warning(
-                        "Hybrid search metric '%s' rejected by index; retrying with '%s'.",
-                        active_metric_type,
-                        fallback_metric,
+                        "Hybrid search embedding failed for collection '%s'; falling back to BM25 sparse search. Error: %s",
+                        collection_name,
+                        e,
                     )
-                    active_metric_type = fallback_metric
+                    use_hybrid = False
+                    use_bm25 = "sparse" in field_names
+                else:
+                    raise
 
-            out = []
-            # hybrid_search returns a list of Hits for each query vector; we have exactly one query.
-            for hit in (results[0] if results else []):
-                out.append({
-                    "id": hit.id,
-                    "text": hit.get('text') or '',
-                    "hash": hit.get('hash') or '',
-                    "embedding_model": hit.get('embedding_model') or '',
-                    "distance": hit.distance,
-                    "creation_date": datetime.fromtimestamp(int(hit.get('creation_date') or 0)).isoformat(),
-                    "path": _to_display_path(hit.get('path') or ''),
-                    "tags": hit.get("tags"),
-                    "chunk_duration_s": hit.get("chunk_duration_s"),
-                    "level": hit.get("level"),
-                    "t_start_ms": hit.get("t_start_ms"),
-                    "t_end_ms": hit.get("t_end_ms"),
-                    "source_id": _to_display_path(hit.get("source_id") or ""),
-                    "parent_id": hit.get("parent_id"),
-                    "doc_type": hit.get("doc_type"),
-                    "source_type": hit.get("source_type"),
-                    "topic_label": hit.get("topic_label"),
-                    "language": hit.get("language"),
-                })
-            prefers_lower = _prefers_lower_distance(mode_norm="hybrid", anns_field="vector", metric_type=effective_metric_type)
-            # Deduplicate occasional hybrid duplicates by id, keeping best score.
-            deduped_by_id = {}
-            for item in out:
-                key = str(item.get("id"))
-                current = deduped_by_id.get(key)
-                item_distance = float(item.get("distance", 1e18 if prefers_lower else -1e18))
-                current_distance = float(current.get("distance", 1e18 if prefers_lower else -1e18)) if current is not None else None
-                if current is None or _is_better(item_distance, current_distance, prefers_lower):
-                    deduped_by_id[key] = item
-            out = list(deduped_by_id.values())
-            out.sort(key=lambda item: float(item.get("distance", 1e18 if prefers_lower else -1e18)), reverse=not prefers_lower)
-            out = [item for item in out if _is_informative_result_text(item.get("text", ""))]
-            out = _dedupe_repeated_chunks(out, prefers_lower=prefers_lower)
+            if use_hybrid:
+                # Default: weighted fusion (tunable via env)
+                dense_w = (
+                    float(hybrid_dense_weight)
+                    if hybrid_dense_weight is not None
+                    else float(os.environ.get("VECTORSTORE_HYBRID_DENSE_WEIGHT", "0.65"))
+                )
+                sparse_w = (
+                    float(hybrid_sparse_weight)
+                    if hybrid_sparse_weight is not None
+                    else float(os.environ.get("VECTORSTORE_HYBRID_SPARSE_WEIGHT", "0.35"))
+                )
+                fusion = str(hybrid_fusion or os.environ.get("VECTORSTORE_HYBRID_FUSION", "weighted")).strip().lower()
+                if fusion == "rrf":
+                    k = int(hybrid_rrf_k if hybrid_rrf_k is not None else os.environ.get("VECTORSTORE_HYBRID_RRF_K", "60"))
+                    rerank = RRFRanker(k=k)
+                else:
+                    rerank = WeightedRanker(dense_w, sparse_w)
 
-            # Handle unique results if requested
-            if unique and out:
-                seen_hashes = set()
-                unique_results = []
-                for result in out:
-                    if result['hash'] not in seen_hashes:
-                        seen_hashes.add(result['hash'])
-                        unique_results.append(result)
-                out = unique_results
+                results = None
+                while True:
+                    try:
+                        dense_req = AnnSearchRequest(
+                            data=[validated_query_vectors[0]],
+                            anns_field="vector",
+                            param={"metric_type": active_metric_type, "params": {"nprobe": effective_nprobe}},
+                            limit=min(max(limit, 10) * 4, MAX_QUERY_LIMIT),
+                            expr=expr,
+                        )
+                        sparse_req = AnnSearchRequest(
+                            data=[str(query)],
+                            anns_field="sparse",
+                            param={"metric_type": "BM25", "params": {}},
+                            limit=min(max(limit, 10) * 4, MAX_QUERY_LIMIT),
+                            expr=expr,
+                        )
+                        results = collection.hybrid_search(
+                            reqs=[dense_req, sparse_req],
+                            rerank=rerank,
+                            limit=min(limit, MAX_QUERY_LIMIT),
+                            output_fields=output_fields,
+                        )
+                        break
+                    except Exception as e:
+                        fallback_metric = _metric_fallback_from_error(e, active_metric_type)
+                        if not fallback_metric:
+                            raise
+                        logging.warning(
+                            "Hybrid search metric '%s' rejected by index; retrying with '%s'.",
+                            active_metric_type,
+                            fallback_metric,
+                        )
+                        active_metric_type = fallback_metric
 
-            return out
+                out = []
+                # hybrid_search returns a list of Hits for each query vector; we have exactly one query.
+                for hit in (results[0] if results else []):
+                    out.append({
+                        "id": hit.id,
+                        "text": hit.get('text') or '',
+                        "hash": hit.get('hash') or '',
+                        "embedding_model": hit.get('embedding_model') or '',
+                        "distance": hit.distance,
+                        "creation_date": datetime.fromtimestamp(int(hit.get('creation_date') or 0)).isoformat(),
+                        "filehash": hit.get("filehash") or "",
+                        "path": _to_display_path(hit.get('path') or ''),
+                        "tags": hit.get("tags"),
+                        "chunk_duration_s": hit.get("chunk_duration_s"),
+                        "level": hit.get("level"),
+                        "t_start_ms": hit.get("t_start_ms"),
+                        "t_end_ms": hit.get("t_end_ms"),
+                        "source_id": _to_display_path(hit.get("source_id") or ""),
+                        "parent_id": hit.get("parent_id"),
+                        "doc_type": hit.get("doc_type"),
+                        "source_type": hit.get("source_type"),
+                        "topic_label": hit.get("topic_label"),
+                        "language": hit.get("language"),
+                    })
+                prefers_lower = _prefers_lower_distance(mode_norm="hybrid", anns_field="vector", metric_type=effective_metric_type)
+                # Deduplicate occasional hybrid duplicates by id, keeping best score.
+                deduped_by_id = {}
+                for item in out:
+                    key = str(item.get("id"))
+                    current = deduped_by_id.get(key)
+                    item_distance = float(item.get("distance", 1e18 if prefers_lower else -1e18))
+                    current_distance = float(current.get("distance", 1e18 if prefers_lower else -1e18)) if current is not None else None
+                    if current is None or _is_better(item_distance, current_distance, prefers_lower):
+                        deduped_by_id[key] = item
+                out = list(deduped_by_id.values())
+                out.sort(key=lambda item: float(item.get("distance", 1e18 if prefers_lower else -1e18)), reverse=not prefers_lower)
+                out = [item for item in out if _is_informative_result_text(item.get("text", ""))]
+                out = _dedupe_transcript_copies(out, prefers_lower=prefers_lower)
+                out = _dedupe_repeated_chunks(out, prefers_lower=prefers_lower)
+
+                # Handle unique results if requested
+                if unique and out:
+                    seen_hashes = set()
+                    unique_results = []
+                    for result in out:
+                        if result['hash'] not in seen_hashes:
+                            seen_hashes.add(result['hash'])
+                            unique_results.append(result)
+                    out = unique_results
+
+                return out
 
         if use_bm25:
             logging.info("Using BM25 sparse search.")
@@ -386,26 +461,38 @@ def search_vectorstore(
 
             # Get embedding for the query
             logging.info("Generating embedding for query...")
-            query_vectors = embed_text_to_vector(
-                [query],
-                model,
-                is_local=True,
-                ip_address=ip_address,
-                embedding_host=embedding_host,
-                embedding_port=embedding_port,
-            )
-            logging.info("Embedding generated successfully")
-            
-            # Validate embedding
-            logging.info("Validating query embedding...")
-            validated_query_vectors = validate_embeddings(query_vectors, dim)
-            if not validated_query_vectors or validated_query_vectors[0] is None:
-                raise RuntimeError("Failed to generate valid query vector.")
-            logging.info("Query embedding validated successfully")
+            try:
+                query_vectors = embed_text_to_vector(
+                    [query],
+                    model,
+                    is_local=True,
+                    ip_address=ip_address,
+                    embedding_host=embedding_host,
+                    embedding_port=embedding_port,
+                )
+                logging.info("Embedding generated successfully")
 
-            search_data = [validated_query_vectors[0]]
-            anns_field = "vector"
-            search_param = {"metric_type": active_metric_type, "params": {"nprobe": effective_nprobe}}
+                # Validate embedding
+                logging.info("Validating query embedding...")
+                validated_query_vectors = validate_embeddings(query_vectors, dim)
+                if not validated_query_vectors or validated_query_vectors[0] is None:
+                    raise RuntimeError("Failed to generate valid query vector.")
+                logging.info("Query embedding validated successfully")
+
+                search_data = [validated_query_vectors[0]]
+                anns_field = "vector"
+                search_param = {"metric_type": active_metric_type, "params": {"nprobe": effective_nprobe}}
+            except Exception as e:
+                if not ("sparse" in field_names and _is_embedding_failure(e)):
+                    raise
+                logging.warning(
+                    "Dense search embedding failed for collection '%s'; falling back to BM25 sparse search. Error: %s",
+                    collection_name,
+                    e,
+                )
+                search_data = [str(query)]
+                anns_field = "sparse"
+                search_param = {"metric_type": "BM25", "params": {}}
 
         # Perform search
         logging.info(f"Searching with limit={limit}...")
@@ -452,6 +539,7 @@ def search_vectorstore(
                     "embedding_model": hit.get('embedding_model') or '',
                     "distance": hit.distance,
                     "creation_date": datetime.fromtimestamp(int(hit.get('creation_date') or 0)).isoformat(),
+                    "filehash": hit.get("filehash") or "",
                     "path": _to_display_path(hit.get('path') or ''),
                     "tags": hit.get("tags"),
                     "chunk_duration_s": hit.get("chunk_duration_s"),
@@ -478,6 +566,7 @@ def search_vectorstore(
         results = list(deduped_by_id.values())
         results.sort(key=lambda item: float(item.get("distance", 1e18 if prefers_lower else -1e18)), reverse=not prefers_lower)
         results = [item for item in results if _is_informative_result_text(item.get("text", ""))]
+        results = _dedupe_transcript_copies(results, prefers_lower=prefers_lower)
         results = _dedupe_repeated_chunks(results, prefers_lower=prefers_lower)
 
         if max_distance is not None and anns_field == "vector" and active_metric_type in {"L2", "COSINE"}:
