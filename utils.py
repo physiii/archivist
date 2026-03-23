@@ -22,6 +22,8 @@ NLIST = int(os.getenv("NLIST", "1024"))
 EMBEDDING_DIMENSIONS: dict[str, int] = {
     DEFAULT_EMBEDDING_MODEL: LOCAL_EMBEDDING_DIM,
     LOCAL_EMBEDDING_MODEL: LOCAL_EMBEDDING_DIM,
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
 }
 
 def embed_text_to_vector(
@@ -211,4 +213,3 @@ def process_and_insert_lines(
         [created] * len(rows),
     ]
     collection.insert(data, fields=fields)
-

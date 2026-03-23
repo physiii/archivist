@@ -39,6 +39,7 @@ from indexing_service import (
     list_indexing_targets,
     scan_indexing_target,
     start_indexing,
+    start_scheduler_best_effort as start_indexing_scheduler_best_effort,
     start_target_indexing,
     stop_indexing,
     update_indexing_target,
@@ -50,6 +51,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 # Start backup scheduler once (best-effort; uses a file lock).
 start_scheduler_best_effort()
+start_indexing_scheduler_best_effort()
 
 # Allow the UI to be served from a different dev origin (Vite preview/dev).
 @app.after_request
@@ -447,6 +449,7 @@ def api_search_collection(name: str):
         return jsonify({"error": "No query provided"}), 400
     limit = int(payload.get("limit", 10))
     mode = payload.get("mode", "dense")
+    embedding_model = payload.get("model")
     unique = bool(payload.get("unique", False))
     path_filter = payload.get("path", "")
     ip_address = payload.get("ip_address", MILVUS_HOST)
@@ -461,6 +464,7 @@ def api_search_collection(name: str):
             unique=unique,
             mode=mode,
             collection_name=name,
+            embedding_model=embedding_model,
             ip_address=ip_address,
             embedding_host=embedding_host,
             embedding_port=embedding_port,
@@ -717,6 +721,7 @@ def api_search_global():
     mode = payload.get("mode", "dense")
     unique = bool(payload.get("unique", False))
     path_filter = payload.get("path", "")
+    embedding_model = payload.get("model")
     ip_address = payload.get("ip_address", MILVUS_HOST)
     embedding_host = payload.get("embedding_host", EMBEDDING_HOST)
     embedding_port = payload.get("embedding_port", EMBEDDING_PORT)
@@ -740,6 +745,7 @@ def api_search_global():
                 unique=unique,
                 mode=mode,
                 collection_name=logical_name,
+                embedding_model=embedding_model,
                 ip_address=ip_address,
                 embedding_host=embedding_host,
                 embedding_port=embedding_port,
@@ -1226,6 +1232,7 @@ def handle_vectorstore_request():
         unique = data.get('unique', False)
         mode = data.get('mode', 'dense')
         collection_name = data.get('collection')
+        embedding_model = data.get('model')
         ip_address = data.get('ip_address', MILVUS_HOST)
         embedding_host = data.get('embedding_host', EMBEDDING_HOST)
         embedding_port = data.get('embedding_port', EMBEDDING_PORT)
@@ -1239,6 +1246,7 @@ def handle_vectorstore_request():
                 unique=unique,
                 mode=mode,
                 collection_name=collection_name,
+                embedding_model=embedding_model,
                 ip_address=ip_address,
                 embedding_host=embedding_host,
                 embedding_port=embedding_port,

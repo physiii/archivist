@@ -195,6 +195,7 @@ def search_vectorstore(
     path_filter="",
     unique=False,
     collection_name=None,
+    embedding_model=None,
     ip_address="localhost",
     embedding_host="localhost",
     embedding_port=None,
@@ -316,7 +317,7 @@ def search_vectorstore(
             logging.info("Using HYBRID search (dense + BM25 sparse).")
 
             # Dense vector query via local embedding server
-            model = LOCAL_EMBEDDING_MODEL
+            model = str(embedding_model or LOCAL_EMBEDDING_MODEL)
             dim = collection_vector_dim or LOCAL_EMBEDDING_DIM
             try:
                 query_vectors = embed_text_to_vector(
@@ -455,7 +456,7 @@ def search_vectorstore(
             search_param = {"metric_type": "BM25", "params": {}}
         else:
             # Dense vector search (local embeddings server)
-            model = LOCAL_EMBEDDING_MODEL
+            model = str(embedding_model or LOCAL_EMBEDDING_MODEL)
             dim = collection_vector_dim or LOCAL_EMBEDDING_DIM
             logging.info(f"Using embedding model: {model}")
 
