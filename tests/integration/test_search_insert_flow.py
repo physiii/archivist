@@ -13,7 +13,7 @@ import requests
 BASE_URL = os.environ.get("VECTORSTORE_BASE_URL", "http://127.0.0.1:5050").rstrip("/")
 
 
-def _deterministic_embedding(text: str, dim: int = 1024) -> list[float]:
+def _deterministic_embedding(text: str, dim: int = 4096) -> list[float]:
     h = hashlib.sha256(text.encode("utf-8")).digest()
     # Expand the hash into dim floats in [0, 1).
     out: list[float] = []
@@ -26,7 +26,7 @@ def _deterministic_embedding(text: str, dim: int = 1024) -> list[float]:
 
 class _EmbedHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 - stdlib handler API
-        if self.path != "/embed_batch":
+        if self.path not in {"/embed", "/v1/embeddings", "/embed_batch"}:
             self.send_response(404)
             self.end_headers()
             return
@@ -36,9 +36,20 @@ class _EmbedHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
             payload = {}
-        texts = payload.get("texts") or []
-        embeddings = [_deterministic_embedding(str(t)) for t in texts]
-        body = json.dumps({"embeddings": embeddings}).encode("utf-8")
+        if self.path == "/embed":
+            text = payload.get("text") or ""
+            body = json.dumps({"embedding": _deterministic_embedding(str(text))}).encode("utf-8")
+        else:
+            texts = payload.get("texts") or payload.get("input") or []
+            if isinstance(texts, str):
+                texts = [texts]
+            embeddings = [_deterministic_embedding(str(t)) for t in texts]
+            if self.path == "/v1/embeddings":
+                body = json.dumps(
+                    {"data": [{"index": idx, "embedding": embedding} for idx, embedding in enumerate(embeddings)]}
+                ).encode("utf-8")
+            else:
+                body = json.dumps({"embeddings": embeddings}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -130,4 +141,3 @@ def test_insert_and_search_dense_bm25_hybrid():
         except Exception:
             pass
         server.stop()
-

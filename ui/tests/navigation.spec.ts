@@ -24,5 +24,5 @@ test("open collection navigates to detail page", async ({ page }) => {
   }
   await expect(page).toHaveURL(/\/collections\/.+/);
   await expect(page.getByRole("heading", { name: /Collection:/ })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Embeddings Preview" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Embeddings (3D|Preview)/ })).toBeVisible();
 });

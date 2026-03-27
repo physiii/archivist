@@ -13,6 +13,15 @@ services:
       EMBEDDING_PORT: "8000"
       VECTORSTORE_METRIC_TYPE: COSINE
       METRIC_TYPE: COSINE
+      VECTORSTORE_ZFS_HOST: 192.168.1.42
+      VECTORSTORE_ZFS_HOST_LABEL: megamind
+      VECTORSTORE_ZFS_SSH_USER: andy
+      VECTORSTORE_ZFS_USE_SUDO: "true"
+      VECTORSTORE_ZFS_SNAPSHOT_RECURSIVE: "true"
+      VECTORSTORE_RSYNC_IDLE_TIMEOUT_SECONDS: "1800"
+      VECTORSTORE_RSYNC_NICE_LEVEL: "15"
+      VECTORSTORE_RSYNC_IONICE_CLASS: "idle"
+      VECTORSTORE_RSYNC_IONICE_LEVEL: "7"
       INDEXING_PATH_ALIASES: /media/mass=/media/mass;/home/andy/nas_mass=/home/andy/nas_mass
       INDEXING_SCAN_TIMEOUT_SECONDS: "900"
       INDEXING_FILE_DISCOVERY_TIMEOUT_SECONDS: "900"
@@ -20,15 +29,29 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "5050:5050"
+    networks:
+      default:
+        aliases:
+          - vectorstore
     volumes:
       - vectorstore_vectorstore-backups:/backups
       - vectorstore_vectorstore-indexing:/indexing
+      - vectorstore_milvus-data:/data/milvus:ro
+      - vectorstore_etcd-data:/data/etcd:ro
+      - vectorstore_minio-data:/data/minio:ro
       - /media/mass:/media/mass
       - /home/andy/nas_mass:/home/andy/nas_mass
+      - /home/andy/.ssh:/root/.ssh:ro
     restart: unless-stopped
 
 volumes:
   vectorstore_vectorstore-backups:
     external: true
   vectorstore_vectorstore-indexing:
+    external: true
+  vectorstore_milvus-data:
+    external: true
+  vectorstore_etcd-data:
+    external: true
+  vectorstore_minio-data:
     external: true

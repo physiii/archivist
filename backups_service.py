@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import selectors
 import signal
 import subprocess
 import threading
@@ -28,8 +29,8 @@ SCHEDULER_LOCK_FILE = BACKUP_ROOT / ".backup-scheduler.lock"
 RUN_LOCK_FILE = BACKUP_ROOT / ".backup-run.lock"
 RUN_SUMMARY_FILE = "summary.json"
 
-# Canonical docker volume data mounts for the vectorstore stack.
-SOURCE_DIRS = [
+# Canonical docker volume mounts for the vectorstore stack archive.
+ARCHIVE_SOURCE_DIRS = [
     (Path("/data/milvus"), "milvus"),
     (Path("/data/etcd"), "etcd"),
     (Path("/data/minio"), "minio"),
@@ -49,9 +50,32 @@ DEFAULT_RSYNC_EXCLUDES = [
     "--exclude=Thumbs.db",
     "--exclude=@eaDir/**",
     "--exclude=.Trash-*/**",
+    # Skip deleted Milvus volume dumps inside `scripts`; they contain unreadable
+    # etcd internals that cause rsync exit code 23.
+    "--exclude=/milvus_DEL/",
+    "--exclude=/milvus_DEL/**",
 ]
 
 MASS_PREFIX = "/media/mass"
+ZFS_REMOTE_HOST = str(os.getenv("VECTORSTORE_ZFS_HOST", "")).strip() or None
+ZFS_REMOTE_HOST_LABEL = str(os.getenv("VECTORSTORE_ZFS_HOST_LABEL", "")).strip() or ZFS_REMOTE_HOST
+ZFS_REMOTE_USER = str(os.getenv("VECTORSTORE_ZFS_SSH_USER", "")).strip() or None
+ZFS_USE_SUDO = str(os.getenv("VECTORSTORE_ZFS_USE_SUDO", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ZFS_SNAPSHOT_RECURSIVE = str(os.getenv("VECTORSTORE_ZFS_SNAPSHOT_RECURSIVE", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RSYNC_IDLE_TIMEOUT_SECONDS = max(int(os.getenv("VECTORSTORE_RSYNC_IDLE_TIMEOUT_SECONDS", "1800")), 0)
+RSYNC_NICE_LEVEL = min(max(int(os.getenv("VECTORSTORE_RSYNC_NICE_LEVEL", "15")), 0), 19)
+RSYNC_IONICE_CLASS = str(os.getenv("VECTORSTORE_RSYNC_IONICE_CLASS", "idle")).strip().lower()
+RSYNC_IONICE_LEVEL = min(max(int(os.getenv("VECTORSTORE_RSYNC_IONICE_LEVEL", "7")), 0), 7)
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -134,6 +158,68 @@ def _append_log(path: Path, line: str) -> None:
         pass
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _zfs_target_label(pool: str | None) -> str | None:
+    clean_pool = str(pool or "").strip()
+    if not clean_pool:
+        return None
+    if ZFS_REMOTE_HOST:
+        return f"{ZFS_REMOTE_HOST_LABEL}:{clean_pool}"
+    return clean_pool
+
+
+def _zfs_command(*parts: str) -> list[str]:
+    command = [str(part) for part in parts if str(part)]
+    if ZFS_USE_SUDO:
+        command = ["sudo", "-n", *command]
+    if ZFS_REMOTE_HOST:
+        host_target = f"{ZFS_REMOTE_USER}@{ZFS_REMOTE_HOST}" if ZFS_REMOTE_USER else ZFS_REMOTE_HOST
+        return ["ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host_target, *command]
+    return command
+
+
+def _zfs_runtime_available() -> tuple[bool, str | None]:
+    if ZFS_REMOTE_HOST:
+        if not shutil_which("ssh"):
+            return False, "ssh command not available in runtime."
+        return True, None
+    if not shutil_which("zpool") or not shutil_which("zfs"):
+        return False, "zpool/zfs command not available in runtime."
+    return True, None
+
+
+def _resolve_archive_inputs() -> tuple[Path | None, list[str], list[str]]:
+    roots = {path.parent for path, _label in ARCHIVE_SOURCE_DIRS}
+    archive_root = next(iter(roots)) if len(roots) == 1 else None
+    included_members: list[str] = []
+    missing_paths: list[str] = []
+    for path, member_name in ARCHIVE_SOURCE_DIRS:
+        if path.exists():
+            included_members.append(member_name)
+        else:
+            missing_paths.append(str(path))
+    return archive_root, included_members, missing_paths
+
+
+def _delete_file_if_exists(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _write_run_summary(run_dir: Path, summary: dict[str, Any]) -> None:
     try:
         (run_dir / RUN_SUMMARY_FILE).write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -149,6 +235,44 @@ def _read_run_summary(run_dir: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _run_last_activity_at(run_dir: Path) -> datetime:
+    timestamps: list[float] = []
+    for path in (run_dir / RUN_SUMMARY_FILE, run_dir / "main.log", run_dir / "debug.log"):
+        try:
+            timestamps.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not timestamps:
+        return datetime.now(timezone.utc)
+    return datetime.fromtimestamp(max(timestamps), tz=timezone.utc)
+
+
+def _reconcile_run_summary(run_dir: Path, summary: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not summary:
+        return summary
+    if summary.get("status") != "running" or summary.get("finished_at"):
+        return summary
+
+    with _lock:
+        current_run_id = _state.run_id if _state.running else None
+    if current_run_id == run_dir.name:
+        return summary
+
+    repaired = dict(summary)
+    repaired["status"] = "interrupted"
+    repaired["finished_at"] = _iso(_run_last_activity_at(run_dir))
+    message = "Backup worker exited before completing this run."
+    errors = repaired.get("errors")
+    if not isinstance(errors, list):
+        errors = []
+    if message not in errors:
+        errors.append(message)
+    repaired["errors"] = errors
+    repaired["last_line"] = repaired.get("last_line") or message
+    _write_run_summary(run_dir, repaired)
+    return repaired
 
 
 def _get_mount_point(path: str) -> str:
@@ -267,6 +391,7 @@ def _zfs_diagnostics(pool: str | None) -> dict[str, Any]:
         return {
             "available": False,
             "pool": None,
+            "host": ZFS_REMOTE_HOST_LABEL,
             "health": None,
             "status_ok": None,
             "status_summary": "No ZFS pool configured.",
@@ -276,15 +401,18 @@ def _zfs_diagnostics(pool: str | None) -> dict[str, Any]:
             "avail_bytes": None,
             "mount_point": None,
         }
-    if not shutil_which("zpool") or not shutil_which("zfs"):
+    available, command_error = _zfs_runtime_available()
+    target_label = _zfs_target_label(pool)
+    if not available:
         return {
             "available": False,
-            "pool": pool,
+            "pool": target_label,
+            "host": ZFS_REMOTE_HOST_LABEL,
             "health": None,
             "status_ok": None,
             "status_summary": None,
             "errors": [],
-            "command_error": "zpool/zfs command not available in runtime.",
+            "command_error": command_error,
             "used_bytes": None,
             "avail_bytes": None,
             "mount_point": None,
@@ -292,7 +420,8 @@ def _zfs_diagnostics(pool: str | None) -> dict[str, Any]:
 
     out = {
         "available": True,
-        "pool": pool,
+        "pool": target_label,
+        "host": ZFS_REMOTE_HOST_LABEL,
         "health": None,
         "status_ok": None,
         "status_summary": None,
@@ -303,7 +432,7 @@ def _zfs_diagnostics(pool: str | None) -> dict[str, Any]:
         "mount_point": None,
     }
     try:
-        proc = subprocess.run(["zpool", "status", pool], capture_output=True, text=True, timeout=8)
+        proc = subprocess.run(_zfs_command("zpool", "status", pool), capture_output=True, text=True, timeout=12)
         full = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         for line in full.splitlines():
             stripped = line.strip()
@@ -314,13 +443,13 @@ def _zfs_diagnostics(pool: str | None) -> dict[str, Any]:
                 if msg and msg.lower() != "no known data errors":
                     out["errors"].append(msg)
 
-        proc_x = subprocess.run(["zpool", "status", "-x", pool], capture_output=True, text=True, timeout=8)
+        proc_x = subprocess.run(_zfs_command("zpool", "status", "-x", pool), capture_output=True, text=True, timeout=12)
         status_x = (proc_x.stdout or "").strip()
         if status_x:
             out["status_summary"] = status_x
             out["status_ok"] = "is healthy" in status_x.lower()
         zfs_proc = subprocess.run(
-            ["zfs", "list", "-Hp", "-o", "used,avail,mountpoint", pool], capture_output=True, text=True, timeout=8
+            _zfs_command("zfs", "list", "-Hp", "-o", "used,avail,mountpoint", pool), capture_output=True, text=True, timeout=12
         )
         if zfs_proc.returncode == 0 and zfs_proc.stdout.strip():
             parts = zfs_proc.stdout.splitlines()[0].split("\t")
@@ -568,6 +697,25 @@ def _load_schedule_state() -> None:
     _save_schedule_state()
 
 
+def get_schedule_config() -> dict[str, Any]:
+    global _schedule_loaded
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    if not _schedule_loaded:
+        _load_schedule_state()
+        _schedule_loaded = True
+    with _lock:
+        if _schedule.enabled and _schedule.next_run_at is None:
+            _schedule.next_run_at = _compute_next_run(datetime.now(timezone.utc), _schedule.time_of_day)
+            _save_schedule_state()
+        return {
+            "enabled": _schedule.enabled,
+            "time_of_day": _schedule.time_of_day,
+            "timezone": "utc",
+            "next_run_at": _iso(_schedule.next_run_at),
+            "last_triggered_at": _iso(_schedule.last_triggered_at),
+        }
+
+
 def _latest_runs(limit: int = 10) -> list[dict[str, Any]]:
     if not RUNS_DIR.exists():
         return []
@@ -578,7 +726,7 @@ def _latest_runs(limit: int = 10) -> list[dict[str, Any]]:
         main_log = run_dir / "main.log"
         debug_log = run_dir / "debug.log"
         last_line = _tail(main_log, lines=1).strip() if main_log.exists() else ""
-        summary = _read_run_summary(run_dir)
+        summary = _reconcile_run_summary(run_dir, _read_run_summary(run_dir))
         out.append(
             {
                 "run_id": run_dir.name,
@@ -600,7 +748,7 @@ def _target_history_index(limit_runs: int = 200) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}
     for run in _latest_runs(limit=limit_runs):
         run_dir = Path(run["main_log_path"]).parent
-        summary = _read_run_summary(run_dir)
+        summary = _reconcile_run_summary(run_dir, _read_run_summary(run_dir))
         if not summary:
             continue
         run_id = str(summary.get("run_id") or run.get("run_id") or "")
@@ -754,13 +902,7 @@ def get_backup_overview() -> dict[str, Any]:
             "progress_total": _state.progress_total,
             "progress_line": _state.progress_line,
         }
-        schedule = {
-            "enabled": _schedule.enabled,
-            "time_of_day": _schedule.time_of_day,
-            "timezone": "utc",
-            "next_run_at": _iso(_schedule.next_run_at),
-            "last_triggered_at": _iso(_schedule.last_triggered_at),
-        }
+    schedule = get_schedule_config()
 
     return {
         "status": status,
@@ -793,8 +935,37 @@ def _release_run_lock() -> None:
         pass
 
 
+def _signal_process_group(proc: subprocess.Popen[str], sig: int) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+        return
+    except Exception:
+        pass
+    try:
+        proc.send_signal(sig)
+    except Exception:
+        pass
+
+
+def _terminate_process_group(proc: subprocess.Popen[str], grace_seconds: float = 10.0) -> None:
+    if proc.poll() is not None:
+        return
+    _signal_process_group(proc, signal.SIGTERM)
+    deadline = time.monotonic() + max(grace_seconds, 0.0)
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if proc.poll() is None:
+        _signal_process_group(proc, signal.SIGKILL)
+
+
 def _run_subprocess_with_logs(
-    command: list[str], main_log_path: Path, debug_log_path: Path, progress_prefix: str
+    command: list[str],
+    main_log_path: Path,
+    debug_log_path: Path,
+    progress_prefix: str,
+    idle_timeout_seconds: int | None = None,
 ) -> tuple[int, str | None]:
     _append_log(debug_log_path, "$ " + " ".join(command))
     proc = subprocess.Popen(
@@ -803,23 +974,90 @@ def _run_subprocess_with_logs(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     last_line = None
+    last_output_at = time.monotonic()
+    last_heartbeat_bucket = -1
+    timed_out = False
     with _lock:
         _state.process = proc
-    for raw in iter(proc.stdout.readline, ""):  # type: ignore[union-attr]
-        line = raw.strip()
-        if not line:
-            continue
-        last_line = line
-        _append_log(main_log_path, line)
-        with _lock:
-            _state.progress_line = f"{progress_prefix}: {line[:240]}"
-    proc.wait()
+    stream = proc.stdout
+    selector: selectors.BaseSelector | None = None
+    if stream is not None:
+        selector = selectors.DefaultSelector()
+        selector.register(stream, selectors.EVENT_READ)
+    try:
+        while True:
+            if selector is None or stream is None:
+                break
+            events = selector.select(timeout=2.0)
+            if events:
+                raw = stream.readline()
+                if raw == "":
+                    if proc.poll() is not None:
+                        break
+                    continue
+                line = raw.strip()
+                if not line:
+                    continue
+                last_line = line
+                last_output_at = time.monotonic()
+                last_heartbeat_bucket = -1
+                _append_log(main_log_path, line)
+                with _lock:
+                    _state.progress_line = f"{progress_prefix}: {line[:240]}"
+                continue
+
+            if proc.poll() is not None:
+                raw = stream.readline()
+                if raw:
+                    line = raw.strip()
+                    if line:
+                        last_line = line
+                        _append_log(main_log_path, line)
+                        with _lock:
+                            _state.progress_line = f"{progress_prefix}: {line[:240]}"
+                    continue
+                break
+
+            idle_seconds = time.monotonic() - last_output_at
+            heartbeat_bucket = int(idle_seconds // 15)
+            if heartbeat_bucket >= 1 and heartbeat_bucket != last_heartbeat_bucket:
+                last_heartbeat_bucket = heartbeat_bucket
+                status_line = (
+                    f"{progress_prefix}: still running, no new output for {_format_duration(idle_seconds)}"
+                    + (f". Last output: {last_line[:160]}" if last_line else ".")
+                )
+                _append_log(main_log_path, status_line)
+                with _lock:
+                    _state.progress_line = status_line[:240]
+            if idle_timeout_seconds is not None and idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
+                timed_out = True
+                timeout_line = (
+                    f"{progress_prefix}: aborting stalled command after {_format_duration(idle_seconds)} without output."
+                    + (f" Last output: {last_line[:160]}" if last_line else "")
+                )
+                last_line = timeout_line
+                _append_log(main_log_path, timeout_line)
+                with _lock:
+                    _state.progress_line = timeout_line[:240]
+                _terminate_process_group(proc)
+                break
+    finally:
+        if selector is not None:
+            selector.close()
+    if timed_out:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        proc.wait()
     with _lock:
         if _state.process is proc:
             _state.process = None
-    return proc.returncode, last_line
+    return (124 if timed_out else proc.returncode), last_line
 
 
 def _build_rsync_excludes(config: dict[str, Any]) -> list[str]:
@@ -831,6 +1069,36 @@ def _build_rsync_excludes(config: dict[str, Any]) -> list[str]:
         if item not in merged:
             merged.append(item)
     return merged
+
+
+def _build_rsync_command(config: dict[str, Any], src: str, dst: str, excludes: list[str]) -> list[str]:
+    command: list[str] = []
+    if shutil_which("ionice"):
+        if RSYNC_IONICE_CLASS in {"idle", "3"}:
+            command.extend(["ionice", "-c3"])
+        elif RSYNC_IONICE_CLASS in {"best-effort", "besteffort", "2"}:
+            command.extend(["ionice", "-c2", f"-n{RSYNC_IONICE_LEVEL}"])
+    if RSYNC_NICE_LEVEL > 0 and shutil_which("nice"):
+        command.extend(["nice", "-n", str(RSYNC_NICE_LEVEL)])
+
+    # SMB-backed targets don't benefit from expensive ACL/hard-link preservation,
+    # and omitting directory time updates avoids extra metadata churn.
+    command.extend(
+        [
+            "rsync",
+            "-rlt",
+            "--delete",
+            "--human-readable",
+            "--info=progress2",
+            "--modify-window=1",
+            "--omit-dir-times",
+            f"--bwlimit={config.get('rsync_bwlimit') or '20M'}",
+            *excludes,
+            f"{src}/",
+            dst,
+        ]
+    )
+    return command
 
 
 def _run_backup_job(
@@ -883,30 +1151,49 @@ def _run_backup_job(
             _state.progress_line = f"Starting archive {backup_name}" if include_archive else "Starting target sync steps"
 
         if include_archive:
-            tar_cmd = [
-                "tar",
-                "--warning=no-file-changed",
-                "--ignore-failed-read",
-                "--checkpoint=500",
-                "--checkpoint-action=echo=archive checkpoint %u",
-                "-czf",
-                str(backup_path),
-                "-C",
-                "/data",
-                "milvus",
-                "etcd",
-                "minio",
-            ]
-            rc, last_line = _run_subprocess_with_logs(tar_cmd, main_log_path, debug_log_path, "archive")
-            summary["last_line"] = last_line
-            if rc == 0:
-                summary["archive_ok"] = True
-                _append_log(main_log_path, "Archive step completed.")
-            else:
+            archive_root, archive_members, missing_archive_paths = _resolve_archive_inputs()
+            if archive_root is None:
                 run_failed = True
-                summary["archive_error"] = f"tar exited with code {rc}"
+                summary["archive_error"] = "Archive source directories do not share a common parent."
                 summary["errors"].append(summary["archive_error"])
+                summary["last_line"] = summary["archive_error"]
                 _append_log(main_log_path, f"Archive step failed: {summary['archive_error']}")
+            elif missing_archive_paths:
+                run_failed = True
+                summary["archive_error"] = "Missing archive source paths: " + ", ".join(missing_archive_paths)
+                summary["errors"].append(summary["archive_error"])
+                summary["last_line"] = summary["archive_error"]
+                _append_log(main_log_path, f"Archive step failed: {summary['archive_error']}")
+            elif not archive_members:
+                run_failed = True
+                summary["archive_error"] = "No archive source paths are available."
+                summary["errors"].append(summary["archive_error"])
+                summary["last_line"] = summary["archive_error"]
+                _append_log(main_log_path, f"Archive step failed: {summary['archive_error']}")
+            else:
+                tar_cmd = [
+                    "tar",
+                    "--warning=no-file-changed",
+                    "--ignore-failed-read",
+                    "--checkpoint=500",
+                    "--checkpoint-action=echo=archive checkpoint %u",
+                    "-czf",
+                    str(backup_path),
+                    "-C",
+                    str(archive_root),
+                    *archive_members,
+                ]
+                rc, last_line = _run_subprocess_with_logs(tar_cmd, main_log_path, debug_log_path, "archive")
+                summary["last_line"] = last_line
+                if rc == 0:
+                    summary["archive_ok"] = True
+                    _append_log(main_log_path, "Archive step completed.")
+                else:
+                    run_failed = True
+                    summary["archive_error"] = f"tar exited with code {rc}"
+                    summary["errors"].append(summary["archive_error"])
+                    _append_log(main_log_path, f"Archive step failed: {summary['archive_error']}")
+                    _delete_file_if_exists(backup_path)
         else:
             summary["archive_ok"] = True
             summary["archive_file"] = None
@@ -935,17 +1222,16 @@ def _run_backup_job(
             if not src or not dst_root:
                 continue
             dst = os.path.join(dst_root, os.path.basename(src))
-            rsync_cmd = [
-                "rsync",
-                "-aAH",
-                "--delete",
-                "--human-readable",
-                "--info=progress2",
-                f"--bwlimit={config.get('rsync_bwlimit') or '20M'}",
-            ] + excludes + [f"{src}/", dst]
+            rsync_cmd = _build_rsync_command(config, src, dst, excludes)
 
             _append_log(main_log_path, f"Syncing {src} -> {dst}")
-            rc, last_line = _run_subprocess_with_logs(rsync_cmd, main_log_path, debug_log_path, f"sync:{src}")
+            rc, last_line = _run_subprocess_with_logs(
+                rsync_cmd,
+                main_log_path,
+                debug_log_path,
+                f"sync:{src}",
+                idle_timeout_seconds=RSYNC_IDLE_TIMEOUT_SECONDS or None,
+            )
             item = {
                 "profile": target.get("profile"),
                 "source": src,
@@ -973,24 +1259,31 @@ def _run_backup_job(
             time.sleep(max(int(config.get("sleep_seconds", 5)), 0))
 
         pool = str(config.get("backup_pool") or "").strip()
-        if include_archive and pool and shutil_which("zfs"):
+        zfs_available, zfs_command_error = _zfs_runtime_available()
+        if include_archive and pool and zfs_available:
             snapshot_name = f"after_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-            summary["snapshot_name"] = snapshot_name
+            snapshot_ref = f"{pool}@{snapshot_name}"
+            summary["snapshot_name"] = _zfs_target_label(snapshot_ref) or snapshot_ref
             with _lock:
                 _state.active_step = "snapshot"
-                _state.progress_line = f"Creating snapshot {pool}@{snapshot_name}"
-            snap_cmd = ["zfs", "snapshot", f"{pool}@{snapshot_name}"]
+                _state.progress_line = f"Creating snapshot {summary['snapshot_name']}"
+            snap_cmd = ["zfs", "snapshot"]
+            if ZFS_SNAPSHOT_RECURSIVE:
+                snap_cmd.append("-r")
+            snap_cmd.append(snapshot_ref)
+            _append_log(main_log_path, f"Taking ZFS snapshot: {summary['snapshot_name']}")
             rc, last_line = _run_subprocess_with_logs(snap_cmd, main_log_path, debug_log_path, "snapshot")
             summary["last_line"] = last_line or summary["last_line"]
             if rc == 0:
                 summary["snapshot_status"] = "ok"
+                _append_log(main_log_path, f"Snapshot taken: {summary['snapshot_name']}")
             else:
                 summary["snapshot_status"] = "failed"
                 summary["snapshot_error"] = f"zfs snapshot exited with code {rc}"
                 summary["errors"].append(summary["snapshot_error"])
         elif include_archive:
             summary["snapshot_status"] = "skipped"
-            summary["snapshot_error"] = "zfs command unavailable in runtime"
+            summary["snapshot_error"] = zfs_command_error or "zfs command unavailable in runtime"
         else:
             summary["snapshot_status"] = "skipped"
             summary["snapshot_error"] = "snapshot skipped for target-only backup"
@@ -1106,10 +1399,7 @@ def stop_backup() -> dict[str, Any]:
         proc = _state.process
         thread = _state.run_thread
     if proc is not None and proc.poll() is None:
-        try:
-            proc.send_signal(signal.SIGTERM)
-        except Exception:
-            pass
+        _signal_process_group(proc, signal.SIGTERM)
     if thread is not None:
         thread.join(timeout=10)
     return get_backup_overview()
@@ -1119,7 +1409,7 @@ def get_run_logs(run_id: str, tail_lines: int = 180) -> dict[str, Any]:
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists() or not run_dir.is_dir():
         raise FileNotFoundError(run_id)
-    summary = _read_run_summary(run_dir)
+    summary = _reconcile_run_summary(run_dir, _read_run_summary(run_dir))
     return {
         "main_log_tail": _tail(run_dir / "main.log", lines=tail_lines),
         "debug_log_tail": _tail(run_dir / "debug.log", lines=tail_lines),
@@ -1169,4 +1459,3 @@ def start_scheduler_best_effort() -> None:
     _schedule_loaded = True
     thread = threading.Thread(target=_schedule_worker, daemon=True, name="backup-scheduler")
     thread.start()
-

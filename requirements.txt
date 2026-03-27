@@ -6,3 +6,5 @@ requests
 tqdm
 webvtt-py
 numpy
+pypdf
+python-docx

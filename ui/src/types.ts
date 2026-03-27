@@ -173,6 +173,7 @@ export type BackupOverview = {
       used_percent?: number | null;
     }>;
     zfs: {
+      host?: string | null;
       pool?: string | null;
       health?: string | null;
       status_ok?: boolean | null;
@@ -225,6 +226,15 @@ export type IndexingOverview = {
     chunks_done?: number;
     chunks_total?: number;
     current_path?: string | null;
+  };
+  timer_schedule?: string;
+  schedule: {
+    source?: string;
+    enabled: boolean;
+    time_of_day: string;
+    timezone?: string;
+    next_run_at?: string | null;
+    last_triggered_at?: string | null;
   };
   targets: IndexingTarget[];
   target_health: Array<

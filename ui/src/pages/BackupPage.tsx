@@ -461,7 +461,10 @@ export default function BackupPage() {
                   </span>
                 </div>
                 <p className="muted">
-                  Pool: {overview.storage_diagnostics.zfs.pool ?? "unknown"} · Health: {overview.storage_diagnostics.zfs.health ?? "unknown"}
+                  Target:{" "}
+                  {overview.storage_diagnostics.zfs.pool ??
+                    (overview.storage_diagnostics.zfs.host ? `${overview.storage_diagnostics.zfs.host}:unknown` : "unknown")}{" "}
+                  · Health: {overview.storage_diagnostics.zfs.health ?? "unknown"}
                 </p>
                 <p className="muted">
                   ZFS used {formatBytes(overview.storage_diagnostics.zfs.used_bytes)} / available{" "}

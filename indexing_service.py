@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from backups_service import get_schedule_config
+from documents.chunking import chunk_document_segments
+from documents.extract import extract_document_segments
 from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, utility
 try:
     from pymilvus import Function, FunctionType
@@ -41,12 +44,18 @@ INDEXING_ROOT = Path(os.getenv("VECTORSTORE_INDEXING_DIR", "/indexing"))
 RUNS_DIR = INDEXING_ROOT / "runs"
 INDEXING_CONFIG_FILE = INDEXING_ROOT / "indexing-config.json"
 INDEXING_STATE_FILE = INDEXING_ROOT / "indexing-state.json"
+INDEXING_SCHEDULE_STATE_FILE = INDEXING_ROOT / ".indexing-schedule.json"
+SCHEDULER_LOCK_FILE = INDEXING_ROOT / ".indexing-scheduler.lock"
 RUN_LOCK_FILE = INDEXING_ROOT / ".indexing-run.lock"
 RUN_SUMMARY_FILE = "summary.json"
 
 TRANSCRIPT_COLLECTION = "documents_transcripts"
+DOCUMENTS_COLLECTION = "documents"
 SUPPORTED_EXTS = {".vtt", ".srt", ".tsv", ".txt"}
+DOCUMENT_EXTS = {".pdf", ".docx"}
+ALL_INDEX_EXTS = SUPPORTED_EXTS | DOCUMENT_EXTS
 INDEXING_CONTENT_VERSION = "transcript_v6"
+DOCUMENT_CONTENT_VERSION = "document_v1"
 HOST_MOUNT_ROOT = Path(os.getenv("HOST_MOUNT_ROOT", "/host"))
 INDEXING_HOST_PATH_FALLBACK = os.getenv("INDEXING_HOST_PATH_FALLBACK", "1").strip().lower() in {"1", "true", "yes"}
 LEGACY_PATH_PREFIX_ALIASES = {
@@ -75,10 +84,18 @@ DOC_TYPE_BY_EXT = {
     ".srt": "subtitle_srt",
     ".tsv": "transcript_tsv",
     ".txt": "transcript_txt",
+    ".pdf": "pdf",
+    ".docx": "docx",
+}
+
+DOCUMENT_DOC_TYPE_BY_EXT = {
+    ".pdf": "pdf",
+    ".docx": "docx",
+    ".txt": "text_document",
 }
 
 
-def required_transcript_field_names() -> set[str]:
+def required_chunk_field_names() -> set[str]:
     return {
         "id",
         "vector",
@@ -103,6 +120,44 @@ def required_transcript_field_names() -> set[str]:
     }
 
 
+def _chunk_collection_fields() -> list[FieldSchema]:
+    return [
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=LOCAL_EMBEDDING_DIM),
+        FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535, enable_analyzer=True),
+        FieldSchema(name="sparse", dtype=DataType.SPARSE_FLOAT_VECTOR),
+        FieldSchema(name="hash", dtype=DataType.VARCHAR, max_length=64),
+        FieldSchema(name="source_id", dtype=DataType.VARCHAR, max_length=1024),
+        FieldSchema(name="path", dtype=DataType.VARCHAR, max_length=1024),
+        FieldSchema(name="filehash", dtype=DataType.VARCHAR, max_length=64),
+        FieldSchema(name="t_start_ms", dtype=DataType.INT64),
+        FieldSchema(name="t_end_ms", dtype=DataType.INT64),
+        FieldSchema(name="chunk_duration_s", dtype=DataType.INT64),
+        FieldSchema(name="level", dtype=DataType.INT64),
+        FieldSchema(name="parent_id", dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="doc_type", dtype=DataType.VARCHAR, max_length=128),
+        FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=128),
+        FieldSchema(name="topic_label", dtype=DataType.VARCHAR, max_length=128),
+        FieldSchema(name="language", dtype=DataType.VARCHAR, max_length=32),
+        FieldSchema(name="tags", dtype=DataType.VARCHAR, max_length=512),
+        FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=64),
+        FieldSchema(name="creation_date", dtype=DataType.INT64),
+    ]
+
+
+def _chunk_collection_functions() -> list[Any]:
+    if Function is None or FunctionType is None:
+        return []
+    return [
+        Function(
+            name="bm25_fn",
+            function_type=FunctionType.BM25,
+            input_field_names=["text"],
+            output_field_names=["sparse"],
+        )
+    ]
+
+
 def _iso(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).isoformat() if dt else None
 
@@ -115,6 +170,28 @@ def _tail(path: Path, lines: int = 120) -> str:
             return "".join(handle.readlines()[-lines:])
     except OSError:
         return ""
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", value.strip())
+    if not match:
+        raise ValueError("time_of_day must be HH:MM (24h).")
+    return int(match.group(1)), int(match.group(2))
+
+
+def _compute_next_run(now: datetime, hhmm: str) -> datetime:
+    hour, minute = _parse_hhmm(hhmm)
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        from datetime import timedelta
+
+        candidate = candidate + timedelta(days=1)
+    return candidate
+
+
+def _scheduled_slot_at_or_before(now: datetime, hhmm: str) -> datetime:
+    hour, minute = _parse_hhmm(hhmm)
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
 def _append_log(path: Path, line: str) -> None:
@@ -141,6 +218,44 @@ def _read_summary(run_dir: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _run_last_activity_at(run_dir: Path) -> datetime:
+    timestamps: list[float] = []
+    for path in (run_dir / RUN_SUMMARY_FILE, run_dir / "main.log", run_dir / "debug.log"):
+        try:
+            timestamps.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not timestamps:
+        return datetime.now(timezone.utc)
+    return datetime.fromtimestamp(max(timestamps), tz=timezone.utc)
+
+
+def _reconcile_summary(run_dir: Path, summary: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not summary:
+        return summary
+    if summary.get("status") != "running" or summary.get("finished_at"):
+        return summary
+
+    with _lock:
+        current_run_id = _state.run_id if _state.running else None
+    if current_run_id == run_dir.name:
+        return summary
+
+    repaired = dict(summary)
+    repaired["status"] = "interrupted"
+    repaired["finished_at"] = _iso(_run_last_activity_at(run_dir))
+    message = "Indexing worker exited before completing this run."
+    errors = repaired.get("errors")
+    if not isinstance(errors, list):
+        errors = []
+    if message not in errors:
+        errors.append(message)
+    repaired["errors"] = errors
+    repaired["last_line"] = repaired.get("last_line") or message
+    _write_summary(run_dir, repaired)
+    return repaired
 
 
 def _new_target_id() -> str:
@@ -208,6 +323,30 @@ def _save_config(config: dict[str, Any]) -> None:
     INDEXING_CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
+def _apply_target_scan_metadata(
+    config: dict[str, Any],
+    target_id: str,
+    count: int,
+    scanned_at: str | None,
+    last_error: str | None = None,
+) -> bool:
+    for target in config.get("targets", []):
+        if target.get("id") != target_id:
+            continue
+        target["transcript_files"] = int(count)
+        target["last_scanned_at"] = scanned_at
+        target["last_error"] = last_error
+        return True
+    return False
+
+
+def _persist_target_scan_progress(target_id: str, count: int, last_error: str | None = None) -> None:
+    config = _load_config()
+    scanned_at = _iso(datetime.now(timezone.utc))
+    if _apply_target_scan_metadata(config, target_id=target_id, count=count, scanned_at=scanned_at, last_error=last_error):
+        _save_config(config)
+
+
 def _load_state() -> dict[str, str]:
     if not INDEXING_STATE_FILE.exists():
         return {}
@@ -231,6 +370,52 @@ def _save_state(files_map: dict[str, str]) -> None:
     _ensure_root()
     payload = {"version": 1, "files": files_map}
     INDEXING_STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _load_schedule_state() -> None:
+    if not INDEXING_SCHEDULE_STATE_FILE.exists():
+        _schedule.last_triggered_at = None
+        return
+    try:
+        payload = json.loads(INDEXING_SCHEDULE_STATE_FILE.read_text(encoding="utf-8"))
+        last_raw = payload.get("last_triggered_at")
+        if isinstance(last_raw, str) and last_raw:
+            _schedule.last_triggered_at = datetime.fromisoformat(last_raw.replace("Z", "+00:00"))
+        else:
+            _schedule.last_triggered_at = None
+    except Exception:
+        _schedule.last_triggered_at = None
+
+
+def _save_schedule_state() -> None:
+    _ensure_root()
+    payload = {"last_triggered_at": _iso(_schedule.last_triggered_at)}
+    try:
+        INDEXING_SCHEDULE_STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _backup_linked_schedule_snapshot(now: datetime | None = None) -> dict[str, Any]:
+    global _schedule_loaded
+    current = now or datetime.now(timezone.utc)
+    if not _schedule_loaded:
+        _load_schedule_state()
+        _schedule_loaded = True
+    backup_schedule = get_schedule_config()
+    enabled = bool(backup_schedule.get("enabled", True))
+    time_of_day = str(backup_schedule.get("time_of_day", "02:00"))
+    next_run_at = _compute_next_run(current, time_of_day) if enabled else None
+    with _lock:
+        last_triggered_at = _schedule.last_triggered_at
+    return {
+        "source": "backup",
+        "enabled": enabled,
+        "time_of_day": time_of_day,
+        "timezone": str(backup_schedule.get("timezone") or "utc"),
+        "next_run_at": _iso(next_run_at),
+        "last_triggered_at": _iso(last_triggered_at),
+    }
 
 
 def _resolve_target_root(path: str) -> tuple[Path, bool]:
@@ -360,7 +545,7 @@ def _target_scan_count(path: str, recursive: bool) -> tuple[int, bool]:
             str(root),
             topdown=True,
             onerror=lambda _err: None,
-            followlinks=True,
+            followlinks=False,
         ):
             if time.monotonic() >= deadline:
                 timed_out = True
@@ -370,7 +555,7 @@ def _target_scan_count(path: str, recursive: bool) -> tuple[int, bool]:
                     timed_out = True
                     break
                 suffix = Path(name).suffix.lower()
-                if suffix in SUPPORTED_EXTS:
+                if suffix in ALL_INDEX_EXTS:
                     count += 1
     else:
         try:
@@ -379,7 +564,7 @@ def _target_scan_count(path: str, recursive: bool) -> tuple[int, bool]:
                     timed_out = True
                     break
                 try:
-                    if entry.is_file() and entry.suffix.lower() in SUPPORTED_EXTS:
+                    if entry.is_file() and entry.suffix.lower() in ALL_INDEX_EXTS:
                         count += 1
                 except OSError:
                     continue
@@ -395,10 +580,29 @@ def _path_is_descendant(path: str, root: str) -> bool:
 
 
 def _iter_target_files(path: str, recursive: bool) -> list[str]:
+    return list(_iter_target_file_paths(path, recursive))
+
+
+def _dedupe_directory_paths(paths: list[str]) -> list[str]:
+    transcript_jobs = []
+    document_paths = []
+    for read_path in sorted(paths):
+        if _treat_as_document(read_path):
+            document_paths.append(read_path)
+        else:
+            display_path = _to_host_display_path(read_path)
+            transcript_jobs.append({"path": display_path, "read_path": read_path})
+    deduped_transcripts, _ = _dedupe_file_jobs(transcript_jobs)
+    out = [str(job.get("read_path") or "") for job in deduped_transcripts if str(job.get("read_path") or "")]
+    out.extend(document_paths)
+    out.sort()
+    return out
+
+
+def _iter_target_file_paths(path: str, recursive: bool):
     root, _ = _resolve_target_root(path)
     if not root.exists() or not root.is_dir():
-        return []
-    out: list[str] = []
+        return
     timeout_seconds = float(os.getenv("INDEXING_FILE_DISCOVERY_TIMEOUT_SECONDS", "600"))
     deadline = time.monotonic() + max(1.0, timeout_seconds)
     if recursive:
@@ -406,35 +610,39 @@ def _iter_target_files(path: str, recursive: bool) -> list[str]:
             str(root),
             topdown=True,
             onerror=lambda _err: None,
-            followlinks=True,
+            followlinks=False,
         ):
             if time.monotonic() >= deadline:
                 break
+            dir_paths: list[str] = []
             for name in filenames:
                 if time.monotonic() >= deadline:
                     break
                 suffix = Path(name).suffix.lower()
-                if suffix not in SUPPORTED_EXTS:
+                if suffix not in ALL_INDEX_EXTS:
                     continue
                 item = Path(dirpath) / name
                 try:
-                    out.append(str(item.resolve()))
+                    dir_paths.append(str(item.resolve()))
                 except OSError:
                     continue
+            for read_path in _dedupe_directory_paths(dir_paths):
+                yield read_path
     else:
         try:
+            dir_paths = []
             for item in root.iterdir():
                 if time.monotonic() >= deadline:
                     break
                 try:
-                    if item.is_file() and item.suffix.lower() in SUPPORTED_EXTS:
-                        out.append(str(item.resolve()))
+                    if item.is_file() and item.suffix.lower() in ALL_INDEX_EXTS:
+                        dir_paths.append(str(item.resolve()))
                 except OSError:
                     continue
         except OSError:
-            return out
-    out.sort()
-    return out
+            return
+        for read_path in _dedupe_directory_paths(dir_paths):
+            yield read_path
 
 
 def _file_hash(path: str) -> str:
@@ -453,13 +661,13 @@ def _milvus_alias(prefix: str = "indexing") -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
-def _ensure_transcripts_collection(alias: str, ip_address: str = "localhost") -> Collection:
+def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address: str = "localhost") -> Collection:
     connections.connect(alias, host=ip_address, port="19530")
     recreate = False
-    if utility.has_collection(TRANSCRIPT_COLLECTION, using=alias):
-        existing = Collection(name=TRANSCRIPT_COLLECTION, using=alias)
+    if utility.has_collection(name, using=alias):
+        existing = Collection(name=name, using=alias)
         fields = {field.name: field for field in existing.schema.fields}
-        required = required_transcript_field_names()
+        required = required_chunk_field_names()
         if not required.issubset(fields.keys()):
             recreate = True
         else:
@@ -468,40 +676,9 @@ def _ensure_transcripts_collection(alias: str, ip_address: str = "localhost") ->
                 recreate = True
         if recreate:
             existing.drop()
-    if not utility.has_collection(TRANSCRIPT_COLLECTION, using=alias):
-        fields = [
-            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=LOCAL_EMBEDDING_DIM),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535, enable_analyzer=True),
-            FieldSchema(name="sparse", dtype=DataType.SPARSE_FLOAT_VECTOR),
-            FieldSchema(name="hash", dtype=DataType.VARCHAR, max_length=64),
-            FieldSchema(name="source_id", dtype=DataType.VARCHAR, max_length=1024),
-            FieldSchema(name="path", dtype=DataType.VARCHAR, max_length=1024),
-            FieldSchema(name="filehash", dtype=DataType.VARCHAR, max_length=64),
-            FieldSchema(name="t_start_ms", dtype=DataType.INT64),
-            FieldSchema(name="t_end_ms", dtype=DataType.INT64),
-            FieldSchema(name="chunk_duration_s", dtype=DataType.INT64),
-            FieldSchema(name="level", dtype=DataType.INT64),
-            FieldSchema(name="parent_id", dtype=DataType.VARCHAR, max_length=256),
-            FieldSchema(name="doc_type", dtype=DataType.VARCHAR, max_length=128),
-            FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=128),
-            FieldSchema(name="topic_label", dtype=DataType.VARCHAR, max_length=128),
-            FieldSchema(name="language", dtype=DataType.VARCHAR, max_length=32),
-            FieldSchema(name="tags", dtype=DataType.VARCHAR, max_length=512),
-            FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=64),
-            FieldSchema(name="creation_date", dtype=DataType.INT64),
-        ]
-        functions = []
-        if Function is not None and FunctionType is not None:
-            bm25_fn = Function(
-                name="bm25_fn",
-                function_type=FunctionType.BM25,
-                input_field_names=["text"],
-                output_field_names=["sparse"],
-            )
-            functions = [bm25_fn]
-        schema = CollectionSchema(fields, description="Transcript chunks", functions=functions)
-        collection = Collection(name=TRANSCRIPT_COLLECTION, schema=schema, using=alias)
+    if not utility.has_collection(name, using=alias):
+        schema = CollectionSchema(_chunk_collection_fields(), description=description, functions=_chunk_collection_functions())
+        collection = Collection(name=name, schema=schema, using=alias)
         dense_index = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
         collection.create_index(field_name="vector", index_params=dense_index)
         collection.create_index(
@@ -509,7 +686,7 @@ def _ensure_transcripts_collection(alias: str, ip_address: str = "localhost") ->
             index_params={"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}},
         )
         return collection
-    collection = Collection(name=TRANSCRIPT_COLLECTION, using=alias)
+    collection = Collection(name=name, using=alias)
     try:
         existing = collection.indexes or []
     except Exception:
@@ -541,6 +718,14 @@ def _ensure_transcripts_collection(alias: str, ip_address: str = "localhost") ->
     return collection
 
 
+def _ensure_transcripts_collection(alias: str, ip_address: str = "localhost") -> Collection:
+    return _ensure_chunk_collection(TRANSCRIPT_COLLECTION, "Transcript chunks", alias=alias, ip_address=ip_address)
+
+
+def _ensure_documents_collection(alias: str, ip_address: str = "localhost") -> Collection:
+    return _ensure_chunk_collection(DOCUMENTS_COLLECTION, "Document chunks", alias=alias, ip_address=ip_address)
+
+
 @dataclass
 class RuntimeState:
     run_thread: threading.Thread | None = None
@@ -565,8 +750,17 @@ class RuntimeState:
     _run_lock_fd: Any | None = None
 
 
+@dataclass
+class ScheduleState:
+    last_triggered_at: datetime | None = None
+
+
 _lock = threading.Lock()
 _state = RuntimeState()
+_schedule = ScheduleState()
+_scheduler_stop = threading.Event()
+_scheduler_lock_fd = None
+_schedule_loaded = False
 
 
 def list_indexing_targets() -> list[dict[str, Any]]:
@@ -678,7 +872,7 @@ def _latest_runs(limit: int = 10) -> list[dict[str, Any]]:
     run_dirs.sort(key=lambda p: p.name, reverse=True)
     out: list[dict[str, Any]] = []
     for run_dir in run_dirs[:limit]:
-        summary = _read_summary(run_dir) or {}
+        summary = _reconcile_summary(run_dir, _read_summary(run_dir)) or {}
         last_line = summary.get("last_line") or _tail(run_dir / "main.log", lines=1).strip() or None
         out.append(
             {
@@ -733,6 +927,8 @@ def get_indexing_overview() -> dict[str, Any]:
     storage_ready = all(t["ready"] for t in target_health if t["enabled"]) if target_health else False
     return {
         "status": _state_status(),
+        "timer_schedule": "daily",
+        "schedule": _backup_linked_schedule_snapshot(),
         "targets": config["targets"],
         "target_health": target_health,
         "storage_ready": storage_ready,
@@ -754,8 +950,7 @@ def _release_run_lock() -> None:
 def _build_file_jobs(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     for target in targets:
-        files = _iter_target_files(target["path"], bool(target.get("recursive", True)))
-        for read_path in files:
+        for read_path in _iter_target_file_paths(target["path"], bool(target.get("recursive", True))):
             jobs.append(
                 {
                     "target_id": target["id"],
@@ -788,6 +983,52 @@ def _doc_type_for_path(path: str) -> str:
     return DOC_TYPE_BY_EXT.get(Path(path).suffix.lower(), "transcript")
 
 
+def _document_doc_type_for_path(path: str) -> str:
+    return DOCUMENT_DOC_TYPE_BY_EXT.get(Path(path).suffix.lower(), "document")
+
+
+def _txt_looks_like_transcript(path: str) -> bool:
+    try:
+        sample = Path(path).read_text(encoding="utf-8", errors="replace")[:16000]
+    except Exception:
+        return False
+    if not sample.strip():
+        return False
+    patterns = [
+        r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*-->",
+        r"(?m)^\s*\[?\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\]?",
+        r"(?m)^\s*\d+\s*$",
+    ]
+    if re.search(patterns[0], sample):
+        return True
+    timestamp_hits = sum(1 for pattern in patterns[1:] if re.search(pattern, sample))
+    if timestamp_hits > 0:
+        return True
+    generic_timestamps = re.findall(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\b", sample)
+    return len(generic_timestamps) >= 3
+
+
+def _treat_as_document(path: str) -> bool:
+    suffix = Path(path).suffix.lower()
+    if suffix in DOCUMENT_EXTS:
+        return True
+    if suffix == ".txt":
+        return not _txt_looks_like_transcript(path)
+    return False
+
+
+def _collection_name_for_path(path: str) -> str:
+    if _treat_as_document(path):
+        return DOCUMENTS_COLLECTION
+    return TRANSCRIPT_COLLECTION
+
+
+def _content_version_for_path(path: str) -> str:
+    if _treat_as_document(path):
+        return DOCUMENT_CONTENT_VERSION
+    return INDEXING_CONTENT_VERSION
+
+
 def _parse_and_chunk(read_path: str, display_path: str) -> tuple[list[TranscriptChunk], str | None]:
     cues, reason = parse_transcript(read_path)
     if not cues:
@@ -808,6 +1049,29 @@ def _parse_and_chunk(read_path: str, display_path: str) -> tuple[list[Transcript
     if not chunks:
         return [], "No chunks generated"
     return chunks, None
+
+
+def _parse_document_and_chunk(read_path: str, display_path: str) -> tuple[list[TranscriptChunk], str | None]:
+    segments, reason = extract_document_segments(read_path)
+    if not segments:
+        return [], reason or "No extractable document text found"
+    chunks = chunk_document_segments(
+        segments,
+        path=display_path,
+        source_id=_source_id_for_path(display_path),
+        doc_type=_document_doc_type_for_path(read_path),
+        source_type="document",
+        language=None,
+    )
+    if not chunks:
+        return [], "No document chunks generated"
+    return chunks, None
+
+
+def _parse_file_job(read_path: str, display_path: str) -> tuple[list[TranscriptChunk], str | None]:
+    if _treat_as_document(read_path):
+        return _parse_document_and_chunk(read_path, display_path)
+    return _parse_and_chunk(read_path, display_path)
 
 
 def _chunk_hash(chunk: TranscriptChunk) -> str:
@@ -846,13 +1110,33 @@ def _insert_chunks(
     if not rows:
         return 0
     def _tags_for_chunk(chunk: TranscriptChunk) -> str:
+        path_obj = Path(str(chunk.path or ""))
+        suffix = path_obj.suffix.lower().lstrip(".")
         tags = [
             chunk.tag,
+            f"chunk_tag:{chunk.tag}",
             f"level_{chunk.level}",
             f"duration_{chunk.chunk_duration_s}s",
             f"source_type:{chunk.source_type}",
             f"doc_type:{chunk.doc_type}",
+            f"filename:{path_obj.name}",
         ]
+        if suffix:
+            tags.append(f"file_ext:{suffix}")
+        if path_obj.parent.name:
+            tags.append(f"parent_dir:{path_obj.parent.name}")
+        page_match = re.match(r"page_(\d+)", chunk.tag)
+        if page_match:
+            tags.append(f"page:{page_match.group(1)}")
+            tags.append("segment_kind:page")
+        heading_match = re.match(r"heading_(\d+)", chunk.tag)
+        if heading_match:
+            tags.append(f"heading:{heading_match.group(1)}")
+            tags.append("segment_kind:heading")
+        block_match = re.match(r"block_(\d+)", chunk.tag)
+        if block_match:
+            tags.append(f"block:{block_match.group(1)}")
+            tags.append("segment_kind:block")
         if chunk.language:
             tags.append(f"language:{chunk.language}")
         if chunk.topic_label:
@@ -930,166 +1214,164 @@ def _run_indexing_job(
     _write_summary(run_dir, summary)
 
     try:
-        file_jobs: list[dict[str, Any]] = []
+        alias = _milvus_alias("indexing")
+        files_state = _load_state()
+        target_indexed_time: dict[str, str] = {}
+        target_scan_counts: dict[str, int] = {}
+        target_scan_persisted_counts: dict[str, int] = {}
+        collections: dict[str, Collection] = {}
+        seen_filehash_paths: dict[str, str] = {}
         with _lock:
             _state.active_step = "scan"
             _state.files_total = 0
             _state.files_done = 0
             _state.progress_total = 1
             _state.progress_current = 0
-            _state.progress_line = "Discovering transcript files"
+            _state.progress_line = "Discovering indexable files"
             _state.current_path = None
-        for target in targets:
-            target_path = str(target.get("path") or "")
-            with _lock:
-                if _state.stop_requested:
-                    raise RuntimeError("Indexing stop requested by user.")
-                _state.current_path = target_path
-                _state.progress_line = f"Discovering files under {target_path}"
-            files = _iter_target_files(target_path, bool(target.get("recursive", True)))
-            for read_path in files:
-                file_jobs.append(
-                    {
-                        "target_id": target["id"],
-                        "path": _to_host_display_path(read_path),
-                        "read_path": read_path,
-                    }
-                )
-            with _lock:
-                _state.files_total = len(file_jobs)
-                _state.progress_total = max(len(file_jobs), 1)
-                _state.progress_current = 0
-
-        file_jobs, duplicate_family_paths = _dedupe_file_jobs(file_jobs)
-        file_jobs.sort(key=lambda item: item["path"])
-        summary["files_total"] = len(file_jobs)
-        _append_log(main_log_path, f"[{run_id}] indexing run started with {len(file_jobs)} candidate files")
-        if duplicate_family_paths:
-            _append_log(main_log_path, f"Skipped {len(duplicate_family_paths)} lower-priority sibling transcript files")
-
-        parsed_jobs: list[dict[str, Any]] = []
-        seen_filehash_paths: dict[str, str] = {}
-        with _lock:
-            _state.active_step = "scan"
-            _state.files_total = len(file_jobs)
-            _state.files_done = 0
-            _state.progress_total = max(len(file_jobs), 1)
-            _state.progress_current = 0
-            _state.progress_line = "Scanning transcript files"
-            _state.current_path = None
-
-        for idx, job in enumerate(file_jobs, start=1):
-            with _lock:
-                if _state.stop_requested:
-                    raise RuntimeError("Indexing stop requested by user.")
-                _state.files_done = idx - 1
-                _state.progress_current = idx - 1
-                _state.current_path = job["path"]
-                _state.progress_line = f"Scanning {job['path']}"
-            chunks, reason = _parse_and_chunk(str(job["read_path"]), str(job["path"]))
-            if chunks:
-                job["chunks"] = chunks
-                job["filehash"] = _file_hash(str(job["read_path"]))
-                duplicate_of = seen_filehash_paths.get(str(job["filehash"]))
-                if duplicate_of:
-                    summary["files_skipped"] += 1
-                    _append_log(main_log_path, f"Skipped {job['path']}: duplicate transcript content of {duplicate_of}")
-                else:
-                    seen_filehash_paths[str(job["filehash"])] = str(job["path"])
-                    parsed_jobs.append(job)
-                    summary["chunks_total"] += len(chunks)
-            else:
-                summary["files_skipped"] += 1
-                if reason:
-                    summary["errors"].append(f"{job['path']}: {reason}")
-                _append_log(main_log_path, f"Skipped {job['path']}: {reason or 'no chunks'}")
-            with _lock:
-                _state.files_done = idx
-                _state.progress_current = idx
-            _write_summary(run_dir, summary)
-
-        with _lock:
-            _state.active_step = "index"
-            _state.progress_total = max(summary["chunks_total"], 1)
-            _state.progress_current = 0
-            _state.chunks_total = summary["chunks_total"]
-            _state.chunks_done = 0
-            _state.progress_line = "Embedding and inserting chunks"
-            _state.current_path = None
-
-        alias = _milvus_alias("transcripts")
-        files_state = _load_state()
-        target_indexed_time: dict[str, str] = {}
         try:
-            collection = _ensure_transcripts_collection(alias=alias, ip_address=ip_address)
-            try:
-                collection.load()
-            except Exception:
-                pass
-            if summary["chunks_total"] == 0:
-                summary["status"] = "ok"
-            for job in parsed_jobs:
+            discovered_files = 0
+            _append_log(main_log_path, f"[{run_id}] indexing run started")
+            for target in targets:
+                target_path = str(target.get("path") or "")
+                target_scan_counts[target["id"]] = 0
+                target_scan_persisted_counts[target["id"]] = 0
                 with _lock:
                     if _state.stop_requested:
                         raise RuntimeError("Indexing stop requested by user.")
-                    _state.current_path = job["path"]
-                    _state.progress_line = f"Indexing {job['path']}"
-                filehash = str(job["filehash"])
-                path = str(job["path"])
-                read_path = str(job.get("read_path") or path)
-                chunks: list[TranscriptChunk] = job["chunks"]
-                state_token = f"{INDEXING_CONTENT_VERSION}|{LOCAL_EMBEDDING_MODEL}|{filehash}"
-                if files_state.get(path) == state_token:
-                    summary["files_skipped"] += 1
+                    _state.current_path = target_path
+                    _state.progress_line = f"Discovering files under {target_path}"
+                for read_path in _iter_target_file_paths(target_path, bool(target.get("recursive", True))):
+                    display_path = _to_host_display_path(read_path)
+                    discovered_files += 1
+                    target_scan_counts[target["id"]] += 1
+                    if target_scan_counts[target["id"]] - target_scan_persisted_counts[target["id"]] >= 25:
+                        _persist_target_scan_progress(target["id"], target_scan_counts[target["id"]])
+                        target_scan_persisted_counts[target["id"]] = target_scan_counts[target["id"]]
+                    summary["files_total"] = discovered_files
                     with _lock:
-                        _state.chunks_done += len(chunks)
+                        if _state.stop_requested:
+                            raise RuntimeError("Indexing stop requested by user.")
+                        _state.active_step = "scan"
+                        _state.current_path = display_path
+                        _state.files_total = discovered_files
+                        _state.progress_total = max(discovered_files, 1)
+                        _state.progress_current = _state.files_done
+                        _state.progress_line = f"Scanning {display_path}"
+                    chunks, reason = _parse_file_job(read_path, display_path)
+                    if not chunks:
+                        summary["files_skipped"] += 1
+                        if reason:
+                            summary["errors"].append(f"{display_path}: {reason}")
+                        _append_log(main_log_path, f"Skipped {display_path}: {reason or 'no chunks'}")
+                        with _lock:
+                            _state.files_done += 1
+                            _state.progress_current = _state.files_done
+                        _write_summary(run_dir, summary)
+                        continue
+
+                    filehash = _file_hash(read_path)
+                    duplicate_of = seen_filehash_paths.get(filehash)
+                    if duplicate_of:
+                        summary["files_skipped"] += 1
+                        _append_log(main_log_path, f"Skipped {display_path}: duplicate transcript content of {duplicate_of}")
+                        with _lock:
+                            _state.files_done += 1
+                            _state.progress_current = _state.files_done
+                        _write_summary(run_dir, summary)
+                        continue
+
+                    seen_filehash_paths[filehash] = display_path
+                    summary["chunks_total"] += len(chunks)
+                    collection_name = _collection_name_for_path(read_path)
+                    content_version = _content_version_for_path(read_path)
+                    collection = collections.get(collection_name)
+                    if collection is None:
+                        if collection_name == DOCUMENTS_COLLECTION:
+                            collection = _ensure_documents_collection(alias=alias, ip_address=ip_address)
+                        else:
+                            collection = _ensure_transcripts_collection(alias=alias, ip_address=ip_address)
+                        try:
+                            collection.load()
+                        except Exception:
+                            pass
+                        collections[collection_name] = collection
+
+                    state_token = f"{content_version}|{LOCAL_EMBEDDING_MODEL}|{filehash}"
+                    if files_state.get(display_path) == state_token:
+                        summary["files_skipped"] += 1
+                        with _lock:
+                            _state.files_done += 1
+                            _state.chunks_done += len(chunks)
+                            _state.chunks_total = summary["chunks_total"]
+                            _state.progress_total = max(summary["chunks_total"], 1)
+                            _state.progress_current = _state.chunks_done
+                        _write_summary(run_dir, summary)
+                        continue
+
+                    with _lock:
+                        _state.active_step = "index"
+                        _state.current_path = display_path
+                        _state.chunks_total = summary["chunks_total"]
+                        _state.progress_total = max(summary["chunks_total"], 1)
                         _state.progress_current = _state.chunks_done
-                    continue
-                for source_id in _source_id_candidates(display_path=path, read_path=read_path):
-                    delete_expr = f'source_id == "{_escape_expr(source_id)}"'
+                        _state.progress_line = f"Indexing {display_path}"
+
+                    for source_id in _source_id_candidates(display_path=display_path, read_path=read_path):
+                        delete_expr = f'source_id == "{_escape_expr(source_id)}"'
+                        try:
+                            collection.delete(delete_expr)
+                        except Exception:
+                            pass
                     try:
-                        collection.delete(delete_expr)
-                    except Exception:
-                        pass
-                try:
-                    inserted = _insert_chunks(
-                        collection=collection,
-                        chunks=chunks,
-                        filehash=filehash,
-                        embedding_host=embedding_host,
-                        embedding_port=embedding_port,
-                    )
-                except Exception as exc:
-                    inserted = 0
-                    summary["files_failed"] += 1
-                    summary["errors"].append(f"{path}: embedding/insert failed ({exc})")
-                    _append_log(main_log_path, f"Failed {path}: embedding/insert failed ({exc})")
-                    with _lock:
-                        _state.chunks_done += len(chunks)
-                        _state.progress_current = _state.chunks_done
-                    _write_summary(run_dir, summary)
-                    continue
-                if inserted <= 0:
-                    summary["files_failed"] += 1
-                    summary["errors"].append(f"{path}: no valid embeddings generated")
-                    _append_log(main_log_path, f"Failed {path}: no valid embeddings generated")
-                else:
-                    summary["files_indexed"] += 1
-                    summary["chunks_indexed"] += inserted
-                    files_state[path] = state_token
-                    target_indexed_time[job["target_id"]] = _iso(datetime.now(timezone.utc)) or ""
-                    _append_log(main_log_path, f"Indexed {path}: {inserted} chunks")
-                with _lock:
-                    _state.chunks_done += len(chunks)
-                    _state.progress_current = _state.chunks_done
-                    elapsed = max(1, int(time.time() - (_state._started_monotonic or time.time())))
-                    _state.elapsed_seconds = elapsed
-                    if _state.chunks_done > 0 and _state.chunks_total > _state.chunks_done:
-                        rate = _state.chunks_done / elapsed
-                        _state.eta_seconds = int((_state.chunks_total - _state.chunks_done) / rate) if rate > 0 else None
+                        inserted = _insert_chunks(
+                            collection=collection,
+                            chunks=chunks,
+                            filehash=filehash,
+                            embedding_host=embedding_host,
+                            embedding_port=embedding_port,
+                        )
+                    except Exception as exc:
+                        inserted = 0
+                        summary["files_failed"] += 1
+                        summary["errors"].append(f"{display_path}: embedding/insert failed ({exc})")
+                        _append_log(main_log_path, f"Failed {display_path}: embedding/insert failed ({exc})")
+                        with _lock:
+                            _state.files_done += 1
+                            _state.chunks_done += len(chunks)
+                            _state.progress_current = _state.chunks_done
+                        _write_summary(run_dir, summary)
+                        continue
+
+                    if inserted <= 0:
+                        summary["files_failed"] += 1
+                        summary["errors"].append(f"{display_path}: no valid embeddings generated")
+                        _append_log(main_log_path, f"Failed {display_path}: no valid embeddings generated")
                     else:
-                        _state.eta_seconds = 0
-                _write_summary(run_dir, summary)
+                        summary["files_indexed"] += 1
+                        summary["chunks_indexed"] += inserted
+                        files_state[display_path] = state_token
+                        target_indexed_time[target["id"]] = _iso(datetime.now(timezone.utc)) or ""
+                        _append_log(main_log_path, f"Indexed {display_path}: {inserted} chunks")
+
+                    with _lock:
+                        _state.files_done += 1
+                        _state.chunks_done += len(chunks)
+                        _state.chunks_total = summary["chunks_total"]
+                        _state.progress_total = max(summary["chunks_total"], 1)
+                        _state.progress_current = _state.chunks_done
+                        elapsed = max(1, int(time.time() - (_state._started_monotonic or time.time())))
+                        _state.elapsed_seconds = elapsed
+                        if _state.chunks_done > 0 and _state.chunks_total > _state.chunks_done:
+                            rate = _state.chunks_done / elapsed
+                            _state.eta_seconds = int((_state.chunks_total - _state.chunks_done) / rate) if rate > 0 else None
+                        else:
+                            _state.eta_seconds = 0
+                    _write_summary(run_dir, summary)
+                _persist_target_scan_progress(target["id"], target_scan_counts[target["id"]])
+                target_scan_persisted_counts[target["id"]] = target_scan_counts[target["id"]]
+            if summary["files_total"] == 0:
+                summary["status"] = "ok"
             _save_state(files_state)
         finally:
             try:
@@ -1097,12 +1379,18 @@ def _run_indexing_job(
             except Exception:
                 pass
 
-        if target_indexed_time:
+        if target_indexed_time or target_scan_counts:
             config = _load_config()
-            touched_ids = set(target_indexed_time.keys())
+            touched_ids = set(target_indexed_time.keys()) | set(target_scan_counts.keys())
+            scanned_at = _iso(datetime.now(timezone.utc))
             for target in config["targets"]:
                 if target["id"] in touched_ids:
-                    target["last_indexed_at"] = target_indexed_time[target["id"]]
+                    if target["id"] in target_indexed_time:
+                        target["last_indexed_at"] = target_indexed_time[target["id"]]
+                    if target["id"] in target_scan_counts:
+                        target["transcript_files"] = int(target_scan_counts[target["id"]])
+                        target["last_scanned_at"] = scanned_at
+                        target["last_error"] = None
             _save_config(config)
 
         if summary["files_failed"] > 0:
@@ -1231,9 +1519,45 @@ def get_indexing_run_logs(run_id: str, tail_lines: int = 180) -> dict[str, Any]:
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists() or not run_dir.is_dir():
         raise FileNotFoundError(run_id)
-    summary = _read_summary(run_dir)
+    summary = _reconcile_summary(run_dir, _read_summary(run_dir))
     return {
         "main_log_tail": _tail(run_dir / "main.log", lines=tail_lines),
         "debug_log_tail": _tail(run_dir / "debug.log", lines=tail_lines),
         "summary": summary,
     }
+
+
+def _schedule_worker() -> None:
+    while not _scheduler_stop.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            snapshot = _backup_linked_schedule_snapshot(now)
+            if snapshot["enabled"]:
+                slot = _scheduled_slot_at_or_before(now, str(snapshot["time_of_day"]))
+                with _lock:
+                    last_triggered_at = _schedule.last_triggered_at
+                due = slot <= now and (last_triggered_at is None or last_triggered_at < slot)
+                if due:
+                    try:
+                        start_indexing()
+                        with _lock:
+                            _schedule.last_triggered_at = now
+                            _save_schedule_state()
+                    except Exception:
+                        pass
+        finally:
+            _scheduler_stop.wait(30)
+
+
+def start_scheduler_best_effort() -> None:
+    global _scheduler_lock_fd
+    global _schedule_loaded
+    if _scheduler_lock_fd is not None:
+        return
+    _scheduler_lock_fd = _acquire_lock(SCHEDULER_LOCK_FILE)
+    if _scheduler_lock_fd is None:
+        return
+    _load_schedule_state()
+    _schedule_loaded = True
+    thread = threading.Thread(target=_schedule_worker, daemon=True, name="indexing-scheduler")
+    thread.start()

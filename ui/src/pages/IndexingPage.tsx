@@ -9,6 +9,7 @@ import {
   startIndexing,
   startIndexingTarget,
   stopIndexing,
+  updateBackupSchedule,
   updateIndexingTarget
 } from "../lib/api";
 import type { IndexingLogResponse, IndexingOverview, IndexingTarget } from "../types";
@@ -19,6 +20,8 @@ export default function IndexingPage() {
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
+  const [scheduleEnabled, setScheduleEnabled] = useState(true);
+  const [scheduleTime, setScheduleTime] = useState("02:00");
   const [newTargetPath, setNewTargetPath] = useState("/media/mass/recording");
   const [newTargetRecursive, setNewTargetRecursive] = useState(true);
 
@@ -26,6 +29,8 @@ export default function IndexingPage() {
     try {
       const data = await getIndexingOverview();
       setOverview(data);
+      setScheduleEnabled(data.schedule.enabled);
+      setScheduleTime(data.schedule.time_of_day);
       setError(null);
       if (!selectedRun && data.recent_runs.length > 0) {
         setSelectedRun(data.recent_runs[0].run_id);
@@ -42,6 +47,18 @@ export default function IndexingPage() {
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load indexing logs.");
+    }
+  }
+
+  async function onSaveSchedule() {
+    setWorking(true);
+    try {
+      await updateBackupSchedule(scheduleEnabled, scheduleTime);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update schedule.");
+    } finally {
+      setWorking(false);
     }
   }
 
@@ -166,7 +183,7 @@ export default function IndexingPage() {
           <div className="backup-header panel">
             <div>
               <h2>Indexing</h2>
-              <p className="muted">Transcript indexing for selected target folders.</p>
+              <p className="muted">Transcript, PDF, and DOCX indexing for selected target folders.</p>
               <div className="health-pill">
                 <span className={`status-dot ${overview.storage_ready ? "success" : "warning"}`} />
                 <span>{overview.storage_ready ? "Targets look available" : "Targets need attention"}</span>
@@ -186,6 +203,30 @@ export default function IndexingPage() {
           </div>
 
           <div className="panel">
+            <h3>Indexing Scheduler</h3>
+            <div className="schedule-form">
+              <label className="schedule-toggle">
+                <input type="checkbox" checked={scheduleEnabled} onChange={(event) => setScheduleEnabled(event.target.checked)} />
+                Enabled
+              </label>
+              <label>
+                Time (UTC)
+                <input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} />
+              </label>
+              <button disabled={working} onClick={() => void onSaveSchedule()}>
+                Save Schedule
+              </button>
+            </div>
+            <p className="muted">
+              Next run: {overview.schedule.next_run_at ? new Date(overview.schedule.next_run_at).toLocaleString() : "disabled"}
+            </p>
+            <p className="muted">
+              Last trigger:{" "}
+              {overview.schedule.last_triggered_at ? new Date(overview.schedule.last_triggered_at).toLocaleString() : "none"}
+            </p>
+          </div>
+
+          <div className="panel">
             <p>
               <strong>State:</strong> {overview.status.running ? "Running" : "Idle"}
             </p>
@@ -196,7 +237,7 @@ export default function IndexingPage() {
               <strong>Status line:</strong> {overview.status.progress_line ?? "No active progress line."}
             </p>
             <p className="muted">
-              Files: {overview.status.files_done ?? 0}/{overview.status.files_total ?? 0} · Chunks: {overview.status.chunks_done ?? 0}/
+              Indexable files: {overview.status.files_done ?? 0}/{overview.status.files_total ?? 0} · Chunks: {overview.status.chunks_done ?? 0}/
               {overview.status.chunks_total ?? 0} · ETA:{" "}
               {typeof overview.status.eta_seconds === "number" ? `${overview.status.eta_seconds}s` : "unknown"}
             </p>
@@ -235,7 +276,7 @@ export default function IndexingPage() {
                     </div>
                     <p className="muted">Resolved: {health?.resolved_path ?? target.path}</p>
                     <p className="muted">
-                      Files: {target.transcript_files} · Recursive: {target.recursive ? "yes" : "no"} · Last scan:{" "}
+                      Indexable files: {target.transcript_files} · Recursive: {target.recursive ? "yes" : "no"} · Last scan:{" "}
                       {target.last_scanned_at ? new Date(target.last_scanned_at).toLocaleString() : "never"}
                     </p>
                     {target.last_error && <p className="muted">Last error: {target.last_error}</p>}
