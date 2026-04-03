@@ -45,13 +45,30 @@ from indexing_service import (
     update_indexing_target,
 )
 from movietime_items import search_movietime_items, upsert_movietime_items
+from chat_store import (
+    add_message,
+    create_session as create_chat_session,
+    delete_session as delete_chat_session,
+    get_session_messages,
+    init_db as init_chat_db,
+    list_sessions,
+    update_session_title,
+)
+import transcription_service
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
+init_chat_db()
 
 # Start backup scheduler once (best-effort; uses a file lock).
 start_scheduler_best_effort()
 start_indexing_scheduler_best_effort()
+
+# Initialize transcription service (non-blocking, will log if GPU unavailable)
+try:
+    transcription_service.init_transcription_model()
+except Exception as e:
+    logging.warning("Transcription service init failed: %s", e)
 
 # Allow the UI to be served from a different dev origin (Vite preview/dev).
 @app.after_request
@@ -1027,6 +1044,57 @@ def api_indexing_target_index(target_id: str):
         return jsonify({"error": str(e)}), 409
 
 
+@app.route("/api/transcribe", methods=["POST"])
+def transcribe_endpoint():
+    """Transcription endpoint - drop-in replacement for TranscribeServer."""
+    if not transcription_service.is_available():
+        return jsonify({"error": "Transcription service not available", "status": transcription_service.get_status()}), 503
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided. Send multipart/form-data with field 'file'."}), 400
+
+    uploaded = request.files["file"]
+    data = uploaded.read()
+    if not data:
+        return jsonify({"error": "Empty file"}), 400
+
+    initial_prompt = request.args.get("initial_prompt")
+    no_speech_threshold = request.args.get("no_speech_threshold", type=float)
+    vad_filter = request.args.get("vad_filter", "true").lower() in ("true", "1", "yes")
+    allow_fallback = request.args.get("allow_fallback", "true").lower() in ("true", "1", "yes")
+    detailed = request.args.get("detailed", "false").lower() in ("true", "1", "yes")
+    word_timestamps = request.args.get("word_timestamps", "false").lower() in ("true", "1", "yes")
+
+    try:
+        transcription, meta, segments = transcription_service.transcribe_audio_bytes(
+            data,
+            content_type=uploaded.content_type or "",
+            filename=uploaded.filename or "",
+            initial_prompt=initial_prompt,
+            no_speech_threshold=no_speech_threshold,
+            vad_filter=vad_filter,
+            allow_fallback=allow_fallback,
+            word_timestamps=word_timestamps,
+        )
+        return jsonify(transcription_service.build_transcribe_response(
+            transcription, meta, segments, detailed=detailed, word_timestamps=word_timestamps
+        ))
+    except Exception as e:
+        logging.exception("Transcription failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/transcribe/status", methods=["GET"])
+def transcribe_status():
+    return jsonify(transcription_service.get_status())
+
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe_compat_endpoint():
+    """Backward-compatible endpoint matching TranscribeServer's POST / contract."""
+    return transcribe_endpoint()
+
+
 @app.route("/api/movietime/items/upsert", methods=["POST"])
 def api_movietime_items_upsert():
     payload = request.json or {}
@@ -1313,6 +1381,304 @@ def handle_exception(e: Exception):
     app.logger.error(f"Unhandled exception: {str(e)}")
     app.logger.error(traceback.format_exc())
     return jsonify({"error": "An unexpected error occurred"}), 500
+
+## ── Chat endpoint (OpenClaw proxy) ──────────────────────────────────
+import re as _re
+
+_OPENCLAW_URL = os.environ.get("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789").rstrip("/")
+_OPENCLAW_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
+_OPENCLAW_MODEL = os.environ.get("OPENCLAW_CHAT_MODEL", "openclaw/default").strip()
+
+_CHAT_SYSTEM_MESSAGE = """You are Archivist's built-in chat assistant. You run inside a self-hosted document search and vector database management app.
+
+## What you know about
+- Document collections (transcripts, PDFs, text files indexed in Milvus vector DB)
+- Search: dense (semantic), BM25 (keyword), and hybrid search across collections
+- 3D embeddings visualization
+- Backup management: scheduled backups, logs, targets
+- Indexing: document indexing pipelines, status, logs
+
+## UI Navigation
+Append ACTION line to navigate the user: ACTION:{"type":"navigate","payload":{"path":"/collections"}}
+
+Available pages:
+- /collections -- All collections (main view, search across all)
+- /collections/COLLECTION_NAME -- Collection detail with search
+- /backup -- Backup management (schedules, logs, targets)
+- /indexing -- Indexing management (pipelines, status)
+
+Examples:
+- "show collections" -> answer + ACTION:{"type":"navigate","payload":{"path":"/collections"}}
+- "search for meetings" -> answer + ACTION:{"type":"navigate","payload":{"path":"/collections"}}
+- "backup status" -> answer + ACTION:{"type":"navigate","payload":{"path":"/backup"}}
+- "indexing status" -> answer + ACTION:{"type":"navigate","payload":{"path":"/indexing"}}
+
+## Rules
+1. ALWAYS respond to every message
+2. Keep responses concise and helpful
+3. Keep responses under 200 words unless showing search results
+"""
+
+
+def _extract_chat_action(text):
+    match = _re.search(r"ACTION:(\{[^}]+\})", text)
+    if not match:
+        return None
+    try:
+        import json as _json
+        parsed = _json.loads(match.group(1))
+        if parsed.get("type") and parsed.get("payload"):
+            return parsed
+    except (ValueError, KeyError):
+        pass
+    return None
+
+
+# ── Media processing endpoints ─────────────────────────────────────────
+
+@app.route("/api/media/process", methods=["POST"])
+def media_process():
+    """Process a media file through the hierarchical pipeline."""
+    from media.pipeline import process_media_file
+    body = request.get_json(force=True, silent=True) or {}
+    path = (body.get("path") or "").strip()
+    if not path:
+        return jsonify({"error": "path is required"}), 400
+    if not os.path.isfile(path):
+        return jsonify({"error": f"File not found: {path}"}), 404
+    output_format = body.get("format")
+    try:
+        from media.models import OutputFormat
+        fmt = OutputFormat(output_format) if output_format else None
+    except (ValueError, KeyError):
+        fmt = None
+    try:
+        result = process_media_file(path, output_format=fmt)
+        return jsonify(result)
+    except Exception as e:
+        logging.exception("Media processing failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/media/jobs", methods=["GET"])
+def media_jobs():
+    """Get active/recent media processing jobs."""
+    from media.pipeline import get_active_jobs
+    return jsonify({"jobs": get_active_jobs()})
+
+
+@app.route("/api/media/assets", methods=["GET"])
+def media_assets():
+    """List all registered media assets."""
+    from media.evidence_store import list_assets
+    return jsonify({"assets": list_assets()})
+
+
+@app.route("/api/media/assets/<media_id>", methods=["GET"])
+def media_asset_detail(media_id):
+    """Get details for a specific media asset."""
+    from media.evidence_store import get_asset, get_artifacts
+    asset = get_asset(media_id)
+    if not asset:
+        return jsonify({"error": "Asset not found"}), 404
+    artifacts = get_artifacts(media_id)
+    return jsonify({
+        "asset": {
+            "media_id": asset.media_id,
+            "path": asset.path,
+            "filename": asset.filename,
+            "modality": asset.modality.value,
+            "duration_s": asset.duration_s,
+            "file_hash": asset.file_hash,
+            "file_size_bytes": asset.file_size_bytes,
+            "created_at": asset.created_at,
+            "indexed_at": asset.indexed_at,
+            "metadata": asset.metadata,
+        },
+        "artifacts": [
+            {"artifact_id": a.artifact_id, "kind": a.kind, "start_s": a.start_s, "end_s": a.end_s, "confidence": a.confidence}
+            for a in artifacts
+        ],
+    })
+
+
+@app.route("/api/media/pipeline/<media_id>", methods=["GET"])
+def media_pipeline_result(media_id):
+    """Get the full pipeline result for a processed media asset."""
+    from media.pipeline import get_pipeline_result
+    result = get_pipeline_result(media_id)
+    if not result:
+        return jsonify({"error": "No pipeline result found"}), 404
+    return jsonify(result)
+
+
+# ── Chat session endpoints ─────────────────────────────────────────────
+
+@app.route("/api/chat/sessions", methods=["GET"])
+def get_chat_sessions():
+    try:
+        sessions = list_sessions()
+        return jsonify({"sessions": sessions})
+    except Exception as e:
+        return jsonify({"sessions": [], "error": str(e)}), 200
+
+
+@app.route("/api/chat/sessions", methods=["POST"])
+def create_new_chat_session():
+    body = request.get_json(force=True, silent=True) or {}
+    title = (body.get("title") or "").strip()
+    try:
+        session = create_chat_session(title)
+        return jsonify(session), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/chat/sessions/<session_id>/messages", methods=["GET"])
+def get_chat_messages(session_id):
+    try:
+        msgs = get_session_messages(session_id)
+        return jsonify({"messages": msgs})
+    except Exception as e:
+        return jsonify({"messages": [], "error": str(e)}), 200
+
+
+@app.route("/api/chat/sessions/<session_id>", methods=["DELETE"])
+def remove_chat_session(session_id):
+    try:
+        delete_chat_session(session_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat_endpoint():
+    import json as _json
+
+    body = request.get_json(force=True, silent=True) or {}
+    message = (body.get("message") or "").strip()
+    if not message:
+        return jsonify({"reply": "Please provide a message."}), 400
+
+    if not _OPENCLAW_TOKEN:
+        return jsonify({"reply": "Chat backend not configured. Set OPENCLAW_GATEWAY_TOKEN."}), 500
+
+    stream = body.get("stream", True)
+    session_id = body.get("session_id")
+    session_key = body.get("session_key") or (
+        f"main:web:{session_id}@archivist" if session_id else f"archivist-{id(request)}"
+    )
+
+    # Persist user message and load history
+    if session_id:
+        add_message(session_id, "user", message)
+        history = get_session_messages(session_id)
+        # Auto-title on first user message
+        if sum(1 for m in history if m["role"] == "user") == 1:
+            update_session_title(session_id, message[:80])
+        # Build messages from DB history (last 20)
+        recent = history[-20:]
+        messages_payload = [{"role": "system", "content": _CHAT_SYSTEM_MESSAGE}]
+        messages_payload += [{"role": m["role"], "content": m["content"]} for m in recent]
+    else:
+        messages_payload = [
+            {"role": "system", "content": _CHAT_SYSTEM_MESSAGE},
+            {"role": "user", "content": message},
+        ]
+
+    if stream:
+        import requests as _requests
+
+        def generate():
+            try:
+                resp = _requests.post(
+                    f"{_OPENCLAW_URL}/v1/chat/completions",
+                    json={
+                        "model": _OPENCLAW_MODEL,
+                        "stream": True,
+                        "messages": messages_payload,
+                        "user": session_key,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {_OPENCLAW_TOKEN}",
+                        "Content-Type": "application/json",
+                        "x-openclaw-session-key": session_key,
+                    },
+                    stream=True,
+                    timeout=180,
+                )
+
+                full_text = ""
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data: "):
+                        continue
+                    payload = line[6:].strip()
+                    if payload == "[DONE]":
+                        # Persist assistant response
+                        if session_id and full_text.strip():
+                            add_message(session_id, "assistant", full_text.strip())
+                        action = _extract_chat_action(full_text)
+                        if action:
+                            yield f"data: {_json.dumps({'action': action})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    try:
+                        parsed = _json.loads(payload)
+                        delta = parsed.get("choices", [{}])[0].get("delta", {}).get("content")
+                        if delta:
+                            full_text += delta
+                            yield f"data: {_json.dumps({'delta': delta})}\n\n"
+                    except (ValueError, IndexError, KeyError):
+                        pass
+
+                # Persist assistant response (stream ended without [DONE])
+                if session_id and full_text.strip():
+                    add_message(session_id, "assistant", full_text.strip())
+                action = _extract_chat_action(full_text)
+                if action:
+                    yield f"data: {_json.dumps({'action': action})}\n\n"
+                yield "data: [DONE]\n\n"
+
+            except Exception as e:
+                yield f"data: {_json.dumps({'delta': f'Error: {str(e)}'})}\n\n"
+                yield "data: [DONE]\n\n"
+
+        from flask import Response
+        return Response(generate(), mimetype="text/event-stream")
+
+    else:
+        import requests as _requests
+        try:
+            resp = _requests.post(
+                f"{_OPENCLAW_URL}/v1/chat/completions",
+                json={
+                    "model": _OPENCLAW_MODEL,
+                    "stream": False,
+                    "messages": messages_payload,
+                    "user": session_key,
+                },
+                headers={
+                    "Authorization": f"Bearer {_OPENCLAW_TOKEN}",
+                    "Content-Type": "application/json",
+                    "x-openclaw-session-key": session_key,
+                },
+                timeout=180,
+            )
+            data = resp.json()
+            reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No response.")
+            # Persist assistant response
+            if session_id and reply.strip():
+                add_message(session_id, "assistant", reply.strip())
+            action = _extract_chat_action(reply)
+            clean_reply = _re.sub(r"ACTION:\{[^}]*\}", "", reply).strip()
+            result = {"reply": clean_reply}
+            if action:
+                result["action"] = action
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"reply": f"Failed to reach AI backend: {str(e)}"}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5050)

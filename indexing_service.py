@@ -53,7 +53,8 @@ TRANSCRIPT_COLLECTION = "documents_transcripts"
 DOCUMENTS_COLLECTION = "documents"
 SUPPORTED_EXTS = {".vtt", ".srt", ".tsv", ".txt"}
 DOCUMENT_EXTS = {".pdf", ".docx"}
-ALL_INDEX_EXTS = SUPPORTED_EXTS | DOCUMENT_EXTS
+MEDIA_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts"}
+ALL_INDEX_EXTS = SUPPORTED_EXTS | DOCUMENT_EXTS | MEDIA_EXTS
 INDEXING_CONTENT_VERSION = "transcript_v6"
 DOCUMENT_CONTENT_VERSION = "document_v1"
 HOST_MOUNT_ROOT = Path(os.getenv("HOST_MOUNT_ROOT", "/host"))
@@ -1068,7 +1069,103 @@ def _parse_document_and_chunk(read_path: str, display_path: str) -> tuple[list[T
     return chunks, None
 
 
+def _is_media_file(path: str) -> bool:
+    return Path(path).suffix.lower() in MEDIA_EXTS
+
+
+def _transcribe_and_chunk(read_path: str, display_path: str) -> tuple[list[TranscriptChunk], str | None]:
+    """Transcribe an audio/video file and chunk the result.
+
+    Uses the transcription service to generate a transcript, then
+    converts segments into VTT-style cues for the chunking pipeline.
+    Falls back to the media pipeline if transcription is unavailable.
+    """
+    try:
+        import transcription_service
+        if not transcription_service.is_available():
+            return [], "Transcription service not available"
+
+        with open(read_path, "rb") as f:
+            data = f.read()
+
+        transcription, meta, segments = transcription_service.transcribe_audio_bytes(
+            data,
+            content_type="",
+            filename=Path(read_path).name,
+        )
+
+        if not transcription or not segments:
+            return [], "Transcription produced no output"
+
+        # Convert whisper segments to Cue objects for the chunking pipeline
+        from transcripts.parsers import Cue
+        cues = []
+        for seg in segments:
+            text = getattr(seg, "text", "").strip()
+            start_s = getattr(seg, "start", 0.0)
+            end_s = getattr(seg, "end", 0.0)
+            if not text or end_s <= start_s:
+                continue
+            cues.append(Cue(
+                start_ms=int(start_s * 1000),
+                end_ms=int(end_s * 1000),
+                text=text,
+            ))
+
+        if not cues:
+            return [], "No valid transcript segments"
+
+        # Also save a .vtt file alongside the media file for future reference
+        _save_vtt_sidecar(read_path, cues, meta)
+
+        chunks = build_time_window_chunks(
+            cues,
+            path=display_path,
+            source_id=_source_id_for_path(display_path),
+            source_type="transcript",
+            doc_type="media_transcript",
+            topic_label=None,
+            language=meta.get("lang"),
+            durations_s=(60, 3600),
+            strides_s=(30, 1800),
+            min_words_level1=4,
+            min_words_level2=8,
+        )
+        if not chunks:
+            return [], "No chunks generated from transcription"
+        return chunks, None
+
+    except ImportError:
+        return [], "transcription_service not installed"
+    except Exception as exc:
+        return [], f"Transcription failed: {exc}"
+
+
+def _save_vtt_sidecar(media_path: str, cues, meta: dict):
+    """Save a .vtt file next to the media file for re-indexing without re-transcription."""
+    try:
+        vtt_path = Path(media_path).with_suffix(".vtt")
+        if vtt_path.exists():
+            return  # Don't overwrite existing transcript
+        lines = ["WEBVTT", "", f"NOTE", f"Source: {media_path}", f"Language: {meta.get('lang', 'en')}", ""]
+        for cue in cues:
+            start_s = cue.start_ms / 1000.0
+            end_s = cue.end_ms / 1000.0
+            start = f"{int(start_s // 3600):02}:{int((start_s % 3600) // 60):02}:{int(start_s % 60):02}.{int((start_s % 1) * 1000):03}"
+            end = f"{int(end_s // 3600):02}:{int((end_s % 3600) // 60):02}:{int(end_s % 60):02}.{int((end_s % 1) * 1000):03}"
+            lines.extend([f"{start} --> {end}", cue.text, ""])
+        vtt_path.write_text("\n".join(lines), encoding="utf-8")
+    except Exception:
+        pass  # Sidecar is best-effort
+
+
 def _parse_file_job(read_path: str, display_path: str) -> tuple[list[TranscriptChunk], str | None]:
+    if _is_media_file(read_path):
+        # Check for existing .vtt sidecar first (avoids re-transcribing)
+        vtt_path = Path(read_path).with_suffix(".vtt")
+        if vtt_path.exists():
+            return _parse_and_chunk(str(vtt_path), display_path)
+        return _transcribe_and_chunk(read_path, display_path)
     if _treat_as_document(read_path):
         return _parse_document_and_chunk(read_path, display_path)
     return _parse_and_chunk(read_path, display_path)
