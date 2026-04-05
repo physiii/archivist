@@ -13,6 +13,14 @@ from media.models import AtomicEvent, EventType, LocalRecap
 
 logger = logging.getLogger("archivist.media.recaps")
 
+
+def _clip_text(text: str, limit: int = 220) -> str:
+    clean = " ".join((text or "").split()).strip()
+    if len(clean) <= limit:
+        return clean
+    clipped = clean[:limit].rsplit(" ", 1)[0].strip()
+    return f"{clipped}..."
+
 # ── Prompts for LLM-based recap generation ──────────────────────────────
 
 RECAP_SYSTEM_PROMPT = """You are a precise evidence analyst creating step-by-step accounts from timestamped events.
@@ -199,11 +207,30 @@ def build_recap_from_events(
 
     # Build mechanical recap if no LLM text provided
     if not recap_text:
-        lines = []
+        event_type_counts: dict[str, int] = {}
         for evt in events:
+            key = evt.event_type.value if hasattr(evt.event_type, "value") else str(evt.event_type)
+            event_type_counts[key] = event_type_counts.get(key, 0) + 1
+
+        dominant_types = ", ".join(
+            f"{kind} x{count}"
+            for kind, count in sorted(event_type_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+        )
+        summary_bits = [f"{len(events)} events"]
+        if dominant_types:
+            summary_bits.append(dominant_types)
+        if all_entities:
+            summary_bits.append(f"entities: {', '.join(sorted(all_entities)[:6])}")
+
+        lines = [f"Summary: {' | '.join(summary_bits)}", "", "Timeline:"]
+        preview_limit = 8
+        for evt in events[:preview_limit]:
             timestamp = f"[{evt.time_start:.1f}s]"
             speakers = f" {', '.join(evt.speakers)}:" if evt.speakers else ""
-            lines.append(f"{timestamp}{speakers} {evt.text_evidence}")
+            type_label = evt.event_type.value if hasattr(evt.event_type, "value") else str(evt.event_type)
+            lines.append(f"{timestamp}{speakers} [{type_label}] {_clip_text(evt.text_evidence)}")
+        if len(events) > preview_limit:
+            lines.append(f"... {len(events) - preview_limit} additional events in this window.")
         recap_text = "\n".join(lines)
 
     # Detect questions in events

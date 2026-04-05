@@ -1,5 +1,7 @@
 """Tests for the hierarchical media processing pipeline."""
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -121,6 +123,72 @@ class TestEvidenceStore:
         keyframes = evidence_store.get_artifacts("test", kind="keyframe")
         assert len(keyframes) == 1
 
+    def test_register_asset_reuses_media_id_for_same_path(self, tmp_path, monkeypatch):
+        from media import evidence_store
+        monkeypatch.setattr(evidence_store, "MEDIA_STORE_DIR", tmp_path / "store")
+        monkeypatch.setattr(evidence_store, "ASSETS_INDEX", tmp_path / "store" / "assets.json")
+
+        test_file = tmp_path / "test.mp3"
+        test_file.write_bytes(b"\x00" * 1024)
+        monkeypatch.setattr(evidence_store, "_probe_media", lambda p: {"duration_s": 10.0, "file_size_bytes": 1024})
+
+        first = evidence_store.register_asset(str(test_file))
+        second = evidence_store.register_asset(str(test_file))
+        assert first.media_id == second.media_id
+        assert len(evidence_store.list_assets()) == 1
+
+    def test_get_artifacts_from_pipeline_result(self, tmp_path, monkeypatch):
+        from media import evidence_store
+        monkeypatch.setattr(evidence_store, "PIPELINE_RESULTS_DIR", tmp_path / "pipeline")
+        monkeypatch.setattr(evidence_store, "ARTIFACTS_DIR", tmp_path / "artifacts")
+        evidence_store.PIPELINE_RESULTS_DIR.mkdir(parents=True)
+
+        (evidence_store.PIPELINE_RESULTS_DIR / "abc123.json").write_text(
+            '{"artifacts":[{"artifact_id":"a1","media_id":"abc123","kind":"transcript","start_s":0,"end_s":1,"content":"hello","confidence":1.0,"metadata":{},"source_refs":[]}]}',
+            encoding="utf-8",
+        )
+
+        artifacts = evidence_store.get_artifacts("abc123")
+        assert len(artifacts) == 1
+        assert artifacts[0].kind == "transcript"
+        assert artifacts[0].content == "hello"
+
+    def test_load_assets_index_deduplicates_by_path_and_prefers_pipeline_result(self, tmp_path, monkeypatch):
+        from media import evidence_store
+
+        store_dir = tmp_path / "store"
+        monkeypatch.setattr(evidence_store, "MEDIA_STORE_DIR", store_dir)
+        monkeypatch.setattr(evidence_store, "ASSETS_INDEX", store_dir / "assets.json")
+        monkeypatch.setattr(evidence_store, "PIPELINE_RESULTS_DIR", tmp_path / "pipeline")
+        monkeypatch.setattr(evidence_store, "ARTIFACTS_DIR", tmp_path / "artifacts")
+        evidence_store.PIPELINE_RESULTS_DIR.mkdir(parents=True)
+        store_dir.mkdir(parents=True)
+
+        path = str((tmp_path / "clip.mkv").resolve())
+        payload = {
+            "newer_with_pipeline": {
+                "media_id": "newer_with_pipeline",
+                "path": path,
+                "filename": "clip.mkv",
+                "modality": "video",
+                "file_hash": "hash123",
+                "indexed_at": 20,
+            },
+            "older_duplicate": {
+                "media_id": "older_duplicate",
+                "path": path,
+                "filename": "clip.mkv",
+                "modality": "video",
+                "file_hash": "hash123",
+                "indexed_at": 10,
+            },
+        }
+        evidence_store.ASSETS_INDEX.write_text(json.dumps(payload), encoding="utf-8")
+        (evidence_store.PIPELINE_RESULTS_DIR / "newer_with_pipeline.json").write_text("{}", encoding="utf-8")
+
+        index = evidence_store._load_assets_index()
+        assert list(index) == ["newer_with_pipeline"]
+
 
 # ── L1: Filtering ───────────────────────────────────────────────────────
 
@@ -216,6 +284,36 @@ class TestEventExtraction:
         from media.event_extraction import extract_events_from_speech
         events = extract_events_from_speech([])
         assert events == []
+
+    def test_extract_events_from_speech_caps_group_size(self):
+        from media.event_extraction import extract_events_from_speech
+        from media.models import SpeechSegment
+
+        segments = [
+            SpeechSegment(
+                start_s=float(i * 4),
+                end_s=float(i * 4 + 3),
+                text=f"Segment {i} with enough words to count as meaningful content.",
+            )
+            for i in range(30)
+        ]
+
+        events = extract_events_from_speech(segments, media_id="test", merge_window_s=5.0)
+        assert len(events) >= 2
+        assert max((evt.time_end - evt.time_start) for evt in events) <= 95
+
+    def test_extract_entities_filters_common_sentence_starters(self):
+        from media.event_extraction import _extract_entities
+
+        entities = _extract_entities(
+            "Because Andy met Brianna, Yeah, Evan joined later and James asked a question."
+        )
+        assert "Andy" in entities
+        assert "Brianna" in entities
+        assert "Evan" in entities
+        assert "James" in entities
+        assert "Because" not in entities
+        assert "Yeah" not in entities
 
     def test_merge_events_chronological(self):
         from media.event_extraction import merge_events
@@ -353,6 +451,32 @@ class TestMemory:
         assert "contextual memory" in sys_prompt.lower()
         assert "Test recap" in user_prompt
 
+    def test_build_memory_filters_noisy_entities(self):
+        from media.memory import build_memory_from_recaps
+        from media.models import LocalRecap
+
+        recaps = [
+            LocalRecap(
+                time_start=0,
+                time_end=60,
+                recap_text="Recap one",
+                salient_entities=["Andy", "They", "Brianna", "Yep"],
+            ),
+            LocalRecap(
+                time_start=60,
+                time_end=120,
+                recap_text="Recap two",
+                salient_entities=["Andy", "Brianna", "Whereas", "Yep"],
+            ),
+        ]
+
+        memory = build_memory_from_recaps(recaps, media_id="test123")
+        assert "Andy" in memory.main_actors
+        assert "Brianna" in memory.main_actors
+        assert "They" not in memory.main_actors
+        assert "Yep" not in memory.main_actors
+        assert "Whereas" not in memory.inferred_themes
+
 
 # ── L5: Composer ────────────────────────────────────────────────────────
 
@@ -370,6 +494,19 @@ class TestComposer:
 
         fmt = select_output_format(memory, events)
         from media.models import OutputFormat
+        assert fmt == OutputFormat.MEETING_MINUTES
+
+    def test_select_output_format_meeting_from_memory_participants(self):
+        from media.composer import select_output_format
+        from media.models import AtomicEvent, ContextualMemory, EventType, OutputFormat
+
+        events = [
+            AtomicEvent(time_start=0, time_end=5, event_type=EventType.DECISION, text_evidence="We decided to ship."),
+            AtomicEvent(time_start=5, time_end=10, event_type=EventType.QUESTION, text_evidence="When should we launch?"),
+        ]
+        memory = ContextualMemory(main_actors=["Andy", "Brianna", "Dan"])
+
+        fmt = select_output_format(memory, events)
         assert fmt == OutputFormat.MEETING_MINUTES
 
     def test_select_output_format_brief(self):
@@ -428,6 +565,366 @@ class TestPipeline:
         monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", tmp_path)
         result = pipeline.get_pipeline_result("nonexistent")
         assert result is None
+
+    def test_write_transcript_sidecar(self, tmp_path):
+        from media.pipeline import _write_transcript_sidecar
+        from media.models import MediaAsset
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        payload = {
+            "meta": {"lang": "en"},
+            "segments": [{"start": 0.0, "end": 1.25, "text": "Hello world"}],
+        }
+
+        vtt_path = _write_transcript_sidecar(asset, payload)
+        assert vtt_path is not None
+        assert vtt_path.exists()
+        content = vtt_path.read_text(encoding="utf-8")
+        assert "WEBVTT" in content
+        assert "Hello world" in content
+
+    def test_write_pipeline_sidecar(self, tmp_path):
+        from media.pipeline import _write_pipeline_sidecar
+        from media.models import MediaAsset
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        result = {"media_id": "abc123", "artifacts": [{"kind": "transcript"}]}
+
+        sidecar_path = _write_pipeline_sidecar(asset, result)
+        assert sidecar_path == media_path.with_suffix(".json")
+        assert sidecar_path.exists()
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert payload["media_id"] == "abc123"
+
+    def test_generate_subject_line_falls_back_without_gateway(self, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, DerivedArtifact, MediaAsset, Modality, OutputFormat
+
+        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "")
+
+        asset = MediaAsset(
+            media_id="abc123",
+            filename="clip.mkv",
+            modality=Modality.VIDEO,
+            duration_s=90.0,
+        )
+        memory = ContextualMemory(
+            main_actors=["Andy", "Brianna"],
+            inferred_themes=["launch planning"],
+        )
+        document = ComposedDocument(format=OutputFormat.MEETING_MINUTES, title="Meeting Minutes - abc123")
+        artifacts = [
+            DerivedArtifact(
+                artifact_id="evt1",
+                media_id="abc123",
+                kind="event",
+                content="We decided to move the launch to Friday.",
+                metadata={"event_type": "decision", "entities": ["Friday"]},
+            ),
+        ]
+
+        subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
+        assert subject_line == "Andy and Brianna work through decisions around launch planning."
+        assert details["generator"] == "heuristic"
+        assert details["reason"] == "gateway_unconfigured"
+
+    def test_generate_subject_line_uses_gateway_when_configured(self, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, DerivedArtifact, MediaAsset, Modality, OutputFormat
+
+        asset = MediaAsset(
+            media_id="abc123",
+            filename="clip.mkv",
+            modality=Modality.VIDEO,
+            duration_s=90.0,
+        )
+        memory = ContextualMemory(main_actors=["Andy"], inferred_themes=["launch planning"])
+        document = ComposedDocument(format=OutputFormat.EXECUTIVE_BRIEF, title="Executive Brief - abc123")
+        artifacts = [
+            DerivedArtifact(
+                artifact_id="doc1",
+                media_id="abc123",
+                kind="document",
+                content="Andy reviews launch planning and timelines with the team.",
+            ),
+        ]
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "\"Andy reviews launch planning and timelines with the team.\"\nSecond sentence."
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeRequests:
+            @staticmethod
+            def post(url, json=None, headers=None, timeout=None):
+                assert url == "http://gateway/v1/chat/completions"
+                assert json["model"] == "test-model"
+                return _FakeResponse()
+
+        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "token")
+        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_URL", "http://gateway")
+        monkeypatch.setattr(pipeline, "OPENCLAW_CHAT_MODEL", "test-model")
+        monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
+
+        subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
+        assert subject_line == "Andy reviews launch planning and timelines with the team."
+        assert details["generator"] == "openclaw"
+        assert details["model"] == "test-model"
+
+    def test_generate_subject_line_filters_noisy_participants(self, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, DerivedArtifact, MediaAsset, Modality, OutputFormat
+
+        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "")
+
+        asset = MediaAsset(
+            media_id="abc123",
+            filename="clip.mkv",
+            modality=Modality.VIDEO,
+            duration_s=90.0,
+        )
+        memory = ContextualMemory(main_actors=["Evan", "Andy", "They", "Yep", "Brianna"])
+        document = ComposedDocument(format=OutputFormat.MEETING_MINUTES, title="Meeting Minutes - abc123")
+        artifacts = [
+            DerivedArtifact(
+                artifact_id="evt1",
+                media_id="abc123",
+                kind="event",
+                content="We decided to move the launch to Friday.",
+                metadata={"event_type": "decision", "entities": ["Are", "California"]},
+            ),
+        ]
+
+        subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
+        assert subject_line == "Evan, Andy, and Brianna work through decisions in a recorded meeting."
+        assert details["generator"] == "heuristic"
+
+    def test_inject_metadata_into_mkv_embeds_transcript_and_bundle(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, MediaAsset, Modality, OutputFormat
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"source")
+        bundle_path = tmp_path / "bundle.json"
+        bundle_path.write_text("{}", encoding="utf-8")
+
+        commands = []
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            commands.append(cmd)
+            if cmd[0] == "ffprobe":
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"streams":[]}', stderr="")
+            if cmd[0] == "ffmpeg":
+                tmp_output = tmp_path / "clip.archivist_tmp.mkv"
+                tmp_output.write_bytes(b"remuxed")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name, modality=Modality.VIDEO)
+        memory = ContextualMemory(main_actors=["Alice"], inferred_themes=["Demo"])
+        document = ComposedDocument(format=OutputFormat.CHRONOLOGICAL, title="Chronological - test")
+        payload = {"meta": {"lang": "en"}, "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}]}
+
+        info = pipeline._inject_metadata_into_file(
+            asset,
+            memory,
+            document,
+            transcript_payload=payload,
+            result_path=bundle_path,
+        )
+
+        ffmpeg_cmd = next(cmd for cmd in commands if cmd[0] == "ffmpeg")
+        assert info["status"] == "embedded"
+        assert info["transcript_stream_embedded"] is True
+        assert info["artifact_bundle_attached"] is True
+        assert "-attach" in ffmpeg_cmd
+        assert str(bundle_path) in ffmpeg_cmd
+        assert str(media_path.with_suffix(".vtt")) in ffmpeg_cmd
+
+    def test_inject_metadata_prefers_subject_line_for_title(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, MediaAsset, Modality, OutputFormat
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"source")
+        bundle_path = tmp_path / "bundle.json"
+        bundle_path.write_text("{}", encoding="utf-8")
+
+        commands = []
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            commands.append(cmd)
+            if cmd[0] == "ffprobe":
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"streams":[]}', stderr="")
+            if cmd[0] == "ffmpeg":
+                tmp_output = tmp_path / "clip.archivist_tmp.mkv"
+                tmp_output.write_bytes(b"remuxed")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name, modality=Modality.VIDEO)
+        memory = ContextualMemory(main_actors=["Andy", "Brianna"])
+        document = ComposedDocument(format=OutputFormat.MEETING_MINUTES, title="Meeting Minutes - test")
+        payload = {"meta": {"lang": "en"}, "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}]}
+
+        pipeline._inject_metadata_into_file(
+            asset,
+            memory,
+            document,
+            transcript_payload=payload,
+            result_path=bundle_path,
+            subject_line="Andy and Brianna review launch planning and next steps.",
+        )
+
+        ffmpeg_cmd = next(cmd for cmd in commands if cmd[0] == "ffmpeg")
+        assert "title=Andy and Brianna review launch planning and next steps." in ffmpeg_cmd
+        assert "description=Meeting Minutes - test" in ffmpeg_cmd
+
+    def test_inject_metadata_reuses_existing_transcript_sidecar(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, MediaAsset, Modality, OutputFormat
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"source")
+        vtt_path = media_path.with_suffix(".vtt")
+        vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n", encoding="utf-8")
+        bundle_path = tmp_path / "bundle.json"
+        bundle_path.write_text("{}", encoding="utf-8")
+
+        commands = []
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            commands.append(cmd)
+            if cmd[0] == "ffprobe":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "streams": [
+                                {"index": 4, "codec_type": "subtitle", "tags": {"title": "Archivist Transcript"}},
+                            ]
+                        }
+                    ),
+                    stderr="",
+                )
+            if cmd[0] == "ffmpeg":
+                tmp_output = tmp_path / "clip.archivist_tmp.mkv"
+                tmp_output.write_bytes(b"remuxed")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name, modality=Modality.VIDEO)
+        memory = ContextualMemory(main_actors=["Andy", "They", "Brianna", "Yep"])
+        document = ComposedDocument(format=OutputFormat.MEETING_MINUTES, title="Meeting Minutes - test")
+
+        info = pipeline._inject_metadata_into_file(
+            asset,
+            memory,
+            document,
+            transcript_payload=None,
+            result_path=bundle_path,
+            subject_line="Andy and Brianna discuss the launch plan.",
+        )
+
+        ffmpeg_cmd = next(cmd for cmd in commands if cmd[0] == "ffmpeg")
+        assert info["status"] == "embedded"
+        assert info["transcript_sidecar_path"] == str(vtt_path)
+        assert info["transcript_stream_embedded"] is True
+        assert str(vtt_path) in ffmpeg_cmd
+        assert any("artist=Andy, Brianna" == item for item in ffmpeg_cmd)
+        assert any("Participants: Andy, Brianna" in item for item in ffmpeg_cmd)
+
+    def test_inject_metadata_replaces_existing_archivist_streams(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, MediaAsset, Modality, OutputFormat
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"source")
+        bundle_path = tmp_path / "bundle.json"
+        bundle_path.write_text("{}", encoding="utf-8")
+
+        commands = []
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            commands.append(cmd)
+            if cmd[0] == "ffprobe":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "streams": [
+                                {"index": 4, "codec_type": "subtitle", "tags": {"title": "Archivist Transcript"}},
+                                {"index": 5, "codec_type": "attachment", "tags": {"filename": "archivist_media_pipeline.json"}},
+                            ]
+                        }
+                    ),
+                    stderr="",
+                )
+            if cmd[0] == "ffmpeg":
+                tmp_output = tmp_path / "clip.archivist_tmp.mkv"
+                tmp_output.write_bytes(b"remuxed")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name, modality=Modality.VIDEO)
+        memory = ContextualMemory(main_actors=["Andy", "Brianna"])
+        document = ComposedDocument(format=OutputFormat.MEETING_MINUTES, title="Meeting Minutes - test")
+        payload = {"meta": {"lang": "en"}, "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}]}
+
+        info = pipeline._inject_metadata_into_file(
+            asset,
+            memory,
+            document,
+            transcript_payload=payload,
+            result_path=bundle_path,
+        )
+
+        ffmpeg_cmd = next(cmd for cmd in commands if cmd[0] == "ffmpeg")
+        assert info["status"] == "embedded"
+        assert "-0:4" in ffmpeg_cmd
+        assert "-0:5" in ffmpeg_cmd
+
+    def test_asset_record_complete_requires_pipeline_result(self, tmp_path, monkeypatch):
+        from media import pipeline
+
+        monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", tmp_path / "pipeline")
+        pipeline.PIPELINE_STORE_DIR.mkdir(parents=True)
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+
+        asset_data = {"media_id": "abc123", "path": str(media_path)}
+        assert pipeline._asset_record_complete(asset_data) is False
+
+        (pipeline.PIPELINE_STORE_DIR / "abc123.json").write_text("{}", encoding="utf-8")
+        assert pipeline._asset_record_complete(asset_data) is True
 
 
 # ── Transcript Parsers ──────────────────────────────────────────────────

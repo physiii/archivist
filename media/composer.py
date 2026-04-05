@@ -133,13 +133,14 @@ def select_output_format(memory: ContextualMemory, events: list[AtomicEvent]) ->
     has_multiple_speakers = len(set(
         speaker for e in events for speaker in e.speakers
     )) > 1
+    has_multiple_participants = has_multiple_speakers or len(memory.main_actors) > 1
 
     has_risk = bool(memory.risk_safety_issues)
     has_visual = any(e.visual_entities for e in events)
     duration = events[-1].time_end - events[0].time_start if events else 0
 
     # Meeting: multiple speakers + decisions/questions
-    if has_multiple_speakers and (has_decisions or has_questions):
+    if has_multiple_participants and (has_decisions or has_questions):
         return OutputFormat.MEETING_MINUTES
 
     # Incident: risk/safety issues present
@@ -151,7 +152,7 @@ def select_output_format(memory: ContextualMemory, events: list[AtomicEvent]) ->
         return OutputFormat.EXECUTIVE_BRIEF
 
     # Hybrid: visual + audio content
-    if has_visual and has_multiple_speakers:
+    if has_visual and has_multiple_participants:
         return OutputFormat.HYBRID
 
     # Default: chronological

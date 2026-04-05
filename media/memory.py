@@ -14,6 +14,12 @@ from media.models import ContextualMemory, LocalRecap
 
 logger = logging.getLogger("archivist.media.memory")
 
+MEMORY_ENTITY_STOP_TERMS = {
+    "additional", "are", "awesome", "blah", "everybody", "fuck", "god", "never",
+    "no", "none", "nope", "obviously", "okay", "so", "they", "versus", "wait",
+    "whereas", "yep", "yes",
+}
+
 # ── Prompts for LLM-based memory construction ───────────────────────────
 
 MEMORY_SYSTEM_PROMPT = """You are building a compressed contextual memory from a series of local recaps of media content.
@@ -85,6 +91,20 @@ def _format_recaps_for_prompt(recaps: list[LocalRecap]) -> str:
     return "\n".join(parts).strip()
 
 
+def _normalize_memory_entity(entity: str) -> str:
+    candidate = " ".join(str(entity or "").split()).strip(" ,.;:-")
+    if len(candidate) <= 2:
+        return ""
+    words = [word.strip(" ,.;:-").lower() for word in candidate.split() if word.strip(" ,.;:-")]
+    if not words:
+        return ""
+    if len(words) == 1 and words[0] in MEMORY_ENTITY_STOP_TERMS:
+        return ""
+    if all(word in MEMORY_ENTITY_STOP_TERMS for word in words):
+        return ""
+    return candidate
+
+
 def build_memory_from_recaps(
     recaps: list[LocalRecap],
     media_id: str = "",
@@ -104,7 +124,9 @@ def build_memory_from_recaps(
 
     for recap in recaps:
         for entity in recap.salient_entities:
-            entity_counts[entity] += 1
+            normalized = _normalize_memory_entity(entity)
+            if normalized:
+                entity_counts[normalized] += 1
         all_questions.extend(recap.unresolved_questions)
         all_causal.extend(recap.causal_links)
 

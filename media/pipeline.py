@@ -19,9 +19,8 @@ from typing import Optional
 
 from media.evidence_store import (
     ALL_MEDIA_EXTS,
-    get_artifacts,
     register_asset,
-    save_artifact,
+    _load_assets_index,
 )
 from media.event_extraction import (
     extract_events_from_scenes,
@@ -29,8 +28,6 @@ from media.event_extraction import (
     merge_events,
 )
 from media.filtering import (
-    detect_scene_changes,
-    detect_speech_segments,
     filter_asset,
 )
 from media.memory import build_memory_from_recaps, build_memory_prompt
@@ -51,6 +48,17 @@ logger = logging.getLogger("archivist.media.pipeline")
 
 PIPELINE_STORE_DIR = Path(os.getenv("MEDIA_PIPELINE_DIR", "/data/media_pipeline"))
 WATCH_INTERVAL_S = int(os.getenv("MEDIA_WATCH_INTERVAL_S", "30"))
+OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789").rstrip("/")
+OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
+OPENCLAW_CHAT_MODEL = os.getenv("OPENCLAW_CHAT_MODEL", "openclaw/default").strip()
+SUBJECT_MAX_WORDS = max(8, int(os.getenv("MEDIA_SUBJECT_MAX_WORDS", "24")))
+SUBJECT_MAX_CONTEXT_ARTIFACTS = max(6, int(os.getenv("MEDIA_SUBJECT_MAX_CONTEXT_ARTIFACTS", "12")))
+SUBJECT_MAX_PREVIEW_CHARS = max(80, int(os.getenv("MEDIA_SUBJECT_MAX_PREVIEW_CHARS", "220")))
+SUBJECT_STOP_TERMS = {
+    "additional", "are", "awesome", "blah", "everybody", "fuck", "god", "never",
+    "no", "none", "nope", "obviously", "okay", "so", "they", "versus", "wait",
+    "whereas", "yep", "yes",
+}
 
 # ── Active job tracking ─────────────────────────────────────────────────
 
@@ -87,6 +95,284 @@ def _update_job(job: PipelineJob, **kwargs):
         setattr(job, key, value)
 
 
+def _pipeline_sidecar_path(asset_path: str | Path) -> Path:
+    return Path(asset_path).with_suffix(".json")
+
+
+def _write_pipeline_sidecar(asset: MediaAsset, result: dict) -> Optional[Path]:
+    sidecar_path = _pipeline_sidecar_path(asset.path)
+    try:
+        serializable = json.loads(json.dumps(result, default=str))
+        sidecar_path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+        return sidecar_path
+    except OSError as exc:
+        logger.warning("Failed to write pipeline sidecar for %s: %s", asset.filename, exc)
+        return None
+
+
+def _media_output_complete(media_id: str) -> bool:
+    return bool(media_id) and (PIPELINE_STORE_DIR / f"{media_id}.json").exists()
+
+
+def _asset_record_complete(asset_data: dict) -> bool:
+    path = str(asset_data.get("path") or "")
+    media_id = str(asset_data.get("media_id") or "")
+    return bool(path) and Path(path).exists() and _media_output_complete(media_id)
+
+
+def _clip_subject_text(text: str, limit: int = SUBJECT_MAX_PREVIEW_CHARS) -> str:
+    clean = " ".join(str(text or "").split()).strip()
+    if len(clean) <= limit:
+        return clean
+    clipped = clean[:limit].rsplit(" ", 1)[0].strip()
+    return f"{clipped}..."
+
+
+def _subject_artifact_priority(kind: str) -> int:
+    priority = {
+        "document": 0,
+        "memory": 1,
+        "recap": 2,
+        "event": 3,
+        "transcript": 4,
+        "scene": 5,
+        "speech_segment": 6,
+        "keyframe": 7,
+    }
+    return priority.get(kind, 99)
+
+
+def _join_subject_terms(values: list[str], limit: int = 3) -> str:
+    cleaned = _clean_subject_terms(values, limit=limit)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
+def _clean_subject_terms(values: list[str], limit: Optional[int] = None) -> list[str]:
+    cleaned: list[str] = []
+    for value in values:
+        term = _clip_subject_text(value, limit=80).strip(" ,.;:-")
+        if not term or term.lower() in SUBJECT_STOP_TERMS:
+            continue
+        if term not in cleaned:
+            cleaned.append(term)
+        if limit is not None and len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def _infer_subject_activity(artifacts: list[DerivedArtifact], document: Optional[ComposedDocument]) -> str:
+    event_type_counts: dict[str, int] = {}
+    for artifact in artifacts:
+        if artifact.kind != "event":
+            continue
+        label = str(artifact.metadata.get("event_type") or "").strip().lower()
+        if label:
+            event_type_counts[label] = event_type_counts.get(label, 0) + 1
+
+    if event_type_counts.get("decision") and event_type_counts.get("question"):
+        return "discuss decisions and open questions"
+    if event_type_counts.get("decision"):
+        return "work through decisions"
+    if event_type_counts.get("question"):
+        return "work through open questions"
+    if event_type_counts.get("action"):
+        return "review ongoing actions"
+    if document and document.format == OutputFormat.MEETING_MINUTES:
+        return "discuss the main topics"
+    if document and document.format == OutputFormat.INCIDENT_REPORT:
+        return "document an incident"
+    if document and document.format == OutputFormat.EXECUTIVE_BRIEF:
+        return "capture the main points"
+    return "capture the main activity"
+
+
+def _build_subject_line_fallback(
+    asset: MediaAsset,
+    artifacts: list[DerivedArtifact],
+    memory: ContextualMemory,
+    document: Optional[ComposedDocument],
+) -> str:
+    participants = _join_subject_terms(memory.main_actors, limit=3)
+    themes = _join_subject_terms(memory.inferred_themes, limit=2)
+
+    entities: list[str] = []
+    for artifact in artifacts:
+        if artifact.kind == "event":
+            source_entities = artifact.metadata.get("entities", []) or []
+        elif artifact.kind == "recap":
+            source_entities = artifact.metadata.get("salient_entities", []) or []
+        else:
+            source_entities = []
+        for entity in source_entities:
+            entity_text = str(entity or "").strip()
+            if entity_text and entity_text not in entities:
+                entities.append(entity_text)
+        if len(entities) >= 3:
+            break
+    entity_text = _join_subject_terms(entities, limit=2)
+
+    activity = _infer_subject_activity(artifacts, document)
+    format_phrase = "recorded file"
+    if document and document.format == OutputFormat.MEETING_MINUTES:
+        format_phrase = "recorded meeting"
+    elif document and document.format == OutputFormat.INCIDENT_REPORT:
+        format_phrase = "recorded incident review"
+    elif document and document.format == OutputFormat.EXECUTIVE_BRIEF:
+        format_phrase = "recorded briefing"
+
+    if participants and themes:
+        return f"{participants} {activity} around {themes}."
+    if participants:
+        return f"{participants} {activity} in a {format_phrase}."
+    if themes:
+        return f"This {asset.modality.value} file {activity} around {themes}."
+    if entity_text:
+        return f"This {asset.modality.value} file {activity} involving {entity_text}."
+    if document and document.title:
+        title_text = _clip_subject_text(document.title, limit=100).strip(" .")
+        return f"This {asset.modality.value} file documents {title_text.lower()}."
+    return f"This {asset.modality.value} file {activity}."
+
+
+def _normalize_subject_line(text: str, fallback: str) -> str:
+    clean = str(text or "").strip()
+    clean = clean.replace("\r", " ")
+    clean = clean.splitlines()[0].strip() if clean else ""
+    clean = clean.removeprefix("Subject:").removeprefix("subject:").strip()
+    clean = clean.strip("`\"' ")
+    if not clean:
+        clean = fallback
+    clean = " ".join(clean.split()).strip()
+
+    split = clean.replace("!", ".").replace("?", ".")
+    first_sentence = split.split(".", 1)[0].strip()
+    clean = first_sentence or clean
+
+    words = clean.split()
+    if len(words) > SUBJECT_MAX_WORDS:
+        clean = " ".join(words[:SUBJECT_MAX_WORDS]).rstrip(" ,;:-")
+
+    if clean and clean[-1] not in ".!?":
+        clean = f"{clean}."
+    return clean or fallback
+
+
+def build_subject_line_prompt(
+    asset: MediaAsset,
+    artifacts: list[DerivedArtifact],
+    memory: ContextualMemory,
+    document: Optional[ComposedDocument],
+) -> tuple[str, str, list[str]]:
+    kind_counts: dict[str, int] = {}
+    for artifact in artifacts:
+        kind_counts[artifact.kind] = kind_counts.get(artifact.kind, 0) + 1
+
+    selected = sorted(
+        artifacts,
+        key=lambda artifact: (_subject_artifact_priority(artifact.kind), artifact.start_s, artifact.end_s),
+    )[:SUBJECT_MAX_CONTEXT_ARTIFACTS]
+
+    context_lines = []
+    source_refs: list[str] = []
+    for artifact in selected:
+        preview = _clip_subject_text(artifact.content)
+        if artifact.kind == "event":
+            event_type = str(artifact.metadata.get("event_type") or "event")
+            preview = f"{event_type}: {preview}"
+        elif artifact.kind == "recap":
+            preview = f"window {artifact.start_s:.0f}-{artifact.end_s:.0f}s: {preview}"
+        elif artifact.kind == "memory":
+            preview = (
+                f"actors={', '.join(memory.main_actors[:5]) or 'none'}; "
+                f"themes={', '.join(memory.inferred_themes[:5]) or 'none'}"
+            )
+        elif artifact.kind == "document":
+            preview = _clip_subject_text(document.full_text if document else artifact.content)
+        context_lines.append(f"- [{artifact.kind}] {preview}")
+        source_refs.append(artifact.artifact_id)
+
+    summary_lines = [
+        f"Filename: {asset.filename}",
+        f"Modality: {asset.modality.value}",
+        f"Duration seconds: {asset.duration_s:.1f}",
+        f"Document format: {document.format.value if document and hasattr(document.format, 'value') else ''}",
+        f"Document title: {document.title if document else ''}",
+        f"Main actors: {', '.join(memory.main_actors[:6]) or 'none'}",
+        f"Themes: {', '.join(memory.inferred_themes[:6]) or 'none'}",
+        f"Open loops: {len(memory.open_loops)}",
+        "Artifact counts: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kind_counts.items())),
+        "Representative artifacts:",
+        *(context_lines or ["- [none] no artifact context available"]),
+        "",
+        f"Write one factual sentence only, under {SUBJECT_MAX_WORDS} words, describing what this file is about.",
+    ]
+    system_prompt = (
+        "You create concise archival subject lines for processed media files. "
+        "Return exactly one sentence with no markdown, no quotes, no file IDs, and no speaker labels."
+    )
+    return system_prompt, "\n".join(summary_lines), source_refs
+
+
+def _generate_subject_line(
+    asset: MediaAsset,
+    artifacts: list[DerivedArtifact],
+    memory: ContextualMemory,
+    document: Optional[ComposedDocument],
+) -> tuple[str, dict]:
+    fallback = _build_subject_line_fallback(asset, artifacts, memory, document)
+    system_prompt, user_prompt, source_refs = build_subject_line_prompt(asset, artifacts, memory, document)
+    details = {
+        "generator": "heuristic",
+        "model": None,
+        "source_artifact_count": len(artifacts),
+        "context_artifact_refs": source_refs,
+        "error": None,
+    }
+
+    if not OPENCLAW_GATEWAY_TOKEN:
+        return _normalize_subject_line(fallback, fallback), details | {"reason": "gateway_unconfigured"}
+
+    try:
+        import requests
+
+        response = requests.post(
+            f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
+            json={
+                "model": OPENCLAW_CHAT_MODEL,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "user": f"media-subject:{asset.media_id}",
+            },
+            headers={
+                "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+                "Content-Type": "application/json",
+                "x-openclaw-session-key": f"media-subject:{asset.media_id}",
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        subject_line = _normalize_subject_line(content, fallback)
+        return subject_line, details | {"generator": "openclaw", "model": OPENCLAW_CHAT_MODEL}
+    except Exception as exc:
+        logger.warning("Subject line inference failed for %s: %s", asset.filename, exc)
+        return _normalize_subject_line(fallback, fallback), details | {
+            "reason": "gateway_error",
+            "error": str(exc),
+            "model": OPENCLAW_CHAT_MODEL,
+        }
+
+
 # ── Pipeline Execution ──────────────────────────────────────────────────
 
 
@@ -119,6 +405,7 @@ def process_media_file(
         job.media_id = asset.media_id
         result["media_id"] = asset.media_id
         result["asset"] = {
+            "path": asset.path,
             "filename": asset.filename,
             "modality": asset.modality.value,
             "duration_s": asset.duration_s,
@@ -126,9 +413,17 @@ def process_media_file(
         }
 
         # ── Derive transcription for audio/video ────────────────────
+        transcript_payload = None
         transcript_segments = None
         if asset.modality in (Modality.AUDIO, Modality.VIDEO):
-            transcript_segments = _derive_transcript(asset, job)
+            transcript_payload = _derive_transcript(asset, job)
+            transcript_segments = transcript_payload.get("segments") if transcript_payload else None
+        if transcript_payload:
+            result["transcript"] = {
+                "text": transcript_payload.get("text", ""),
+                "meta": transcript_payload.get("meta", {}),
+                "segment_count": len(transcript_segments or []),
+            }
 
         # ── L1: Filter ──────────────────────────────────────────────
         _update_job(job, status="filtering", current_layer="L1_filtering", progress=0.3)
@@ -136,6 +431,7 @@ def process_media_file(
         result["layers"]["L1_filtering"] = {
             "scene_count": len(filter_results.get("scenes", [])),
             "speech_segment_count": len(filter_results.get("speech_segments", [])),
+            "keyframe_count": len(filter_results.get("keyframes", [])),
         }
 
         # ── L2: Extract events ──────────────────────────────────────
@@ -192,6 +488,20 @@ def process_media_file(
             "sections": document.sections,
         }
 
+        # ── Build and persist canonical artifact bundle ────────────
+        artifacts = _build_layer_artifacts(
+            asset,
+            transcript_payload,
+            filter_results,
+            all_events,
+            recaps,
+            memory,
+            document,
+            job,
+        )
+        result["artifacts"] = [_artifact_to_dict(artifact) for artifact in artifacts]
+        result["artifact_count"] = len(result["artifacts"])
+
         # ── L6: Vectorstore projection ─────────────────────────────
         # Insert transcript chunks into Milvus for hybrid search.
         # This makes the transcribed media searchable via the same
@@ -214,11 +524,59 @@ def process_media_file(
         comp_sys, comp_user = build_compose_prompt(memory, recaps, all_events, output_format)
         result["prompts"]["compose"] = {"system": comp_sys, "user": comp_user}
 
+        # ── Final subject line inference ───────────────────────────
+        _update_job(job, status="summarizing", current_layer="L7_subject_line", progress=0.98)
+        subject_sys, subject_user, _ = build_subject_line_prompt(asset, artifacts, memory, document)
+        result["prompts"]["subject_line"] = {"system": subject_sys, "user": subject_user}
+        subject_line, subject_details = _generate_subject_line(asset, artifacts, memory, document)
+        result["subject_line"] = subject_line
+        result["document"]["subject_line"] = subject_line
+        result["layers"]["L7_subject_line"] = {
+            "subject_line": subject_line,
+            **subject_details,
+        }
+        artifacts.append(DerivedArtifact(
+            media_id=asset.media_id,
+            kind="subject_line",
+            start_s=0.0,
+            end_s=asset.duration_s,
+            content=subject_line,
+            confidence=1.0 if subject_details.get("generator") == "openclaw" else 0.7,
+            metadata={
+                "layer": "L7",
+                "generator": subject_details.get("generator"),
+                "model": subject_details.get("model"),
+                "source_artifact_count": subject_details.get("source_artifact_count"),
+            },
+            source_refs=subject_details.get("context_artifact_refs", []),
+        ))
+        artifacts.sort(key=lambda artifact: (artifact.start_s, artifact.end_s, artifact.kind, artifact.artifact_id))
+        result["artifacts"] = [_artifact_to_dict(artifact) for artifact in artifacts]
+        result["artifact_count"] = len(result["artifacts"])
+        job.artifacts_count = len(artifacts)
+
+        # Persist the canonical result before embedding it into the media file.
+        result_path = _save_pipeline_result(asset.media_id, result)
+        result["artifact_bundle_path"] = str(result_path)
+        sidecar_path = _write_pipeline_sidecar(asset, result)
+        if sidecar_path is not None:
+            result["artifact_bundle_sidecar_path"] = str(sidecar_path)
+
+        # ── Inject metadata into source file ───────────────────────
+        result["injection"] = _inject_metadata_into_file(
+            asset,
+            memory,
+            document,
+            transcript_payload=transcript_payload,
+            result_path=sidecar_path or result_path,
+            subject_line=result.get("subject_line"),
+        )
+        _save_pipeline_result(asset.media_id, result)
+        if sidecar_path is not None:
+            _write_pipeline_sidecar(asset, result)
+
         # ── Done ───────────────────────────────────────────────────
         _update_job(job, status="done", current_layer="", progress=1.0, finished_at=time.time())
-
-        # Persist pipeline result
-        _save_pipeline_result(asset.media_id, result)
 
         logger.info(
             "Pipeline complete for %s: %d events, %d recaps, format=%s",
@@ -233,39 +591,36 @@ def process_media_file(
     return result
 
 
-def _derive_transcript(asset: MediaAsset, job: PipelineJob) -> Optional[list]:
-    """Derive a transcript from audio/video using the transcription service."""
+def _artifact_to_dict(artifact: DerivedArtifact) -> dict:
+    return {
+        "artifact_id": artifact.artifact_id,
+        "media_id": artifact.media_id,
+        "kind": artifact.kind,
+        "start_s": artifact.start_s,
+        "end_s": artifact.end_s,
+        "content": artifact.content,
+        "confidence": artifact.confidence,
+        "metadata": artifact.metadata,
+        "source_refs": artifact.source_refs,
+    }
+
+
+def _derive_transcript(asset: MediaAsset, job: PipelineJob) -> Optional[dict]:
+    """Derive a transcript from audio/video using the configured transcription backend."""
     try:
         import transcription_service
+        if not transcription_service.is_available():
+            transcription_service.init_transcription_model()
         if not transcription_service.is_available():
             logger.info("Transcription service not available, skipping transcript derivation")
             return None
 
-        with open(asset.path, "rb") as f:
-            data = f.read()
-
-        content_type = "audio/wav" if asset.path.endswith(".wav") else ""
-        transcription, meta, segments = transcription_service.transcribe_audio_bytes(
-            data,
-            content_type=content_type,
+        transcription, meta, segments = transcription_service.transcribe_media_file(
+            asset.path,
             filename=asset.filename,
+            word_timestamps=True,
         )
-
-        if transcription:
-            # Save transcript as artifact
-            artifact = DerivedArtifact(
-                media_id=asset.media_id,
-                kind="transcript",
-                start_s=0.0,
-                end_s=asset.duration_s,
-                content=transcription,
-                confidence=meta.get("lang_p", 1.0),
-                metadata=meta,
-            )
-            save_artifact(artifact)
-            job.artifacts_count += 1
-
-        return segments
+        return {"text": transcription, "meta": meta, "segments": segments}
 
     except ImportError:
         logger.info("transcription_service not available")
@@ -273,6 +628,462 @@ def _derive_transcript(asset: MediaAsset, job: PipelineJob) -> Optional[list]:
     except Exception as e:
         logger.warning("Transcript derivation failed for %s: %s", asset.filename, e)
         return None
+
+
+def _build_layer_artifacts(
+    asset: MediaAsset,
+    transcript_payload: Optional[dict],
+    filter_results: dict,
+    events: list,
+    recaps: list,
+    memory,
+    document,
+    job: PipelineJob,
+) -> list[DerivedArtifact]:
+    """Build a single canonical artifact bundle for every pipeline layer."""
+    import json as _json
+
+    artifacts: list[DerivedArtifact] = []
+
+    transcript_segments = transcript_payload.get("segments", []) if transcript_payload else []
+    transcript_text = transcript_payload.get("text", "") if transcript_payload else ""
+    transcript_meta = transcript_payload.get("meta", {}) if transcript_payload else {}
+    if transcript_text:
+        artifacts.append(DerivedArtifact(
+            media_id=asset.media_id,
+            kind="transcript",
+            start_s=0.0,
+            end_s=asset.duration_s,
+            content=transcript_text,
+            confidence=transcript_meta.get("lang_p", 1.0),
+            metadata={"layer": "T", **transcript_meta},
+        ))
+
+    for idx, segment in enumerate(filter_results.get("speech_segments", [])):
+        artifacts.append(DerivedArtifact(
+            media_id=asset.media_id,
+            kind="speech_segment",
+            start_s=segment.start_s,
+            end_s=segment.end_s,
+            content=segment.text,
+            confidence=segment.confidence,
+            metadata={
+                "layer": "L1",
+                "speaker": segment.speaker,
+                "salience_tags": [
+                    tag.value if hasattr(tag, "value") else str(tag)
+                    for tag in segment.salience_tags
+                ],
+                "word_timestamps": segment.word_timestamps,
+                "segment_index": idx,
+                "transcript_segment_count": len(transcript_segments),
+            },
+            source_refs=[f"speech_{segment.start_s:.2f}"],
+        ))
+
+    # ── L1: Scene segments ──────────────────────────────────────────
+    for scene in filter_results.get("scenes", []):
+        artifacts.append(DerivedArtifact(
+            media_id=asset.media_id,
+            kind="scene",
+            start_s=scene.start_s,
+            end_s=scene.end_s,
+            content=_json.dumps({
+                "scene_score": scene.scene_score,
+                "motion_score": scene.motion_score,
+                "sharpness_score": scene.sharpness_score,
+                "keyframe_path": scene.keyframe_path,
+                "ocr_text": scene.ocr_text,
+                "labels": scene.labels,
+            }),
+            confidence=min(1.0, scene.scene_score / 0.5) if scene.scene_score > 0 else 0.5,
+            metadata={"layer": "L1"},
+        ))
+
+    for idx, keyframe_path in enumerate(filter_results.get("keyframes", [])):
+        keyframe_start = float(idx)
+        keyframe_end = float(idx)
+        if idx < len(filter_results.get("scenes", [])):
+            keyframe_start = filter_results["scenes"][idx].start_s
+            keyframe_end = filter_results["scenes"][idx].end_s
+        artifacts.append(DerivedArtifact(
+            media_id=asset.media_id,
+            kind="keyframe",
+            start_s=keyframe_start,
+            end_s=keyframe_end,
+            content="",
+            confidence=1.0,
+            metadata={"layer": "L1", "path": keyframe_path, "index": idx},
+            source_refs=[f"keyframe:{keyframe_path}"],
+        ))
+
+    # ── L2: Atomic events ───────────────────────────────────────────
+    for evt in events:
+        artifacts.append(DerivedArtifact(
+            media_id=asset.media_id,
+            kind="event",
+            start_s=evt.time_start,
+            end_s=evt.time_end,
+            content=evt.text_evidence,
+            confidence=evt.confidence,
+            metadata={
+                "layer": "L2",
+                "event_id": evt.event_id,
+                "event_type": evt.event_type.value if hasattr(evt.event_type, 'value') else str(evt.event_type),
+                "speakers": evt.speakers,
+                "visual_entities": evt.visual_entities,
+                "salience_tags": [t.value if hasattr(t, 'value') else str(t) for t in evt.salience_tags],
+                "entities": evt.metadata.get("entities", []),
+            },
+            source_refs=evt.source_refs,
+        ))
+
+    # ── L3: Recaps ──────────────────────────────────────────────────
+    for recap in recaps:
+        artifacts.append(DerivedArtifact(
+            media_id=asset.media_id,
+            kind="recap",
+            start_s=recap.time_start,
+            end_s=recap.time_end,
+            content=recap.recap_text,
+            confidence=1.0,
+            metadata={
+                "layer": "L3",
+                "recap_id": recap.recap_id,
+                "group_type": recap.group_type,
+                "salient_entities": recap.salient_entities,
+                "unresolved_questions": recap.unresolved_questions,
+                "emotional_tone": recap.emotional_tone,
+                "causal_links": recap.causal_links,
+                "event_ids": recap.event_ids,
+            },
+            source_refs=recap.source_refs,
+        ))
+
+    # ── L4: Contextual memory ───────────────────────────────────────
+    artifacts.append(DerivedArtifact(
+        media_id=asset.media_id,
+        kind="memory",
+        start_s=0.0,
+        end_s=asset.duration_s,
+        content=_json.dumps({
+            "memory_id": memory.memory_id,
+            "main_actors": memory.main_actors,
+            "timeline_anchors": memory.timeline_anchors,
+            "locations": memory.locations,
+            "open_loops": memory.open_loops,
+            "inferred_themes": memory.inferred_themes,
+            "risk_safety_issues": memory.risk_safety_issues,
+            "contradictions": memory.contradictions,
+            "notable_evidence": memory.notable_evidence,
+            "final_takeaways": memory.final_takeaways,
+            "recap_ids": memory.recap_ids,
+        }),
+        confidence=1.0,
+        metadata={"layer": "L4", "memory_id": memory.memory_id},
+    ))
+
+    # ── L5: Composed document ───────────────────────────────────────
+    artifacts.append(DerivedArtifact(
+        media_id=asset.media_id,
+        kind="document",
+        start_s=0.0,
+        end_s=asset.duration_s,
+        content=document.full_text,
+        confidence=1.0,
+        metadata={
+            "layer": "L5",
+            "document_id": document.document_id,
+            "format": document.format.value if hasattr(document.format, 'value') else str(document.format),
+            "title": document.title,
+            "section_count": len(document.sections),
+            "memory_id": document.memory_id,
+        },
+        source_refs=document.source_refs,
+    ))
+
+    artifacts.sort(key=lambda artifact: (artifact.start_s, artifact.end_s, artifact.kind, artifact.artifact_id))
+    job.artifacts_count = len(artifacts)
+
+    logger.info(
+        "Saved %d artifacts for %s (scenes=%d, events=%d, recaps=%d, memory=1, doc=1)",
+        job.artifacts_count, asset.filename,
+        len(filter_results.get("scenes", [])), len(events), len(recaps),
+    )
+    return artifacts
+
+
+def _format_vtt_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    secs = (total_ms % 60_000) // 1000
+    millis = total_ms % 1000
+    return f"{hours:02}:{minutes:02}:{secs:02}.{millis:03}"
+
+
+def _write_transcript_sidecar(asset: MediaAsset, transcript_payload: Optional[dict]) -> Optional[Path]:
+    if not transcript_payload:
+        return None
+    segments = transcript_payload.get("segments") or []
+    if not segments:
+        return None
+
+    vtt_path = Path(asset.path).with_suffix(".vtt")
+    meta = transcript_payload.get("meta", {})
+    lines = [
+        "WEBVTT",
+        "",
+        "NOTE",
+        f"Source: {asset.path}",
+        f"Language: {meta.get('lang', 'en')}",
+        "",
+    ]
+    for segment in segments:
+        if isinstance(segment, dict):
+            start_s = float(segment.get("start", 0.0) or 0.0)
+            end_s = float(segment.get("end", start_s) or start_s)
+            text = (segment.get("text") or "").strip()
+        else:
+            start_s = float(getattr(segment, "start", 0.0) or 0.0)
+            end_s = float(getattr(segment, "end", start_s) or start_s)
+            text = str(getattr(segment, "text", "") or "").strip()
+        if not text:
+            continue
+        lines.extend([
+            f"{_format_vtt_timestamp(start_s)} --> {_format_vtt_timestamp(end_s)}",
+            text,
+            "",
+        ])
+    if len(lines) <= 6:
+        return None
+    vtt_path.write_text("\n".join(lines), encoding="utf-8")
+    return vtt_path
+
+
+def _existing_transcript_sidecar(asset: MediaAsset) -> Optional[Path]:
+    vtt_path = Path(asset.path).with_suffix(".vtt")
+    if vtt_path.exists() and vtt_path.stat().st_size > 0:
+        return vtt_path
+    return None
+
+
+def _count_ffprobe_streams(path: Path, stream_selector: str) -> int:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-select_streams", stream_selector,
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return 0
+        payload = json.loads(result.stdout or "{}")
+        return len(payload.get("streams", []))
+    except Exception:
+        return 0
+
+
+def _probe_streams(path: Path) -> list[dict]:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return []
+        payload = json.loads(result.stdout or "{}")
+        return payload.get("streams", [])
+    except Exception:
+        return []
+
+
+def _find_archivist_embedded_streams(path: Path) -> tuple[list[int], list[int]]:
+    subtitle_indexes: list[int] = []
+    attachment_indexes: list[int] = []
+
+    for stream in _probe_streams(path):
+        try:
+            stream_index = int(stream.get("index"))
+        except (TypeError, ValueError):
+            continue
+        tags = stream.get("tags") or {}
+        codec_type = stream.get("codec_type")
+        if codec_type == "subtitle" and tags.get("title") == "Archivist Transcript":
+            subtitle_indexes.append(stream_index)
+        if codec_type == "attachment" and tags.get("filename") == "archivist_media_pipeline.json":
+            attachment_indexes.append(stream_index)
+
+    return subtitle_indexes, attachment_indexes
+
+
+def _inject_metadata_into_file(
+    asset: MediaAsset,
+    memory,
+    document,
+    transcript_payload: Optional[dict] = None,
+    result_path: Optional[Path] = None,
+    subject_line: Optional[str] = None,
+) -> dict:
+    """Inject transcript, artifact bundle, and summary metadata back into the source file."""
+    import subprocess
+
+    info = {
+        "status": "skipped",
+        "transcript_sidecar_path": None,
+        "transcript_stream_embedded": False,
+        "artifact_bundle_attached": False,
+        "summary_tags_written": False,
+        "error": None,
+    }
+
+    if asset.modality not in (Modality.AUDIO, Modality.VIDEO):
+        return info
+
+    src = Path(asset.path)
+    if not src.exists():
+        info["error"] = f"source file missing: {src}"
+        logger.warning("Cannot inject metadata - %s", info["error"])
+        return info
+
+    transcript_sidecar = _write_transcript_sidecar(asset, transcript_payload)
+    if transcript_sidecar is None:
+        transcript_sidecar = _existing_transcript_sidecar(asset)
+    if transcript_sidecar:
+        info["transcript_sidecar_path"] = str(transcript_sidecar)
+
+    metadata_args = []
+    title_text = str(subject_line or (document.title if document else "") or "").strip()
+    if title_text:
+        metadata_args.extend(["-metadata", f"title={title_text}"])
+    if document and document.title and document.title != title_text:
+        metadata_args.extend(["-metadata", f"description={document.title}"])
+
+    description_parts = []
+    if memory.inferred_themes:
+        description_parts.append(f"Themes: {', '.join(memory.inferred_themes)}")
+    cleaned_participants = _clean_subject_terms(memory.main_actors, limit=8)
+    if cleaned_participants:
+        description_parts.append(f"Participants: {', '.join(cleaned_participants)}")
+    if memory.open_loops:
+        description_parts.append(f"Open questions: {len(memory.open_loops)}")
+    if result_path:
+        description_parts.append(f"Archivist bundle: {result_path.name}")
+    if description_parts:
+        metadata_args.extend(["-metadata", f"comment={' | '.join(description_parts)}"])
+
+    if cleaned_participants:
+        metadata_args.extend(["-metadata", f"artist={', '.join(cleaned_participants[:5])}"])
+
+    if document and document.format:
+        fmt_label = document.format.value if hasattr(document.format, "value") else str(document.format)
+        metadata_args.extend(["-metadata", f"genre={fmt_label}"])
+
+    suffix = src.suffix.lower()
+    embed_transcript_stream = transcript_sidecar is not None and suffix in {".mkv", ".mp4"}
+    attach_artifact_bundle = result_path is not None and suffix == ".mkv"
+
+    if not metadata_args and not embed_transcript_stream and not attach_artifact_bundle:
+        return info
+
+    tmp_path = src.with_name(f"{src.stem}.archivist_tmp{src.suffix}")
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(src),
+        ]
+        existing_archivist_subtitles, existing_archivist_attachments = _find_archivist_embedded_streams(src)
+        subtitle_stream_index = None
+        if embed_transcript_stream and transcript_sidecar is not None:
+            subtitle_stream_index = max(
+                0,
+                _count_ffprobe_streams(src, "s") - len(existing_archivist_subtitles),
+            )
+            cmd.extend(["-i", str(transcript_sidecar)])
+
+        cmd.extend(["-map", "0"])
+        if embed_transcript_stream:
+            for stream_index in existing_archivist_subtitles:
+                cmd.extend(["-map", f"-0:{stream_index}"])
+        if attach_artifact_bundle:
+            for stream_index in existing_archivist_attachments:
+                cmd.extend(["-map", f"-0:{stream_index}"])
+        if embed_transcript_stream:
+            cmd.extend(["-map", "1:0"])
+
+        if suffix == ".mp4":
+            cmd.extend(["-c:v", "copy", "-c:a", "copy"])
+            if embed_transcript_stream:
+                cmd.extend(["-c:s", "mov_text"])
+            else:
+                cmd.extend(["-c", "copy"])
+        else:
+            cmd.extend(["-c", "copy"])
+
+        cmd.extend(["-map_metadata", "0"])
+        cmd.extend(metadata_args)
+
+        if embed_transcript_stream and subtitle_stream_index is not None:
+            cmd.extend([
+                f"-metadata:s:s:{subtitle_stream_index}", "language=eng",
+                f"-metadata:s:s:{subtitle_stream_index}", "title=Archivist Transcript",
+            ])
+
+        if attach_artifact_bundle and result_path is not None:
+            attachment_index = max(
+                0,
+                _count_ffprobe_streams(src, "t") - len(existing_archivist_attachments),
+            )
+            cmd.extend([
+                "-attach", str(result_path),
+                f"-metadata:s:t:{attachment_index}", "mimetype=application/json",
+                f"-metadata:s:t:{attachment_index}", "filename=archivist_media_pipeline.json",
+            ])
+
+        cmd.append(str(tmp_path))
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=max(300, int(src.stat().st_size / (8 * 1024 * 1024))),
+        )
+        if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
+            tmp_path.replace(src)
+            info["status"] = "embedded"
+            info["summary_tags_written"] = bool(metadata_args)
+            info["transcript_stream_embedded"] = embed_transcript_stream
+            info["artifact_bundle_attached"] = attach_artifact_bundle
+            logger.info("Injected metadata into %s", asset.filename)
+            return info
+
+        stderr = (result.stderr or b"").decode("utf-8", errors="ignore")
+        info["status"] = "error"
+        info["error"] = stderr[:500]
+        logger.warning("Metadata injection failed for %s: %s", asset.filename, stderr[:200])
+    except Exception as e:
+        info["status"] = "error"
+        info["error"] = str(e)
+        logger.warning("Metadata injection error for %s: %s", asset.filename, e)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    return info
 
 
 def _insert_into_vectorstore(
@@ -492,6 +1303,7 @@ def _save_pipeline_result(media_id: str, result: dict):
     # Convert non-serializable objects
     serializable = json.loads(json.dumps(result, default=str))
     result_file.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+    return result_file
 
 
 def get_pipeline_result(media_id: str) -> Optional[dict]:
@@ -516,6 +1328,9 @@ def start_watcher(directories: list[str]):
         logger.warning("No valid watch directories provided")
         return
 
+    if _watcher_thread and _watcher_thread.is_alive():
+        stop_watcher()
+
     _watcher_stop.clear()
     _watcher_thread = threading.Thread(target=_watcher_loop, daemon=True, name="media-watcher")
     _watcher_thread.start()
@@ -532,13 +1347,12 @@ def stop_watcher():
 
 def _watcher_loop():
     """Background loop that checks watch directories for new media files."""
-    from media.evidence_store import _load_assets_index
     processed_hashes: set[str] = set()
 
     # Load already-processed hashes
     index = _load_assets_index()
     for asset_data in index.values():
-        if asset_data.get("file_hash"):
+        if asset_data.get("file_hash") and _asset_record_complete(asset_data):
             processed_hashes.add(asset_data["file_hash"])
 
     while not _watcher_stop.is_set():
@@ -556,10 +1370,22 @@ def _scan_directory(directory: str, processed_hashes: set[str]):
     from hashlib import sha256
 
     dir_path = Path(directory)
+    index = _load_assets_index()
+    complete_paths = {
+        str(data.get("path") or ""): data
+        for data in index.values()
+        if _asset_record_complete(data)
+    }
     for file_path in dir_path.rglob("*"):
         if not file_path.is_file():
             continue
         if file_path.suffix.lower() not in ALL_MEDIA_EXTS:
+            continue
+
+        resolved_path = str(file_path.resolve())
+        existing_complete = complete_paths.get(resolved_path)
+        if existing_complete and existing_complete.get("file_hash"):
+            processed_hashes.add(existing_complete["file_hash"])
             continue
 
         # Quick hash check to avoid reprocessing
@@ -576,9 +1402,14 @@ def _scan_directory(directory: str, processed_hashes: set[str]):
             continue
 
         logger.info("New media file detected: %s", file_path.name)
-        processed_hashes.add(file_hash)
-
         try:
-            process_media_file(str(file_path))
+            result = process_media_file(str(file_path))
+            if not result.get("error"):
+                processed_hashes.add(file_hash)
+                complete_paths[resolved_path] = {
+                    "path": resolved_path,
+                    "media_id": result.get("media_id", ""),
+                    "file_hash": file_hash,
+                }
         except Exception as e:
             logger.error("Failed to process %s: %s", file_path.name, e)

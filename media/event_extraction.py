@@ -7,6 +7,7 @@ This is the bridge between raw evidence and higher-level narrative.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Optional
 
@@ -20,6 +21,26 @@ from media.models import (
 )
 
 logger = logging.getLogger("archivist.media.events")
+
+MAX_EVENT_DURATION_S = max(15.0, float(os.getenv("MEDIA_MAX_EVENT_DURATION_S", "90")))
+MAX_EVENT_SEGMENTS = max(3, int(os.getenv("MEDIA_MAX_EVENT_SEGMENTS", "40")))
+MAX_EVENT_WORDS = max(40, int(os.getenv("MEDIA_MAX_EVENT_WORDS", "220")))
+
+ENTITY_STOP_WORDS = {
+    "a", "actually", "again", "all", "also", "amazing", "and", "another", "any", "anything",
+    "basically", "because", "best", "better", "brief", "but", "bye", "can", "chatgpt",
+    "classification", "classifier", "cool", "course", "data", "december", "demo",
+    "document", "documents", "done", "easy", "energy", "exactly", "extraction", "first",
+    "forget", "get", "going", "great", "guys", "have", "hello", "here", "hey", "hopefully",
+    "how", "however", "i", "idea", "if", "immediately", "in", "it", "january", "jump",
+    "just", "kind", "last", "let", "like", "look", "makes", "manual", "maybe", "meeting",
+    "more", "mosfet", "my", "next", "no", "not", "now",
+    "okay", "our", "over", "pay", "pay stub", "pay stubs", "pdf", "please", "product", "prompt",
+    "prompts", "quality", "really", "right", "same", "second", "see", "since", "slack", "snacks",
+    "so", "sorry", "summary", "system", "thank", "thanks", "that", "the", "then", "there",
+    "these", "this", "those", "transcript", "true", "up", "use", "vector", "well", "what",
+    "when", "where", "which", "why", "with", "workflow", "yeah", "yes", "you", "your",
+}
 
 
 def _classify_event_type(text: str) -> EventType:
@@ -57,15 +78,26 @@ def _extract_entities(text: str) -> list[str]:
     places, or organizations.
     """
     entities = []
-    # Find capitalized sequences (simple NER approximation)
     matches = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", text)
-    # Filter common sentence starters
-    stop_words = {"The", "This", "That", "These", "Those", "What", "When", "Where", "Who", "How",
-                  "It", "They", "We", "You", "He", "She", "But", "And", "Or", "So", "If"}
     for match in matches:
-        if match.split()[0] not in stop_words and len(match) > 2:
-            entities.append(match)
-    return list(set(entities))
+        parts = match.strip().split()
+        while parts and parts[0].lower() in ENTITY_STOP_WORDS:
+            parts = parts[1:]
+        while parts and parts[-1].lower() in ENTITY_STOP_WORDS:
+            parts = parts[:-1]
+        if not parts:
+            continue
+        candidate = " ".join(parts)
+        lower = candidate.lower()
+        if lower in ENTITY_STOP_WORDS:
+            continue
+        if any(part.lower() in ENTITY_STOP_WORDS for part in candidate.split()):
+            if len(candidate.split()) == 1:
+                continue
+        if len(candidate) <= 2:
+            continue
+        entities.append(candidate)
+    return sorted(set(entities))
 
 
 def extract_events_from_speech(
@@ -89,13 +121,24 @@ def extract_events_from_speech(
     groups: list[list[SpeechSegment]] = []
     current_group: list[SpeechSegment] = [segments[0]]
 
+    current_word_count = len(current_group[0].text.split())
+
     for seg in segments[1:]:
         gap = seg.start_s - current_group[-1].end_s
-        if gap <= merge_window_s:
+        projected_duration = seg.end_s - current_group[0].start_s
+        seg_word_count = len(seg.text.split())
+        would_exceed_limits = (
+            projected_duration > MAX_EVENT_DURATION_S or
+            len(current_group) >= MAX_EVENT_SEGMENTS or
+            (current_word_count + seg_word_count) > MAX_EVENT_WORDS
+        )
+        if gap <= merge_window_s and not would_exceed_limits:
             current_group.append(seg)
+            current_word_count += seg_word_count
         else:
             groups.append(current_group)
             current_group = [seg]
+            current_word_count = seg_word_count
     groups.append(current_group)
 
     events = []
