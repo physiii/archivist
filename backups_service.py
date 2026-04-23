@@ -34,6 +34,8 @@ ARCHIVE_SOURCE_DIRS = [
     (Path("/data/milvus"), "milvus"),
     (Path("/data/etcd"), "etcd"),
     (Path("/data/minio"), "minio"),
+    (Path("/root/.config/archivist"), "archivist-config"),
+    (Path("/data/media_pipeline"), "media-pipeline"),
 ]
 
 # Seed values copied from current custodian config.

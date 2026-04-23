@@ -3,8 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from docx import Document
-from pypdf import PdfReader
+try:
+    from docx import Document
+except Exception:  # pragma: no cover
+    Document = None  # type: ignore
+
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover
+    PdfReader = None  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,8 @@ def _normalize_pdf_text(value: str) -> str:
 
 
 def _extract_pdf_segments(path: str) -> tuple[list[ExtractedDocumentSegment], str | None]:
+    if PdfReader is None:
+        return [], "PDF support unavailable (pypdf not installed)"
     try:
         reader = PdfReader(path)
     except Exception as exc:
@@ -62,6 +71,8 @@ def _extract_pdf_segments(path: str) -> tuple[list[ExtractedDocumentSegment], st
 
 
 def _extract_docx_segments(path: str) -> tuple[list[ExtractedDocumentSegment], str | None]:
+    if Document is None:
+        return [], "DOCX support unavailable (python-docx not installed)"
     try:
         document = Document(path)
     except Exception as exc:

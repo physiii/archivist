@@ -16,6 +16,7 @@ from backups_service import get_schedule_config
 from documents.chunking import chunk_document_segments
 from documents.extract import extract_document_segments
 from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, utility
+from pymilvus.client.types import LoadState
 try:
     from pymilvus import Function, FunctionType
 except Exception:  # pragma: no cover
@@ -75,10 +76,58 @@ INDEXING_PATH_ALIASES = os.getenv(
     "INDEXING_PATH_ALIASES",
     "/media/mass=/media/mass;/home/andy/nas_mass=/home/andy/nas_mass",
 )
+DEFAULT_EXCLUDED_DIR_NAMES = {
+    ".cache",
+    ".cargo",
+    ".colima",
+    ".docker",
+    ".git",
+    ".gradle",
+    ".local",
+    ".mypy_cache",
+    ".next",
+    ".npm",
+    ".pnpm-store",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".rustup",
+    ".tox",
+    ".trash",
+    ".trash-1000",
+    ".venv",
+    ".yarn",
+    "__pycache__",
+    "build",
+    "dist",
+    "library",
+    "node_modules",
+    "venv",
+}
+INDEXING_EXCLUDED_DIR_NAMES = {
+    item.strip().lower()
+    for item in os.getenv("INDEXING_EXCLUDED_DIR_NAMES", ",".join(sorted(DEFAULT_EXCLUDED_DIR_NAMES))).split(",")
+    if item.strip()
+}
+INDEXING_SKIP_HIDDEN_DIRS = os.getenv("INDEXING_SKIP_HIDDEN_DIRS", "1").strip().lower() in {"1", "true", "yes"}
+DEFAULT_MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+DEFAULT_EMBEDDING_HOST = os.getenv("EMBEDDING_HOST", "localhost")
+try:
+    DEFAULT_EMBEDDING_PORT = int(os.getenv("EMBEDDING_PORT", "8000"))
+except (TypeError, ValueError):
+    DEFAULT_EMBEDDING_PORT = 8000
+try:
+    DEFAULT_MILVUS_CONNECT_TIMEOUT = float(os.getenv("MILVUS_CONNECT_TIMEOUT", "3"))
+except (TypeError, ValueError):
+    DEFAULT_MILVUS_CONNECT_TIMEOUT = 3.0
+try:
+    DEFAULT_MILVUS_INSERT_TIMEOUT = float(os.getenv("MILVUS_INSERT_TIMEOUT", "60"))
+except (TypeError, ValueError):
+    DEFAULT_MILVUS_INSERT_TIMEOUT = 60.0
 LEVEL_UTTERANCE = 0
 LEVEL_DETAIL = 1
 LEVEL_TOPIC = 2
 LEVEL_DOC = 3
+TAGS_FIELD_MAX_LENGTH = 512
 
 DOC_TYPE_BY_EXT = {
     ".vtt": "subtitle_vtt",
@@ -140,7 +189,7 @@ def _chunk_collection_fields() -> list[FieldSchema]:
         FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=128),
         FieldSchema(name="topic_label", dtype=DataType.VARCHAR, max_length=128),
         FieldSchema(name="language", dtype=DataType.VARCHAR, max_length=32),
-        FieldSchema(name="tags", dtype=DataType.VARCHAR, max_length=512),
+        FieldSchema(name="tags", dtype=DataType.VARCHAR, max_length=TAGS_FIELD_MAX_LENGTH),
         FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name="creation_date", dtype=DataType.INT64),
     ]
@@ -161,6 +210,23 @@ def _chunk_collection_functions() -> list[Any]:
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).isoformat() if dt else None
+
+
+def _serialize_tags(tags: list[str], *, max_length: int = TAGS_FIELD_MAX_LENGTH) -> str:
+    """Serialize tags within the Milvus VARCHAR limit while keeping the leading signal."""
+    selected: list[str] = []
+    for raw_tag in tags:
+        clean = re.sub(r"\s+", " ", str(raw_tag or "")).strip()
+        if not clean:
+            continue
+        if len(clean) > 96:
+            clean = clean[:95].rstrip() + "…"
+        candidate = [*selected, clean]
+        encoded = json.dumps(candidate, separators=(",", ":"))
+        if len(encoded) > max_length:
+            break
+        selected.append(clean)
+    return json.dumps(selected, separators=(",", ":"))
 
 
 def _tail(path: Path, lines: int = 120) -> str:
@@ -507,7 +573,11 @@ def _canonicalize_transcript_path(path: str) -> str:
 
 
 def _transcript_family_key(path: str) -> str:
-    return TRANSCRIPT_PATH_SUFFIX_RE.sub("", _canonicalize_transcript_path(path))
+    clean = TRANSCRIPT_PATH_SUFFIX_RE.sub("", _canonicalize_transcript_path(path))
+    suffix = Path(clean).suffix.lower()
+    if suffix in MEDIA_EXTS:
+        clean = str(Path(clean).with_suffix(""))
+    return clean
 
 
 def _transcript_job_sort_key(job: dict[str, Any]) -> tuple[int, int, str]:
@@ -533,42 +603,117 @@ def _dedupe_file_jobs(file_jobs: list[dict[str, Any]]) -> tuple[list[dict[str, A
     return deduped_jobs, skipped_paths
 
 
-def _target_scan_count(path: str, recursive: bool) -> tuple[int, bool]:
+def _canonical_compare_path(path: str | Path) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(Path(path).absolute())
+
+
+def _is_same_or_descendant(path: str | Path, root: str | Path) -> bool:
+    path_clean = str(Path(_canonical_compare_path(path)).as_posix()).rstrip("/")
+    root_clean = str(Path(_canonical_compare_path(root)).as_posix()).rstrip("/")
+    return path_clean == root_clean or path_clean.startswith(root_clean + "/")
+
+
+def _target_exclude_roots(target: dict[str, Any], targets: list[dict[str, Any]]) -> list[Path]:
+    if not bool(target.get("recursive", True)):
+        return []
+    target_root, _ = _resolve_target_root(str(target.get("path") or ""))
+    if not target_root.exists() or not target_root.is_dir():
+        return []
+    excludes: list[Path] = []
+    target_root_cmp = _canonical_compare_path(target_root)
+    for other in targets:
+        if other.get("id") == target.get("id") or not other.get("enabled", True):
+            continue
+        other_root, _ = _resolve_target_root(str(other.get("path") or ""))
+        if not other_root.exists() or not other_root.is_dir():
+            continue
+        other_root_cmp = _canonical_compare_path(other_root)
+        if other_root_cmp == target_root_cmp:
+            continue
+        if _is_same_or_descendant(other_root_cmp, target_root_cmp):
+            excludes.append(other_root)
+    excludes.sort(key=lambda item: str(item))
+    return excludes
+
+
+def _should_exclude_path(path: str | Path, exclude_roots: list[Path] | None) -> bool:
+    if not exclude_roots:
+        return False
+    return any(_is_same_or_descendant(path, root) for root in exclude_roots)
+
+
+def _walk_dir_allowed(name: str) -> bool:
+    clean = str(name or "").strip()
+    if not clean:
+        return False
+    if INDEXING_SKIP_HIDDEN_DIRS and clean.startswith("."):
+        return False
+    return clean.lower() not in INDEXING_EXCLUDED_DIR_NAMES
+
+
+def _prune_walk_dirnames(dirpath: str, dirnames: list[str], exclude_roots: list[Path] | None) -> None:
+    dirnames[:] = [
+        name
+        for name in dirnames
+        if _walk_dir_allowed(name) and not _should_exclude_path(Path(dirpath) / name, exclude_roots)
+    ]
+
+
+def _target_scan_count(
+    path: str,
+    recursive: bool,
+    exclude_roots: list[Path] | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[int, bool]:
     root, _ = _resolve_target_root(path)
     if not root.exists() or not root.is_dir():
         return 0, False
-    timeout_seconds = float(os.getenv("INDEXING_SCAN_TIMEOUT_SECONDS", "3600"))
-    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    if timeout_seconds is None:
+        timeout_seconds = float(os.getenv("INDEXING_SCAN_TIMEOUT_SECONDS", "3600"))
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
     count = 0
     timed_out = False
     if recursive:
-        for dirpath, _, filenames in os.walk(
+        for dirpath, dirnames, filenames in os.walk(
             str(root),
             topdown=True,
             onerror=lambda _err: None,
             followlinks=False,
         ):
+            if _should_exclude_path(dirpath, exclude_roots):
+                dirnames[:] = []
+                continue
+            _prune_walk_dirnames(dirpath, dirnames, exclude_roots)
             if time.monotonic() >= deadline:
                 timed_out = True
                 break
+            dir_paths: list[str] = []
             for name in filenames:
                 if time.monotonic() >= deadline:
                     timed_out = True
                     break
                 suffix = Path(name).suffix.lower()
                 if suffix in ALL_INDEX_EXTS:
-                    count += 1
+                    item = Path(dirpath) / name
+                    if not _should_exclude_path(item, exclude_roots):
+                        dir_paths.append(str(item.absolute()))
+            count += len(_dedupe_directory_paths(dir_paths))
     else:
         try:
+            dir_paths = []
             for entry in root.iterdir():
                 if time.monotonic() >= deadline:
                     timed_out = True
                     break
                 try:
                     if entry.is_file() and entry.suffix.lower() in ALL_INDEX_EXTS:
-                        count += 1
+                        dir_paths.append(str(entry.absolute()))
                 except OSError:
                     continue
+            count = len(_dedupe_directory_paths(dir_paths))
         except OSError:
             return count, timed_out
     return count, timed_out
@@ -600,19 +745,23 @@ def _dedupe_directory_paths(paths: list[str]) -> list[str]:
     return out
 
 
-def _iter_target_file_paths(path: str, recursive: bool):
+def _iter_target_file_paths(path: str, recursive: bool, exclude_roots: list[Path] | None = None):
     root, _ = _resolve_target_root(path)
     if not root.exists() or not root.is_dir():
         return
     timeout_seconds = float(os.getenv("INDEXING_FILE_DISCOVERY_TIMEOUT_SECONDS", "600"))
     deadline = time.monotonic() + max(1.0, timeout_seconds)
     if recursive:
-        for dirpath, _, filenames in os.walk(
+        for dirpath, dirnames, filenames in os.walk(
             str(root),
             topdown=True,
             onerror=lambda _err: None,
             followlinks=False,
         ):
+            if _should_exclude_path(dirpath, exclude_roots):
+                dirnames[:] = []
+                continue
+            _prune_walk_dirnames(dirpath, dirnames, exclude_roots)
             if time.monotonic() >= deadline:
                 break
             dir_paths: list[str] = []
@@ -623,10 +772,9 @@ def _iter_target_file_paths(path: str, recursive: bool):
                 if suffix not in ALL_INDEX_EXTS:
                     continue
                 item = Path(dirpath) / name
-                try:
-                    dir_paths.append(str(item.resolve()))
-                except OSError:
+                if _should_exclude_path(item, exclude_roots):
                     continue
+                dir_paths.append(str(item.absolute()))
             for read_path in _dedupe_directory_paths(dir_paths):
                 yield read_path
     else:
@@ -637,7 +785,7 @@ def _iter_target_file_paths(path: str, recursive: bool):
                     break
                 try:
                     if item.is_file() and item.suffix.lower() in ALL_INDEX_EXTS:
-                        dir_paths.append(str(item.resolve()))
+                        dir_paths.append(str(item.absolute()))
                 except OSError:
                     continue
         except OSError:
@@ -662,10 +810,37 @@ def _milvus_alias(prefix: str = "indexing") -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
-def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address: str = "localhost") -> Collection:
-    connections.connect(alias, host=ip_address, port="19530")
+def _default_milvus_host() -> str:
+    return os.getenv("MILVUS_HOST") or DEFAULT_MILVUS_HOST
+
+
+def _default_embedding_host() -> str:
+    return os.getenv("EMBEDDING_HOST") or DEFAULT_EMBEDDING_HOST
+
+
+def _default_embedding_port() -> int:
+    try:
+        return int(os.getenv("EMBEDDING_PORT", str(DEFAULT_EMBEDDING_PORT)))
+    except (TypeError, ValueError):
+        return DEFAULT_EMBEDDING_PORT
+
+
+def _create_index_best_effort(collection: Collection, field_name: str, index_params: dict[str, Any]) -> None:
+    try:
+        collection.create_index(field_name=field_name, index_params=index_params, timeout=5)
+    except Exception as exc:
+        log.warning("Index creation for %s.%s did not finish: %s", collection.name, field_name, exc)
+
+
+def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address: str | None = None) -> Collection:
+    connections.connect(
+        alias,
+        host=ip_address or _default_milvus_host(),
+        port="19530",
+        timeout=DEFAULT_MILVUS_CONNECT_TIMEOUT,
+    )
     recreate = False
-    if utility.has_collection(name, using=alias):
+    if utility.has_collection(name, using=alias, timeout=DEFAULT_MILVUS_CONNECT_TIMEOUT):
         existing = Collection(name=name, using=alias)
         fields = {field.name: field for field in existing.schema.fields}
         required = required_chunk_field_names()
@@ -676,15 +851,16 @@ def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address
             if dim != LOCAL_EMBEDDING_DIM:
                 recreate = True
         if recreate:
-            existing.drop()
-    if not utility.has_collection(name, using=alias):
+            existing.drop(timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
+    if not utility.has_collection(name, using=alias, timeout=DEFAULT_MILVUS_CONNECT_TIMEOUT):
         schema = CollectionSchema(_chunk_collection_fields(), description=description, functions=_chunk_collection_functions())
         collection = Collection(name=name, schema=schema, using=alias)
         dense_index = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
-        collection.create_index(field_name="vector", index_params=dense_index)
-        collection.create_index(
-            field_name="sparse",
-            index_params={"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}},
+        _create_index_best_effort(collection, "vector", dense_index)
+        _create_index_best_effort(
+            collection,
+            "sparse",
+            {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}},
         )
         return collection
     collection = Collection(name=name, using=alias)
@@ -705,16 +881,17 @@ def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address
             break
     if not has_vector_index:
         dense_index = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
-        collection.create_index(field_name="vector", index_params=dense_index)
+        _create_index_best_effort(collection, "vector", dense_index)
     elif vector_metric and vector_metric != str(METRIC_TYPE).strip().upper():
-        collection.release()
-        collection.drop_index(index_name="vector")
+        collection.release(timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
+        collection.drop_index(index_name="vector", timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
         dense_index = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
-        collection.create_index(field_name="vector", index_params=dense_index)
+        _create_index_best_effort(collection, "vector", dense_index)
     if not has_sparse_index:
-        collection.create_index(
-            field_name="sparse",
-            index_params={"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}},
+        _create_index_best_effort(
+            collection,
+            "sparse",
+            {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "params": {}},
         )
     return collection
 
@@ -725,6 +902,42 @@ def _ensure_transcripts_collection(alias: str, ip_address: str = "localhost") ->
 
 def _ensure_documents_collection(alias: str, ip_address: str = "localhost") -> Collection:
     return _ensure_chunk_collection(DOCUMENTS_COLLECTION, "Document chunks", alias=alias, ip_address=ip_address)
+
+
+def _collection_is_loaded(collection: Collection, *, alias: str) -> bool:
+    try:
+        return utility.load_state(collection.name, using=alias, timeout=1) == LoadState.Loaded
+    except Exception:
+        return False
+
+
+def _delete_source_ids_if_loaded(collection: Collection, source_ids: list[str], *, alias: str) -> bool:
+    if not source_ids:
+        return False
+    seen_source_ids: set[str] = set()
+    deleted = False
+    for source_id in source_ids:
+        if not source_id or source_id in seen_source_ids:
+            continue
+        seen_source_ids.add(source_id)
+        delete_expr = f'source_id == "{_escape_expr(source_id)}"'
+        try:
+            collection.delete(delete_expr, timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
+            deleted = True
+        except Exception:
+            try:
+                if not _collection_is_loaded(collection, alias=alias):
+                    collection.load(timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
+                collection.delete(delete_expr, timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
+                deleted = True
+            except Exception:
+                pass
+    if deleted:
+        try:
+            collection.flush(timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
+        except Exception:
+            pass
+    return deleted
 
 
 @dataclass
@@ -814,12 +1027,27 @@ def delete_indexing_target(target_id: str) -> None:
     _save_config(config)
 
 
-def _target_health(target: dict[str, Any]) -> dict[str, Any]:
+def _target_excluded_target_paths(target: dict[str, Any], targets: list[dict[str, Any]]) -> list[str]:
+    exclude_roots = {_canonical_compare_path(root) for root in _target_exclude_roots(target, targets)}
+    if not exclude_roots:
+        return []
+    paths: list[str] = []
+    for other in targets:
+        if other.get("id") == target.get("id"):
+            continue
+        other_root, _ = _resolve_target_root(str(other.get("path") or ""))
+        if _canonical_compare_path(other_root) in exclude_roots:
+            paths.append(str(other.get("path") or ""))
+    return sorted(path for path in paths if path)
+
+
+def _target_health(target: dict[str, Any], targets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     path = str(target["path"])
     resolved_root, used_host_fallback = _resolve_target_root(path)
     exists = resolved_root.exists()
     readable = os.access(str(resolved_root), os.R_OK) if exists else False
     ready = bool(exists and readable and resolved_root.is_dir())
+    excluded_child_targets = _target_excluded_target_paths(target, targets or []) if targets else []
     return {
         "id": target["id"],
         "path": path,
@@ -834,6 +1062,7 @@ def _target_health(target: dict[str, Any]) -> dict[str, Any]:
         "last_error": target.get("last_error"),
         "resolved_path": str(resolved_root),
         "used_host_fallback": used_host_fallback,
+        "excluded_child_targets": excluded_child_targets,
     }
 
 
@@ -846,7 +1075,14 @@ def scan_indexing_target(target_id: str) -> dict[str, Any]:
         found = True
         now = _iso(datetime.now(timezone.utc))
         try:
-            count, timed_out = _target_scan_count(target["path"], bool(target.get("recursive", True)))
+            exclude_roots = _target_exclude_roots(target, config["targets"])
+            interactive_timeout = float(os.getenv("INDEXING_INTERACTIVE_SCAN_TIMEOUT_SECONDS", "30"))
+            count, timed_out = _target_scan_count(
+                target["path"],
+                bool(target.get("recursive", True)),
+                exclude_roots=exclude_roots,
+                timeout_seconds=interactive_timeout,
+            )
             if timed_out and count == 0:
                 # If the broad root times out before transcript-heavy leaves are traversed,
                 # use configured child-target scan counts as a lower-bound instead of 0.
@@ -924,7 +1160,7 @@ def _state_status() -> dict[str, Any]:
 def get_indexing_overview() -> dict[str, Any]:
     _ensure_root()
     config = _load_config()
-    target_health = [_target_health(item) for item in config["targets"]]
+    target_health = [_target_health(item, config["targets"]) for item in config["targets"]]
     storage_ready = all(t["ready"] for t in target_health if t["enabled"]) if target_health else False
     return {
         "status": _state_status(),
@@ -951,7 +1187,12 @@ def _release_run_lock() -> None:
 def _build_file_jobs(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     for target in targets:
-        for read_path in _iter_target_file_paths(target["path"], bool(target.get("recursive", True))):
+        exclude_roots = _target_exclude_roots(target, targets)
+        for read_path in _iter_target_file_paths(
+            target["path"],
+            bool(target.get("recursive", True)),
+            exclude_roots=exclude_roots,
+        ):
             jobs.append(
                 {
                     "target_id": target["id"],
@@ -1073,99 +1314,14 @@ def _is_media_file(path: str) -> bool:
     return Path(path).suffix.lower() in MEDIA_EXTS
 
 
-def _transcribe_and_chunk(read_path: str, display_path: str) -> tuple[list[TranscriptChunk], str | None]:
-    """Transcribe an audio/video file and chunk the result.
-
-    Uses the transcription service to generate a transcript, then
-    converts segments into VTT-style cues for the chunking pipeline.
-    Falls back to the media pipeline if transcription is unavailable.
-    """
-    try:
-        import transcription_service
-        if not transcription_service.is_available():
-            return [], "Transcription service not available"
-
-        with open(read_path, "rb") as f:
-            data = f.read()
-
-        transcription, meta, segments = transcription_service.transcribe_audio_bytes(
-            data,
-            content_type="",
-            filename=Path(read_path).name,
-        )
-
-        if not transcription or not segments:
-            return [], "Transcription produced no output"
-
-        # Convert whisper segments to Cue objects for the chunking pipeline
-        from transcripts.parsers import Cue
-        cues = []
-        for seg in segments:
-            text = getattr(seg, "text", "").strip()
-            start_s = getattr(seg, "start", 0.0)
-            end_s = getattr(seg, "end", 0.0)
-            if not text or end_s <= start_s:
-                continue
-            cues.append(Cue(
-                start_ms=int(start_s * 1000),
-                end_ms=int(end_s * 1000),
-                text=text,
-            ))
-
-        if not cues:
-            return [], "No valid transcript segments"
-
-        # Also save a .vtt file alongside the media file for future reference
-        _save_vtt_sidecar(read_path, cues, meta)
-
-        chunks = build_time_window_chunks(
-            cues,
-            path=display_path,
-            source_id=_source_id_for_path(display_path),
-            source_type="transcript",
-            doc_type="media_transcript",
-            topic_label=None,
-            language=meta.get("lang"),
-            durations_s=(60, 3600),
-            strides_s=(30, 1800),
-            min_words_level1=4,
-            min_words_level2=8,
-        )
-        if not chunks:
-            return [], "No chunks generated from transcription"
-        return chunks, None
-
-    except ImportError:
-        return [], "transcription_service not installed"
-    except Exception as exc:
-        return [], f"Transcription failed: {exc}"
-
-
-def _save_vtt_sidecar(media_path: str, cues, meta: dict):
-    """Save a .vtt file next to the media file for re-indexing without re-transcription."""
-    try:
-        vtt_path = Path(media_path).with_suffix(".vtt")
-        if vtt_path.exists():
-            return  # Don't overwrite existing transcript
-        lines = ["WEBVTT", "", f"NOTE", f"Source: {media_path}", f"Language: {meta.get('lang', 'en')}", ""]
-        for cue in cues:
-            start_s = cue.start_ms / 1000.0
-            end_s = cue.end_ms / 1000.0
-            start = f"{int(start_s // 3600):02}:{int((start_s % 3600) // 60):02}:{int(start_s % 60):02}.{int((start_s % 1) * 1000):03}"
-            end = f"{int(end_s // 3600):02}:{int((end_s % 3600) // 60):02}:{int(end_s % 60):02}.{int((end_s % 1) * 1000):03}"
-            lines.extend([f"{start} --> {end}", cue.text, ""])
-        vtt_path.write_text("\n".join(lines), encoding="utf-8")
-    except Exception:
-        pass  # Sidecar is best-effort
-
-
 def _parse_file_job(read_path: str, display_path: str) -> tuple[list[TranscriptChunk], str | None]:
     if _is_media_file(read_path):
-        # Check for existing .vtt sidecar first (avoids re-transcribing)
-        vtt_path = Path(read_path).with_suffix(".vtt")
-        if vtt_path.exists():
-            return _parse_and_chunk(str(vtt_path), display_path)
-        return _transcribe_and_chunk(read_path, display_path)
+        try:
+            from media.pipeline import process_media_file
+            process_media_file(read_path)
+        except Exception as e:
+            return [], f"media pipeline error: {e}"
+        return [], "routed:media"
     if _treat_as_document(read_path):
         return _parse_document_and_chunk(read_path, display_path)
     return _parse_and_chunk(read_path, display_path)
@@ -1182,11 +1338,12 @@ def _insert_chunks(
     filehash: str,
     embedding_host: str,
     embedding_port: int,
+    tag_builder=None,
 ) -> int:
     if not chunks:
         return 0
     creation = int(datetime.now().timestamp())
-    rows: list[tuple[list[float], TranscriptChunk, str]] = []
+    rows: list[tuple[list[float], TranscriptChunk, str, str, list[str]]] = []
     embedding_batch_size = 16
     embedding_text_max_chars = 12000
     for start in range(0, len(chunks), embedding_batch_size):
@@ -1203,10 +1360,18 @@ def _insert_chunks(
         for vector, chunk in zip(validated, batch_chunks):
             if vector is None:
                 continue
-            rows.append((vector, chunk, _chunk_hash(chunk)))
+            extra_tags = []
+            if callable(tag_builder):
+                try:
+                    built_tags = tag_builder(chunk)
+                    if isinstance(built_tags, list):
+                        extra_tags = [str(tag).strip() for tag in built_tags if str(tag).strip()]
+                except Exception:
+                    extra_tags = []
+            rows.append((vector, chunk, _chunk_hash(chunk), filehash, extra_tags))
     if not rows:
         return 0
-    def _tags_for_chunk(chunk: TranscriptChunk) -> str:
+    def _tags_for_chunk(chunk: TranscriptChunk, extra_tags: list[str] | None = None) -> str:
         path_obj = Path(str(chunk.path or ""))
         suffix = path_obj.suffix.lower().lstrip(".")
         tags = [
@@ -1238,7 +1403,9 @@ def _insert_chunks(
             tags.append(f"language:{chunk.language}")
         if chunk.topic_label:
             tags.append(f"topic:{chunk.topic_label}")
-        return json.dumps(tags)
+        if extra_tags:
+            tags.extend(tag for tag in extra_tags if tag)
+        return _serialize_tags(tags)
 
     fields = [
         "vector",
@@ -1266,7 +1433,7 @@ def _insert_chunks(
         [row[2] for row in rows],
         [row[1].source_id for row in rows],
         [row[1].path for row in rows],
-        [filehash] * len(rows),
+        [row[3] for row in rows],
         [row[1].t_start_ms for row in rows],
         [row[1].t_end_ms for row in rows],
         [row[1].chunk_duration_s for row in rows],
@@ -1276,11 +1443,11 @@ def _insert_chunks(
         [row[1].source_type for row in rows],
         [row[1].topic_label or "" for row in rows],
         [row[1].language or "" for row in rows],
-        [_tags_for_chunk(row[1]) for row in rows],
+        [_tags_for_chunk(row[1], row[4]) for row in rows],
         [LOCAL_EMBEDDING_MODEL] * len(rows),
         [creation] * len(rows),
     ]
-    collection.insert(data, fields=fields)
+    collection.insert(data, fields=fields, timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
     return len(rows)
 
 
@@ -1318,6 +1485,7 @@ def _run_indexing_job(
         target_scan_persisted_counts: dict[str, int] = {}
         collections: dict[str, Collection] = {}
         seen_filehash_paths: dict[str, str] = {}
+        seen_source_paths: set[str] = set()
         with _lock:
             _state.active_step = "scan"
             _state.files_total = 0
@@ -1338,8 +1506,18 @@ def _run_indexing_job(
                         raise RuntimeError("Indexing stop requested by user.")
                     _state.current_path = target_path
                     _state.progress_line = f"Discovering files under {target_path}"
-                for read_path in _iter_target_file_paths(target_path, bool(target.get("recursive", True))):
+                exclude_roots = _target_exclude_roots(target, targets)
+                for read_path in _iter_target_file_paths(
+                    target_path,
+                    bool(target.get("recursive", True)),
+                    exclude_roots=exclude_roots,
+                ):
                     display_path = _to_host_display_path(read_path)
+                    source_path = _source_id_for_path(display_path)
+                    if source_path in seen_source_paths:
+                        _append_log(main_log_path, f"Skipped {display_path}: duplicate path from overlapping target")
+                        continue
+                    seen_source_paths.add(source_path)
                     discovered_files += 1
                     target_scan_counts[target["id"]] += 1
                     if target_scan_counts[target["id"]] - target_scan_persisted_counts[target["id"]] >= 25:
@@ -1356,6 +1534,16 @@ def _run_indexing_job(
                         _state.progress_current = _state.files_done
                         _state.progress_line = f"Scanning {display_path}"
                     chunks, reason = _parse_file_job(read_path, display_path)
+                    if reason == "routed:media":
+                        summary["files_indexed"] += 1
+                        summary.setdefault("files_routed_to_media", 0)
+                        summary["files_routed_to_media"] += 1
+                        _append_log(main_log_path, f"Routed to media pipeline: {display_path}")
+                        with _lock:
+                            _state.files_done += 1
+                            _state.progress_current = _state.files_done
+                        _write_summary(run_dir, summary)
+                        continue
                     if not chunks:
                         summary["files_skipped"] += 1
                         if reason:
@@ -1388,10 +1576,6 @@ def _run_indexing_job(
                             collection = _ensure_documents_collection(alias=alias, ip_address=ip_address)
                         else:
                             collection = _ensure_transcripts_collection(alias=alias, ip_address=ip_address)
-                        try:
-                            collection.load()
-                        except Exception:
-                            pass
                         collections[collection_name] = collection
 
                     state_token = f"{content_version}|{LOCAL_EMBEDDING_MODEL}|{filehash}"
@@ -1414,12 +1598,11 @@ def _run_indexing_job(
                         _state.progress_current = _state.chunks_done
                         _state.progress_line = f"Indexing {display_path}"
 
-                    for source_id in _source_id_candidates(display_path=display_path, read_path=read_path):
-                        delete_expr = f'source_id == "{_escape_expr(source_id)}"'
-                        try:
-                            collection.delete(delete_expr)
-                        except Exception:
-                            pass
+                    _delete_source_ids_if_loaded(
+                        collection,
+                        list(_source_id_candidates(display_path=display_path, read_path=read_path)),
+                        alias=alias,
+                    )
                     try:
                         inserted = _insert_chunks(
                             collection=collection,
@@ -1471,6 +1654,12 @@ def _run_indexing_job(
                 summary["status"] = "ok"
             _save_state(files_state)
         finally:
+            for collection_name, collection in collections.items():
+                try:
+                    collection.release()
+                    log.info("Released indexing collection %s", collection_name)
+                except Exception:
+                    pass
             try:
                 connections.disconnect(alias)
             except Exception:
@@ -1529,11 +1718,14 @@ def _run_indexing_job(
 
 def start_indexing(
     target_ids: list[str] | None = None,
-    embedding_host: str = "localhost",
-    embedding_port: int = 8000,
-    ip_address: str = "localhost",
+    embedding_host: str | None = None,
+    embedding_port: int | None = None,
+    ip_address: str | None = None,
 ) -> dict[str, Any]:
     _ensure_root()
+    resolved_embedding_host = embedding_host or _default_embedding_host()
+    resolved_embedding_port = int(embedding_port or _default_embedding_port())
+    resolved_ip_address = ip_address or _default_milvus_host()
     # Recover from stale lock state after crashes/restarts.
     _release_run_lock()
     config = _load_config()
@@ -1582,7 +1774,7 @@ def start_indexing(
 
     worker = threading.Thread(
         target=_run_indexing_job,
-        args=(run_id, run_dir, targets, embedding_host, int(embedding_port), ip_address),
+        args=(run_id, run_dir, targets, resolved_embedding_host, resolved_embedding_port, resolved_ip_address),
         daemon=True,
         name="indexing-runner",
     )
@@ -1592,7 +1784,12 @@ def start_indexing(
     return get_indexing_overview()
 
 
-def start_target_indexing(target_id: str, embedding_host: str = "localhost", embedding_port: int = 8000, ip_address: str = "localhost") -> dict[str, Any]:
+def start_target_indexing(
+    target_id: str,
+    embedding_host: str | None = None,
+    embedding_port: int | None = None,
+    ip_address: str | None = None,
+) -> dict[str, Any]:
     clean_id = str(target_id or "").strip()
     if not clean_id:
         raise ValueError("target_id is required")
@@ -1636,7 +1833,11 @@ def _schedule_worker() -> None:
                 due = slot <= now and (last_triggered_at is None or last_triggered_at < slot)
                 if due:
                     try:
-                        start_indexing()
+                        start_indexing(
+                            embedding_host=_default_embedding_host(),
+                            embedding_port=_default_embedding_port(),
+                            ip_address=_default_milvus_host(),
+                        )
                         with _lock:
                             _schedule.last_triggered_at = now
                             _save_schedule_state()
@@ -1644,6 +1845,644 @@ def _schedule_worker() -> None:
                         pass
         finally:
             _scheduler_stop.wait(30)
+
+
+# ── GitHub content indexing ──────────────────────────────────────────
+
+GITHUB_CONTENT_VERSION = "github_v1"
+GOOGLE_ARCHIVE_CONTENT_VERSION = "google_archive_v1"
+GOOGLE_ARCHIVE_FILE_MAP = {
+    "gmail": "gmail_messages.jsonl",
+    "calendar": "calendar_events.jsonl",
+    "drive": "drive_files.jsonl",
+    "chat": "chat_messages.jsonl",
+}
+GOOGLE_ARCHIVE_DOC_TYPES = {
+    "gmail": "gmail_message",
+    "calendar": "google_calendar_event",
+    "drive": "google_drive_file",
+    "chat": "google_chat_message",
+}
+GOOGLE_ARCHIVE_SOURCE_TYPES = {
+    "gmail": "google_gmail",
+    "calendar": "google_calendar",
+    "drive": "google_drive",
+    "chat": "google_chat",
+}
+
+
+def _jsonl_read_records(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    records.append(payload)
+    except OSError:
+        return []
+    return records
+
+
+def _google_archive_slug(value: str | None) -> str:
+    clean = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").strip().lower()).strip("-")
+    return clean or "unknown"
+
+
+def _google_archive_virtual_path(record: dict) -> str:
+    service = _google_archive_slug(record.get("service"))
+    account = _google_archive_slug(record.get("account"))
+    day = _google_archive_slug(record.get("day")) or "undated"
+    record_id = _google_archive_slug(record.get("id"))
+    return f"google/{service}/{account}/{day}/{record_id or 'record'}.txt"
+
+
+def _google_archive_source_id(record: dict) -> str:
+    service = _google_archive_slug(record.get("service"))
+    account = _google_archive_slug(record.get("account"))
+    record_id = _google_archive_slug(record.get("id"))
+    if not service or not record_id:
+        return ""
+    return f"google:{service}:{account}:{record_id}"
+
+
+def _google_archive_state_key(record: dict) -> str:
+    return f"google_archive:{_google_archive_source_id(record)}"
+
+
+def _google_archive_state_token(record: dict) -> str:
+    payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
+    digest = sha256(payload.encode("utf-8")).hexdigest()
+    return f"{GOOGLE_ARCHIVE_CONTENT_VERSION}|{LOCAL_EMBEDDING_MODEL}|{digest}"
+
+
+def _google_archive_extra_tags(record: dict) -> list[str]:
+    service = str(record.get("service") or "").strip().lower()
+    account = str(record.get("account") or "").strip()
+    account_slug = _google_archive_slug(account)
+    day = str(record.get("day") or "").strip()
+    tags = [
+        "integration:google",
+        f"service:{_google_archive_slug(service)}",
+        f"account:{account_slug}",
+    ]
+    if account:
+        tags.append(f"account_email:{_google_archive_slug(account)}")
+    if day:
+        tags.append(f"day:{_google_archive_slug(day)}")
+    if service == "gmail":
+        for label in list(record.get("labels") or [])[:8]:
+            tags.append(f"gmail_label:{_google_archive_slug(label)}")
+    elif service == "calendar":
+        calendar_id = str(record.get("calendar_id") or "").strip()
+        if calendar_id:
+            tags.append(f"calendar:{_google_archive_slug(calendar_id)}")
+        tags.append(f"all_day:{'true' if record.get('all_day') else 'false'}")
+    elif service == "drive":
+        mime_type = str(record.get("mime_type") or "").strip()
+        if mime_type:
+            tags.append(f"mime:{_google_archive_slug(mime_type)}")
+        for owner in list(record.get("owners") or [])[:3]:
+            tags.append(f"drive_owner:{_google_archive_slug(owner)}")
+        if record.get("starred"):
+            tags.append("starred:true")
+        if record.get("shared"):
+            tags.append("shared:true")
+    elif service == "chat":
+        space = str(record.get("space_display_name") or record.get("space_name") or "").strip()
+        sender = str(record.get("sender") or "").strip()
+        if space:
+            tags.append(f"chat_space:{_google_archive_slug(space)}")
+        if sender:
+            tags.append(f"chat_sender:{_google_archive_slug(sender)}")
+        space_type = str(record.get("space_type") or "").strip()
+        if space_type:
+            tags.append(f"space_type:{_google_archive_slug(space_type)}")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        clean = str(tag).strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        deduped.append(clean)
+    return deduped[:16]
+
+
+def _google_archive_record_text(record: dict) -> str:
+    service = str(record.get("service") or "").strip().lower()
+    parts: list[str] = []
+    if service == "gmail":
+        parts.extend(
+            [
+                f"Account: {record.get('account') or ''}",
+                f"Subject: {record.get('subject') or ''}",
+                f"From: {record.get('from') or ''}",
+                f"To: {record.get('to') or ''}",
+                f"Cc: {record.get('cc') or ''}",
+                f"Date: {record.get('date') or ''}",
+                f"Labels: {', '.join(record.get('labels') or [])}",
+                f"Snippet: {record.get('snippet') or ''}",
+                str(record.get("body") or "").strip(),
+            ]
+        )
+    elif service == "calendar":
+        attendees = ", ".join(record.get("attendees") or [])
+        parts.extend(
+            [
+                f"Account: {record.get('account') or ''}",
+                f"Calendar: {record.get('calendar_summary') or record.get('calendar_id') or ''}",
+                f"Summary: {record.get('summary') or ''}",
+                f"Status: {record.get('status') or ''}",
+                f"Start: {record.get('start') or ''}",
+                f"End: {record.get('end') or ''}",
+                f"Location: {record.get('location') or ''}",
+                f"Attendees: {attendees}",
+                str(record.get("description") or "").strip(),
+            ]
+        )
+    elif service == "drive":
+        owners = ", ".join(record.get("owners") or [])
+        parents = ", ".join(record.get("parent_ids") or [])
+        parts.extend(
+            [
+                f"Account: {record.get('account') or ''}",
+                f"Name: {record.get('name') or ''}",
+                f"Mime Type: {record.get('mime_type') or ''}",
+                f"Owners: {owners}",
+                f"Created: {record.get('created_time') or ''}",
+                f"Modified: {record.get('modified_time') or ''}",
+                f"Parent IDs: {parents}",
+                f"Description: {record.get('description') or ''}",
+                f"Shared: {record.get('shared') or False}",
+                f"Starred: {record.get('starred') or False}",
+                f"Size: {record.get('size') or ''}",
+            ]
+        )
+    elif service == "chat":
+        parts.extend(
+            [
+                f"Account: {record.get('account') or ''}",
+                f"Space: {record.get('space_display_name') or record.get('space_name') or ''}",
+                f"Space Type: {record.get('space_type') or ''}",
+                f"Sender: {record.get('sender') or ''}",
+                f"Created: {record.get('create_time') or ''}",
+                f"Thread: {record.get('thread_name') or ''}",
+                str(record.get("text") or "").strip(),
+            ]
+        )
+    return "\n".join(str(part).strip() for part in parts if str(part).strip()).strip()
+
+
+def _chunk_google_archive_record(record: dict) -> list[TranscriptChunk]:
+    source_id = _google_archive_source_id(record)
+    service = str(record.get("service") or "").strip().lower()
+    if not source_id or service not in GOOGLE_ARCHIVE_DOC_TYPES:
+        return []
+    full_text = _google_archive_record_text(record)
+    if len(full_text) < 40:
+        return []
+    path = _google_archive_virtual_path(record)
+    doc_type = GOOGLE_ARCHIVE_DOC_TYPES[service]
+    source_type = GOOGLE_ARCHIVE_SOURCE_TYPES[service]
+    tag_prefix = service
+    words = full_text.split()
+    max_words = 420
+    overlap_words = 70
+    if len(words) <= max_words:
+        return [
+            TranscriptChunk(
+                chunk_id=sha256(f"{source_id}|0".encode()).hexdigest()[:24],
+                source_id=source_id,
+                path=path,
+                text=full_text,
+                t_start_ms=0,
+                t_end_ms=0,
+                chunk_duration_s=0,
+                level=0,
+                parent_id=None,
+                doc_type=doc_type,
+                source_type=source_type,
+                topic_label=_google_archive_slug(record.get("account")),
+                language=None,
+                tag=f"{tag_prefix}_record",
+            )
+        ]
+    step = max(max_words - overlap_words, 1)
+    chunks: list[TranscriptChunk] = []
+    start = 0
+    index = 0
+    while start < len(words):
+        end = min(start + max_words, len(words))
+        piece = " ".join(words[start:end]).strip()
+        if piece:
+            chunks.append(
+                TranscriptChunk(
+                    chunk_id=sha256(f"{source_id}|{index}".encode()).hexdigest()[:24],
+                    source_id=source_id,
+                    path=path,
+                    text=piece,
+                    t_start_ms=0,
+                    t_end_ms=0,
+                    chunk_duration_s=0,
+                    level=0,
+                    parent_id=None,
+                    doc_type=doc_type,
+                    source_type=source_type,
+                    topic_label=_google_archive_slug(record.get("account")),
+                    language=None,
+                    tag=f"{tag_prefix}_record_p{index}",
+                )
+            )
+        index += 1
+        if end >= len(words):
+            break
+        start += step
+    return chunks
+
+
+def index_google_archive_content(
+    archive_root: str | Path,
+    *,
+    services: set[str] | None = None,
+    embedding_host: str | None = None,
+    embedding_port: int | None = None,
+    ip_address: str | None = None,
+) -> dict:
+    import logging
+
+    log = logging.getLogger(__name__)
+    root = Path(archive_root)
+    resolved_embedding_host = embedding_host or _default_embedding_host()
+    resolved_embedding_port = int(embedding_port or _default_embedding_port())
+    resolved_ip_address = ip_address or _default_milvus_host()
+    selected_services = {str(item).strip().lower() for item in (services or GOOGLE_ARCHIVE_FILE_MAP.keys()) if str(item).strip()}
+    summary: dict[str, Any] = {
+        "records_seen": 0,
+        "records_indexed": 0,
+        "chunks_inserted": 0,
+        "errors": [],
+        "by_service": {},
+    }
+    if not root.exists():
+        summary["errors"].append(f"archive root missing: {root}")
+        return summary
+
+    alias = _milvus_alias("google_archive_indexing")
+    collection = None
+    pending_entries: list[tuple[TranscriptChunk, str, list[str], str, str, str, int, str]] = []
+    files_state: dict[str, str] = {}
+
+    def _flush_pending() -> None:
+        nonlocal pending_entries, files_state
+        if not pending_entries:
+            return
+        source_ids = []
+        state_updates: list[tuple[str, str, str, int, str]] = []
+        service_chunk_totals: dict[str, int] = {}
+        for _, _, _, source_id, state_key, state_token, chunk_count, service in pending_entries:
+            source_ids.append(source_id)
+            state_updates.append((state_key, state_token, source_id, chunk_count, service))
+        _delete_source_ids_if_loaded(collection, source_ids, alias=alias)
+        try:
+            inserted = _insert_chunks(
+                collection=collection,
+                chunks=[entry[0] for entry in pending_entries],
+                filehash="google_archive_batch",
+                embedding_host=resolved_embedding_host,
+                embedding_port=resolved_embedding_port,
+                tag_builder=lambda chunk: next((entry[2] for entry in pending_entries if entry[0].chunk_id == chunk.chunk_id), []),
+            )
+            if inserted > 0:
+                for state_key, state_token, source_id, chunk_count, service in state_updates:
+                    files_state[state_key] = state_token
+                _save_state(files_state)
+                inserted_source_ids: set[str] = set()
+                for _, _, _, source_id, state_key, _, chunk_count, service in pending_entries:
+                    if source_id in inserted_source_ids:
+                        continue
+                    inserted_source_ids.add(source_id)
+                    summary["records_indexed"] += 1
+                    service_summary = summary["by_service"].setdefault(
+                        service,
+                        {"records_seen": 0, "records_indexed": 0, "chunks_inserted": 0},
+                    )
+                    service_summary["records_indexed"] += 1
+                    service_chunk_totals[service] = service_chunk_totals.get(service, 0) + chunk_count
+                for service, chunk_total in service_chunk_totals.items():
+                    summary["by_service"][service]["chunks_inserted"] += chunk_total
+                summary["chunks_inserted"] += inserted
+        except Exception as exc:
+            log.warning("Google archive batch indexing failed; retrying per record: %s", exc)
+            summary["errors"].append(f"google archive batch: {exc}")
+            by_source: dict[str, list[tuple[TranscriptChunk, str, list[str], str, str, str, int, str]]] = {}
+            for entry in pending_entries:
+                by_source.setdefault(entry[3], []).append(entry)
+            for source_id, source_entries in by_source.items():
+                state_key = source_entries[0][4]
+                state_token = source_entries[0][5]
+                chunk_count = source_entries[0][6]
+                service = source_entries[0][7]
+                try:
+                    inserted = _insert_chunks(
+                        collection=collection,
+                        chunks=[entry[0] for entry in source_entries],
+                        filehash="google_archive_record",
+                        embedding_host=resolved_embedding_host,
+                        embedding_port=resolved_embedding_port,
+                        tag_builder=lambda chunk, record_entries=source_entries: next((entry[2] for entry in record_entries if entry[0].chunk_id == chunk.chunk_id), []),
+                    )
+                    if inserted > 0:
+                        files_state[state_key] = state_token
+                        _save_state(files_state)
+                        summary["records_indexed"] += 1
+                        service_summary = summary["by_service"].setdefault(
+                            service,
+                            {"records_seen": 0, "records_indexed": 0, "chunks_inserted": 0},
+                        )
+                        service_summary["records_indexed"] += 1
+                        service_summary["chunks_inserted"] += inserted
+                        summary["chunks_inserted"] += inserted
+                except Exception as record_exc:
+                    summary["errors"].append(f"{source_id}: {record_exc}")
+                    log.warning("Failed to index Google archive record %s: %s", source_id, record_exc)
+        pending_entries = []
+
+    try:
+        collection = _ensure_documents_collection(alias=alias, ip_address=resolved_ip_address)
+        files_state = _load_state()
+        for account_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            for service, filename in GOOGLE_ARCHIVE_FILE_MAP.items():
+                if service not in selected_services:
+                    continue
+                service_summary = summary["by_service"].setdefault(
+                    service,
+                    {"records_seen": 0, "records_indexed": 0, "chunks_inserted": 0},
+                )
+                for record in _jsonl_read_records(account_dir / filename):
+                    record = dict(record)
+                    record.setdefault("service", service)
+                    source_id = _google_archive_source_id(record)
+                    state_key = _google_archive_state_key(record)
+                    state_token = _google_archive_state_token(record)
+                    summary["records_seen"] += 1
+                    service_summary["records_seen"] += 1
+                    if not source_id:
+                        continue
+                    if files_state.get(state_key) == state_token:
+                        continue
+                    chunks = _chunk_google_archive_record(record)
+                    if not chunks:
+                        files_state[state_key] = state_token
+                        continue
+                    filehash = sha256(f"{source_id}|{state_token}".encode("utf-8")).hexdigest()
+                    extra_tags = _google_archive_extra_tags(record)
+                    pending_entries.extend(
+                        (chunk, filehash, extra_tags, source_id, state_key, state_token, len(chunks), service)
+                        for chunk in chunks
+                    )
+                    if len(pending_entries) >= 96:
+                        _flush_pending()
+        _flush_pending()
+        _save_state(files_state)
+        log.info(
+            "Google archive indexing complete: %d seen, %d indexed, %d chunks",
+            summary["records_seen"],
+            summary["records_indexed"],
+            summary["chunks_inserted"],
+        )
+    except Exception as exc:
+        summary["errors"].append(f"Milvus connection/indexing failed: {exc}")
+        log.exception("Google archive indexing failed")
+    finally:
+        if collection is not None:
+            try:
+                collection.release()
+                log.info("Released Google archive indexing collection %s", DOCUMENTS_COLLECTION)
+            except Exception:
+                pass
+        try:
+            connections.disconnect(alias)
+        except Exception:
+            pass
+
+    return summary
+
+
+def _chunk_github_item(item: dict) -> list[TranscriptChunk]:
+    """Convert a single GitHub content record into TranscriptChunk objects."""
+    source_id = item.get("source_id", "")
+    doc_type = item.get("doc_type", "github_issue")
+    title = str(item.get("title") or "").strip()
+    body = str(item.get("body") or "").strip()
+    comments = item.get("comments") or []
+
+    # Assemble full text: title + body + comments
+    parts = []
+    if title:
+        parts.append(title)
+    if body:
+        parts.append(body)
+    for comment in comments:
+        c = str(comment).strip()
+        if c:
+            parts.append(c)
+
+    full_text = "\n\n".join(parts).strip()
+    if not full_text or len(full_text) < 40:
+        return []
+
+    # Build tags for metadata
+    repo = item.get("repo", "")
+    labels = item.get("labels") or []
+    state = item.get("state", "")
+    tag_parts = [f"repo:{repo}", f"state:{state}"]
+    for label in labels[:5]:
+        tag_parts.append(f"label:{label}")
+
+    # For short items (< ~500 words), keep as single chunk.
+    # For longer items, split into overlapping word windows.
+    words = full_text.split()
+    target_words = 320
+    max_words = 520
+    overlap_words = 80
+    chunks: list[TranscriptChunk] = []
+
+    if len(words) <= max_words:
+        # Single chunk
+        chunk_tag = f"github_{doc_type.replace('github_', '')}_{source_id.replace('/', '_').replace('#', '_')}"
+        chunks.append(
+            TranscriptChunk(
+                chunk_id=sha256(f"{source_id}|0|{chunk_tag}".encode()).hexdigest()[:24],
+                source_id=source_id,
+                path=f"github/{source_id}",
+                text=full_text,
+                t_start_ms=0,
+                t_end_ms=0,
+                chunk_duration_s=0,
+                level=0,
+                parent_id=None,
+                doc_type=doc_type,
+                source_type="github",
+                topic_label=None,
+                language=None,
+                tag=chunk_tag,
+            )
+        )
+    else:
+        # Split into word-window chunks
+        step = max(target_words - overlap_words, 1)
+        idx = 0
+        start = 0
+        while start < len(words):
+            end = min(start + max_words, len(words))
+            chunk_text = " ".join(words[start:end])
+            chunk_tag = f"github_{doc_type.replace('github_', '')}_{source_id.replace('/', '_').replace('#', '_')}_p{idx}"
+            chunks.append(
+                TranscriptChunk(
+                    chunk_id=sha256(f"{source_id}|{idx}|{chunk_tag}".encode()).hexdigest()[:24],
+                    source_id=source_id,
+                    path=f"github/{source_id}",
+                    text=chunk_text,
+                    t_start_ms=0,
+                    t_end_ms=0,
+                    chunk_duration_s=0,
+                    level=0,
+                    parent_id=None,
+                    doc_type=doc_type,
+                    source_type="github",
+                    topic_label=None,
+                    language=None,
+                    tag=chunk_tag,
+                )
+            )
+            idx += 1
+            if start + max_words >= len(words):
+                break
+            start += step
+
+    return chunks
+
+
+def index_github_content(
+    embedding_host: str | None = None,
+    embedding_port: int | None = None,
+    ip_address: str | None = None,
+) -> dict:
+    """Fetch GitHub content and index it into the documents vector store.
+
+    Returns a summary dict with counts of items processed and chunks inserted.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    resolved_embedding_host = embedding_host or _default_embedding_host()
+    resolved_embedding_port = int(embedding_port or _default_embedding_port())
+    resolved_ip_address = ip_address or _default_milvus_host()
+    summary: dict = {"items_fetched": 0, "items_indexed": 0, "chunks_inserted": 0, "errors": []}
+
+    try:
+        from github_service import fetch_github_content_for_indexing, GITHUB_TOKEN
+        if not GITHUB_TOKEN:
+            summary["errors"].append("GITHUB_TOKEN not set")
+            return summary
+    except ImportError as exc:
+        summary["errors"].append(f"github_service not available: {exc}")
+        return summary
+
+    try:
+        content = fetch_github_content_for_indexing()
+    except Exception as exc:
+        summary["errors"].append(f"Failed to fetch GitHub content: {exc}")
+        return summary
+
+    summary["items_fetched"] = len(content)
+    if not content:
+        return summary
+
+    # Connect to Milvus and ensure the documents collection exists.
+    alias = _milvus_alias("github_indexing")
+    collection = None
+    try:
+        collection = _ensure_documents_collection(alias=alias, ip_address=resolved_ip_address)
+
+        # Load state to check for already-indexed items.
+        files_state = _load_state()
+
+        consecutive_failures = 0
+        MAX_CONSECUTIVE_FAILURES = 5
+
+        for item in content:
+            source_id = item.get("source_id", "")
+            updated_at = item.get("updated_at", "")
+            state_token = f"{GITHUB_CONTENT_VERSION}|{LOCAL_EMBEDDING_MODEL}|{source_id}|{updated_at}"
+            state_key = f"github:{source_id}"
+
+            # Skip if already indexed with same version and update time.
+            if files_state.get(state_key) == state_token:
+                continue
+
+            chunks = _chunk_github_item(item)
+            if not chunks:
+                continue
+
+            # Delete existing chunks for this source_id before re-inserting.
+            _delete_source_ids_if_loaded(collection, [source_id], alias=alias)
+
+            filehash = sha256(f"{source_id}|{updated_at}".encode()).hexdigest()
+            try:
+                inserted = _insert_chunks(
+                    collection=collection,
+                    chunks=chunks,
+                    filehash=filehash,
+                    embedding_host=resolved_embedding_host,
+                    embedding_port=resolved_embedding_port,
+                )
+                if inserted > 0:
+                    summary["items_indexed"] += 1
+                    summary["chunks_inserted"] += inserted
+                    files_state[state_key] = state_token
+                    consecutive_failures = 0
+            except Exception as exc:
+                summary["errors"].append(f"{source_id}: {exc}")
+                log.warning("Failed to index GitHub item %s: %s", source_id, exc)
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    log.warning(
+                        "Aborting GitHub indexing after %d consecutive failures (last: %s)",
+                        consecutive_failures, exc,
+                    )
+                    break
+
+        _save_state(files_state)
+        log.info(
+            "GitHub indexing complete: %d items, %d indexed, %d chunks",
+            summary["items_fetched"], summary["items_indexed"], summary["chunks_inserted"],
+        )
+    except Exception as exc:
+        summary["errors"].append(f"Milvus connection/indexing failed: {exc}")
+        log.exception("GitHub content indexing failed")
+    finally:
+        if collection is not None:
+            try:
+                collection.release()
+                log.info("Released GitHub indexing collection %s", DOCUMENTS_COLLECTION)
+            except Exception:
+                pass
+        try:
+            connections.disconnect(alias)
+        except Exception:
+            pass
+
+    return summary
 
 
 def start_scheduler_best_effort() -> None:

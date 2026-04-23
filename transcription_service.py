@@ -1,11 +1,8 @@
-"""
-Transcription service for Archivist.
+"""Transcription service for Archivist.
 
-Brings faster-whisper transcription directly into the archivist process,
-replacing the need for a separate TranscribeServer container. Other services
-can POST audio files to /api/transcribe and get the same response format.
-
-GPU is used when available; falls back to CPU with a warning.
+Uses the existing external TranscribeServer as the primary backend and keeps
+local faster-whisper support available as a fallback and compatibility layer
+for Archivist's own `/api/transcribe` endpoint.
 """
 
 from __future__ import annotations
@@ -13,13 +10,16 @@ from __future__ import annotations
 import io
 import logging
 import os
+import subprocess
 import struct
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+import requests
 
 logger = logging.getLogger("archivist.transcription")
 
@@ -33,6 +33,11 @@ MAX_CONCURRENT = max(1, int(os.getenv("TRANSCRIBE_MAX_CONCURRENT", "1")))
 TARGET_PEAK = float(os.getenv("TRANSCRIBE_TARGET_PEAK", "0.10"))
 MAX_GAIN = float(os.getenv("TRANSCRIBE_MAX_GAIN", "15.0"))
 FALLBACK_NO_SPEECH_THRESHOLD = float(os.getenv("TRANSCRIBE_FALLBACK_NO_SPEECH_THRESHOLD", "0.30"))
+TRANSCRIBE_PROVIDER = (os.getenv("TRANSCRIBE_PROVIDER") or "remote_first").strip().lower()
+TRANSCRIBE_API_URL = (os.getenv("TRANSCRIBE_API_URL") or "http://host.docker.internal:8123").strip().rstrip("/")
+TRANSCRIBE_API_TIMEOUT_S = max(30, int(os.getenv("TRANSCRIBE_API_TIMEOUT_S", "1800")))
+PRELOAD_LOCAL_MODEL = (os.getenv("TRANSCRIBE_PRELOAD_LOCAL") or "false").strip().lower() in ("1", "true", "yes", "on")
+LOCAL_TRANSCRIBE_MODEL = (os.getenv("TRANSCRIBE_LOCAL_MODEL") or "").strip()
 
 # ── Module state ─────────────────────────────────────────────────────────
 
@@ -41,6 +46,12 @@ _model_lock = threading.Lock()
 _transcribe_lock = threading.Semaphore(MAX_CONCURRENT)
 _available = False
 _init_error: str | None = None
+_local_available = False
+_local_error: str | None = None
+_remote_available = False
+_remote_error: str | None = None
+_local_attempted = False
+_remote_attempted = False
 
 
 def is_available() -> bool:
@@ -48,12 +59,30 @@ def is_available() -> bool:
 
 
 def get_status() -> dict:
+    device = "not_loaded"
+    if _local_available:
+        device = "cuda" if _has_cuda() else "cpu"
+    elif _remote_available:
+        device = "remote"
     return {
         "available": _available,
+        "provider": TRANSCRIBE_PROVIDER,
+        "remote_url": TRANSCRIBE_API_URL,
         "model": TRANSCRIBE_MODEL,
+        "local_model": _resolve_local_model_name(TRANSCRIBE_MODEL),
         "compute_type": COMPUTE_TYPE,
         "beam_size": BEAM_SIZE,
-        "device": "cuda" if _available and _has_cuda() else "cpu" if _available else "not_loaded",
+        "device": device,
+        "backends": {
+            "remote": {
+                "available": _remote_available,
+                "error": _remote_error,
+            },
+            "local": {
+                "available": _local_available,
+                "error": _local_error,
+            },
+        },
         "error": _init_error,
     }
 
@@ -66,19 +95,91 @@ def _has_cuda() -> bool:
         return False
 
 
-def init_transcription_model():
-    """Load the faster-whisper model. Call at app startup."""
-    global _model, _available, _init_error
+def _refresh_availability():
+    global _available, _init_error
+    _available = _remote_available or _local_available
+    if _available:
+        _init_error = None
+        return
+    errors = []
+    if _remote_error:
+        errors.append(f"remote: {_remote_error}")
+    if _local_error:
+        errors.append(f"local: {_local_error}")
+    _init_error = "; ".join(errors) if errors else "no transcription backend available"
+
+
+def _provider_allows_remote() -> bool:
+    return TRANSCRIBE_PROVIDER in {"remote_only", "remote_first", "local_first"}
+
+
+def _provider_allows_local() -> bool:
+    return TRANSCRIBE_PROVIDER in {"local_only", "local_first", "remote_first"}
+
+
+def _probe_remote_service(force: bool = False) -> bool:
+    global _remote_available, _remote_error, _remote_attempted
+    if _remote_attempted and not force:
+        return _remote_available
+    _remote_attempted = True
+    if not _provider_allows_remote():
+        _remote_available = False
+        _remote_error = "disabled by provider"
+        _refresh_availability()
+        return False
+    try:
+        response = requests.get(
+            f"{TRANSCRIBE_API_URL}/openapi.json",
+            timeout=(5, 10),
+        )
+        response.raise_for_status()
+        _remote_available = True
+        _remote_error = None
+    except Exception as exc:
+        _remote_available = False
+        _remote_error = str(exc)
+    _refresh_availability()
+    return _remote_available
+
+
+def _resolve_local_model_name(requested_model: str) -> str:
+    if LOCAL_TRANSCRIBE_MODEL:
+        return LOCAL_TRANSCRIBE_MODEL
+    normalized = (requested_model or "").strip()
+    if not normalized:
+        return "large-v3"
+    alias_map = {
+        "turbo": "large-v3",
+        "whisper-1": "large-v3",
+    }
+    return alias_map.get(normalized, normalized)
+
+
+def _init_local_model():
+    """Load the local faster-whisper model when local fallback is needed."""
+    global _model, _local_available, _local_error, _local_attempted
     with _model_lock:
         if _model is not None:
+            _local_available = True
+            _local_error = None
+            _refresh_availability()
             return
+        if not _provider_allows_local():
+            _local_available = False
+            _local_error = "disabled by provider"
+            _refresh_availability()
+            return
+        _local_attempted = True
         try:
             from faster_whisper import WhisperModel
         except ImportError:
-            _init_error = "faster-whisper not installed"
-            logger.warning("Transcription unavailable: faster-whisper not installed")
+            _local_available = False
+            _local_error = "faster-whisper not installed"
+            logger.warning("Local transcription unavailable: faster-whisper not installed")
+            _refresh_availability()
             return
 
+        local_model = _resolve_local_model_name(TRANSCRIBE_MODEL)
         device = "cpu"
         compute = "int8"
         device_index = 0
@@ -89,22 +190,41 @@ def init_transcription_model():
             device = "cuda"
             compute = COMPUTE_TYPE
             device_index = GPU_INDEX
-            logger.info("Loading Whisper model '%s' on cuda:%d (compute=%s)", TRANSCRIBE_MODEL, GPU_INDEX, compute)
+            logger.info("Loading Whisper model '%s' on cuda:%d (compute=%s)", local_model, GPU_INDEX, compute)
         else:
-            logger.info("CUDA not available, loading Whisper model '%s' on CPU (compute=int8)", TRANSCRIBE_MODEL)
+            logger.info("CUDA not available, loading Whisper model '%s' on CPU (compute=int8)", local_model)
+
+        if local_model != TRANSCRIBE_MODEL:
+            logger.info(
+                "Using local fallback model '%s' for remote model alias '%s'",
+                local_model,
+                TRANSCRIBE_MODEL,
+            )
 
         try:
             _model = WhisperModel(
-                TRANSCRIBE_MODEL,
+                local_model,
                 device=device,
                 device_index=device_index,
                 compute_type=compute,
             )
-            _available = True
-            logger.info("Transcription model loaded successfully")
+            _local_available = True
+            _local_error = None
+            logger.info("Local transcription model loaded successfully")
         except Exception as exc:
-            _init_error = str(exc)
-            logger.error("Failed to load transcription model: %s", exc)
+            _local_available = False
+            _local_error = str(exc)
+            logger.error("Failed to load local transcription model: %s", exc)
+        _refresh_availability()
+
+
+def init_transcription_model():
+    """Initialize remote and/or local transcription backends."""
+    if _provider_allows_remote():
+        _probe_remote_service(force=True)
+    if (_provider_allows_local() and PRELOAD_LOCAL_MODEL) or (_provider_allows_local() and not _remote_available):
+        _init_local_model()
+    _refresh_availability()
 
 
 # ── Audio helpers ────────────────────────────────────────────────────────
@@ -297,7 +417,7 @@ def _try_with_vad_fallback(audio, pipeline, extra, initial_prompt, no_speech_thr
 
 # ── Public API ───────────────────────────────────────────────────────────
 
-def transcribe_audio_bytes(
+def _transcribe_audio_bytes_local(
     data: bytes,
     content_type: str = "",
     filename: str = "",
@@ -307,14 +427,9 @@ def transcribe_audio_bytes(
     allow_fallback: bool = True,
     word_timestamps: bool = False,
 ) -> Tuple[str, dict, list]:
-    """
-    Transcribe audio data. Returns (transcription_text, metadata, segments).
-
-    This is the main entry point - matches the TranscribeServer API contract.
-    Thread-safe via semaphore to prevent GPU thrashing.
-    """
-    if not _available or _model is None:
-        raise RuntimeError("Transcription service not available")
+    """Transcribe audio bytes with the local faster-whisper model."""
+    if _model is None:
+        raise RuntimeError("Local transcription model not loaded")
 
     ctype = (content_type or "").lower()
     fname = (filename or "").lower()
@@ -389,6 +504,300 @@ def transcribe_audio_bytes(
         return transcription, meta, segments
 
 
+def _remote_request_params(
+    *,
+    initial_prompt: Optional[str],
+    no_speech_threshold: Optional[float],
+    vad_filter: bool,
+    allow_fallback: bool,
+    word_timestamps: bool,
+) -> dict:
+    params = {
+        "detailed": "true",
+        "vad_filter": "true" if vad_filter else "false",
+        "allow_fallback": "true" if allow_fallback else "false",
+        "word_timestamps": "true" if word_timestamps else "false",
+    }
+    if initial_prompt:
+        params["initial_prompt"] = initial_prompt
+    if no_speech_threshold is not None:
+        params["no_speech_threshold"] = str(no_speech_threshold)
+    return params
+
+
+def _parse_remote_response(payload: dict) -> Tuple[str, dict, list]:
+    return (
+        payload.get("transcription", "") or "",
+        {
+            "pipeline": payload.get("pipeline", "remote_api"),
+            "lang": payload.get("language", "en"),
+            "lang_p": payload.get("language_probability", 0.0),
+            "audio_seconds": payload.get("audio_seconds", 0.0),
+            "ffmpeg": payload.get("ffmpeg_used", False),
+            "fallback": payload.get("fallback_used", False),
+            "audio_stats": payload.get("audio_stats"),
+            "process_time": payload.get("timing", {}).get("total", 0.0),
+            "provider": "remote",
+            "remote_url": TRANSCRIBE_API_URL,
+        },
+        payload.get("segments", []) or [],
+    )
+
+
+def _remote_transcribe_file(
+    file_path: str,
+    *,
+    upload_name: str,
+    content_type: str,
+    initial_prompt: Optional[str],
+    no_speech_threshold: Optional[float],
+    vad_filter: bool,
+    allow_fallback: bool,
+    word_timestamps: bool,
+) -> Tuple[str, dict, list]:
+    params = _remote_request_params(
+        initial_prompt=initial_prompt,
+        no_speech_threshold=no_speech_threshold,
+        vad_filter=vad_filter,
+        allow_fallback=allow_fallback,
+        word_timestamps=word_timestamps,
+    )
+    with open(file_path, "rb") as fh:
+        response = requests.post(
+            f"{TRANSCRIBE_API_URL}/",
+            params=params,
+            files={"file": (upload_name, fh, content_type)},
+            timeout=(30, TRANSCRIBE_API_TIMEOUT_S),
+        )
+    response.raise_for_status()
+    return _parse_remote_response(response.json())
+
+
+def _remote_transcribe_audio_bytes(
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+    initial_prompt: Optional[str],
+    no_speech_threshold: Optional[float],
+    vad_filter: bool,
+    allow_fallback: bool,
+    word_timestamps: bool,
+) -> Tuple[str, dict, list]:
+    suffix = Path(filename or "audio.bin").suffix or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        return _remote_transcribe_file(
+            tmp_path,
+            upload_name=filename or Path(tmp_path).name,
+            content_type=content_type or "application/octet-stream",
+            initial_prompt=initial_prompt,
+            no_speech_threshold=no_speech_threshold,
+            vad_filter=vad_filter,
+            allow_fallback=allow_fallback,
+            word_timestamps=word_timestamps,
+        )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _extract_media_audio_to_wav(path: str) -> str:
+    """Extract the first audio stream from a media file as 16 kHz mono WAV."""
+    src = Path(path)
+    if not src.exists():
+        raise FileNotFoundError(f"Media file not found: {path}")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        out_path = tmp.name
+
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(src),
+            "-vn", "-sn", "-dn",
+            "-map", "0:a:0?",
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            out_path,
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=max(300, int(src.stat().st_size / (5 * 1024 * 1024))),
+        )
+        if result.returncode != 0 or not Path(out_path).exists() or Path(out_path).stat().st_size == 0:
+            err = (result.stderr or b"").decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"ffmpeg audio extraction failed: {err[:400]}")
+        return out_path
+    except Exception:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise
+
+
+def _select_backend() -> str:
+    if TRANSCRIBE_PROVIDER == "remote_only":
+        if not _remote_available:
+            _probe_remote_service(force=True)
+        if _remote_available:
+            return "remote"
+        raise RuntimeError(_remote_error or "Remote transcription backend unavailable")
+
+    if TRANSCRIBE_PROVIDER == "local_only":
+        if not _local_available:
+            _init_local_model()
+        if _local_available:
+            return "local"
+        raise RuntimeError(_local_error or "Local transcription backend unavailable")
+
+    if TRANSCRIBE_PROVIDER == "local_first":
+        if not _local_available:
+            _init_local_model()
+        if _local_available:
+            return "local"
+        if _provider_allows_remote() and (_remote_available or _probe_remote_service(force=True)):
+            return "remote"
+        raise RuntimeError(_local_error or _remote_error or "No transcription backend available")
+
+    if _provider_allows_remote() and (_remote_available or _probe_remote_service(force=True)):
+        return "remote"
+    if _provider_allows_local():
+        _init_local_model()
+        if _local_available:
+            return "local"
+    raise RuntimeError(_remote_error or _local_error or "No transcription backend available")
+
+
+def transcribe_audio_bytes(
+    data: bytes,
+    content_type: str = "",
+    filename: str = "",
+    initial_prompt: Optional[str] = None,
+    no_speech_threshold: Optional[float] = None,
+    vad_filter: bool = True,
+    allow_fallback: bool = True,
+    word_timestamps: bool = False,
+) -> Tuple[str, dict, list]:
+    """Transcribe uploaded audio bytes using the configured backend."""
+    if not _available:
+        init_transcription_model()
+    try:
+        backend = _select_backend()
+    except RuntimeError as exc:
+        raise RuntimeError(f"Transcription service not available: {exc}") from exc
+    if backend == "remote":
+        try:
+            return _remote_transcribe_audio_bytes(
+                data,
+                filename=filename,
+                content_type=content_type,
+                initial_prompt=initial_prompt,
+                no_speech_threshold=no_speech_threshold,
+                vad_filter=vad_filter,
+                allow_fallback=allow_fallback,
+                word_timestamps=word_timestamps,
+            )
+        except Exception as exc:
+            logger.warning("Remote transcription failed: %s", exc)
+            if TRANSCRIBE_PROVIDER == "remote_first" and _provider_allows_local():
+                _init_local_model()
+                if _local_available:
+                    return _transcribe_audio_bytes_local(
+                        data,
+                        content_type=content_type,
+                        filename=filename,
+                        initial_prompt=initial_prompt,
+                        no_speech_threshold=no_speech_threshold,
+                        vad_filter=vad_filter,
+                        allow_fallback=allow_fallback,
+                        word_timestamps=word_timestamps,
+                    )
+            raise
+    return _transcribe_audio_bytes_local(
+        data,
+        content_type=content_type,
+        filename=filename,
+        initial_prompt=initial_prompt,
+        no_speech_threshold=no_speech_threshold,
+        vad_filter=vad_filter,
+        allow_fallback=allow_fallback,
+        word_timestamps=word_timestamps,
+    )
+
+
+def transcribe_media_file(
+    path: str,
+    filename: str = "",
+    initial_prompt: Optional[str] = None,
+    no_speech_threshold: Optional[float] = None,
+    vad_filter: bool = True,
+    allow_fallback: bool = True,
+    word_timestamps: bool = True,
+) -> Tuple[str, dict, list]:
+    """Transcribe a media file by extracting audio first instead of reading the whole file."""
+    if not _available:
+        init_transcription_model()
+    try:
+        backend = _select_backend()
+    except RuntimeError as exc:
+        raise RuntimeError(f"Transcription service not available: {exc}") from exc
+    wav_path = _extract_media_audio_to_wav(path)
+    try:
+        if backend == "remote":
+            try:
+                return _remote_transcribe_file(
+                    wav_path,
+                    upload_name=(filename or Path(path).stem) + ".wav",
+                    content_type="audio/wav",
+                    initial_prompt=initial_prompt,
+                    no_speech_threshold=no_speech_threshold,
+                    vad_filter=vad_filter,
+                    allow_fallback=allow_fallback,
+                    word_timestamps=word_timestamps,
+                )
+            except Exception as exc:
+                logger.warning("Remote media transcription failed: %s", exc)
+                if TRANSCRIBE_PROVIDER == "remote_first" and _provider_allows_local():
+                    _init_local_model()
+                    if _local_available:
+                        data = Path(wav_path).read_bytes()
+                        return _transcribe_audio_bytes_local(
+                            data,
+                            content_type="audio/wav",
+                            filename=(filename or Path(path).stem) + ".wav",
+                            initial_prompt=initial_prompt,
+                            no_speech_threshold=no_speech_threshold,
+                            vad_filter=vad_filter,
+                            allow_fallback=allow_fallback,
+                            word_timestamps=word_timestamps,
+                        )
+                raise
+        data = Path(wav_path).read_bytes()
+        return _transcribe_audio_bytes_local(
+            data,
+            content_type="audio/wav",
+            filename=(filename or Path(path).stem) + ".wav",
+            initial_prompt=initial_prompt,
+            no_speech_threshold=no_speech_threshold,
+            vad_filter=vad_filter,
+            allow_fallback=allow_fallback,
+            word_timestamps=word_timestamps,
+        )
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+
+
 def build_transcribe_response(transcription: str, meta: dict, segments: list, detailed: bool = False, word_timestamps: bool = False) -> dict:
     """Build the JSON response matching TranscribeServer's format."""
     if not detailed and not word_timestamps:
@@ -401,7 +810,7 @@ def build_transcribe_response(transcription: str, meta: dict, segments: list, de
         "audio_seconds": meta.get("audio_seconds", 0.0),
         "pipeline": meta.get("pipeline", "unknown"),
         "ffmpeg_used": meta.get("ffmpeg", False),
-        "vad_filter": True,
+        "vad_filter": meta.get("vad_filter", True),
         "fallback_used": bool(meta.get("fallback", False)),
         "audio_stats": meta.get("audio_stats"),
         "timing": {
@@ -412,6 +821,19 @@ def build_transcribe_response(transcription: str, meta: dict, segments: list, de
 
     segments_out = []
     for seg in segments:
+        if isinstance(seg, dict):
+            seg_obj = {
+                "id": seg.get("id"),
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "text": seg.get("text", ""),
+                "avg_logprob": seg.get("avg_logprob"),
+                "no_speech_prob": seg.get("no_speech_prob"),
+            }
+            if word_timestamps and seg.get("words") is not None:
+                seg_obj["words"] = seg.get("words")
+            segments_out.append(seg_obj)
+            continue
         seg_obj = {
             "id": getattr(seg, "id", None),
             "start": seg.start,

@@ -10,7 +10,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-client rsync \
+    && apt-get install -y --no-install-recommends git openssh-client rsync ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -22,4 +22,4 @@ COPY --from=ui /ui/dist ./ui/dist
 
 EXPOSE 5050
 ENV NAME Archivist
-CMD ["gunicorn", "-w", "1", "--threads", "8", "-b", "0.0.0.0:5050", "main:app"]
+CMD ["gunicorn", "-w", "1", "--threads", "64", "--timeout", "3600", "-b", "0.0.0.0:5050", "main:app"]

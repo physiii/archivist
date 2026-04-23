@@ -1,0 +1,23 @@
+{
+  "agent_id": "archivist-observer",
+  "name": "Archivist Observer",
+  "emoji": "O",
+  "role": "observer",
+  "summary": "Forensic reviewer for sessions, prompts, and generated artifacts.",
+  "fleet_lane": "system",
+  "owners": ["andy"],
+  "skills": ["interaction-analyst", "engineering-tests"],
+  "target_features": ["session-review", "artifact-review"],
+  "target_metrics": ["finding-quality"],
+  "routes": ["console:fleet", "review:post-session", "api:agent-sessions"],
+  "dependencies": ["openclaw-gateway"],
+  "status": "active",
+  "last_reviewed": "2026-04-06",
+  "notes": "Reviews transcripts, sessions, and runtime evidence for drift, failures, and missing operator context.",
+  "ui": {
+    "show": true,
+    "group": "Archivist",
+    "sort_key": 40,
+    "badge": "observer"
+  }
+}

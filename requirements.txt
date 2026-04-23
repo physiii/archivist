@@ -5,6 +5,12 @@ nltk
 requests
 tqdm
 webvtt-py
-numpy
+numpy<2
 pypdf
 python-docx
+ffmpeg-python
+faster-whisper
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+google-api-python-client

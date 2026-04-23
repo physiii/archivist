@@ -575,13 +575,13 @@ export default function Embeddings3D({
 
   return (
     <>
-      <div className="toolbar" style={{ marginBottom: 8 }}>
+      <div className="embed-3d-toolbar">
         <button onClick={() => setView("default")}>Default view</button>
         <button onClick={() => setView("top")}>Top view</button>
         <button onClick={() => setView("side")}>Side view</button>
         <button onClick={() => setView("front")}>Front view</button>
         <button onClick={() => void toggleFullscreen()}>{isFullscreen ? "Exit full screen" : "Full screen"}</button>
-        <label className="muted" style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+        <label className="embed-3d-size-control muted">
           Point size
           <input
             type="range"
@@ -598,23 +598,15 @@ export default function Embeddings3D({
         Legend: red marks the closest region to the query and the gradient shifts through yellow, green, blue, and violet as
         points get farther away. Drag to rotate, scroll to zoom, click points to inspect details.
       </p>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          marginBottom: 8,
-          flexWrap: "wrap"
-        }}
-      >
+      <div className="embed-3d-legend">
         <span className="muted" style={{ fontSize: "0.85rem" }}>
           Closest
         </span>
         <div
+          className="embed-3d-legend-bar"
           aria-label="Distance color bar"
           title="Red is closest to the query; violet is farthest."
           style={{
-            width: 220,
             height: 10,
             borderRadius: 999,
             border: "1px solid rgba(255,255,255,0.16)",

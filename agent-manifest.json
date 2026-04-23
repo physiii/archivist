@@ -1,0 +1,19 @@
+{
+  "agent_id": "archivist",
+  "name": "Archivist",
+  "emoji": "A",
+  "role": "archive-operator",
+  "summary": "Collections, backups, indexing, media evidence, and OpenClaw-backed operator workflows.",
+  "owners": ["andy"],
+  "skills": ["agent-console", "agent-builder", "engineering-code", "verification-gate"],
+  "target_features": ["collections", "backup", "indexing", "media", "console"],
+  "target_metrics": ["gateway-health", "session-count", "backup-failures", "media-job-latency"],
+  "dependencies": ["openclaw-gateway", "milvus", "embed-gateway", "transcription-service"],
+  "status": "active",
+  "last_reviewed": "2026-04-06",
+  "ui": {
+    "group": "Archivist",
+    "sort_key": 1,
+    "badge": "workspace"
+  }
+}

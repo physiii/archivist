@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-import webvtt
+try:
+    import webvtt
+except Exception:  # pragma: no cover
+    webvtt = None  # type: ignore
 try:
     import srt
 except Exception:  # pragma: no cover
@@ -59,7 +62,31 @@ def _clean_text(value: str) -> str:
     return cleaned
 
 
+def _parse_vtt_fallback(content: str) -> list[Cue]:
+    blocks = re.split(r"\n\s*\n", content.replace("\r\n", "\n"))
+    cues: list[Cue] = []
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines or lines[0].upper() == "WEBVTT":
+            continue
+        time_line_idx = next((idx for idx, line in enumerate(lines) if "-->" in line), -1)
+        if time_line_idx < 0:
+            continue
+        start_raw, end_raw = [part.strip() for part in lines[time_line_idx].split("-->", 1)]
+        end_raw = end_raw.split()[0] if end_raw else end_raw
+        start_ms = _parse_timecode_ms(start_raw)
+        end_ms = _parse_timecode_ms(end_raw)
+        text = _clean_text(" ".join(lines[time_line_idx + 1 :]))
+        if start_ms is None or end_ms is None or end_ms <= start_ms or not text:
+            continue
+        cues.append(Cue(start_ms=start_ms, end_ms=end_ms, text=text))
+    return cues
+
+
 def parse_vtt(path: Path) -> list[Cue]:
+    if webvtt is None:
+        return _parse_vtt_fallback(path.read_text(encoding="utf-8", errors="replace"))
+
     cues: list[Cue] = []
     for caption in webvtt.read(str(path)):
         start_ms = _parse_timecode_ms(caption.start)

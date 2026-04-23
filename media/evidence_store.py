@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Optional
@@ -23,6 +25,51 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".wma", ".aac", 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts", ".m4v"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".svg"}
 ALL_MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS | IMAGE_EXTS
+
+_RECORDED_AT_FILENAME_PATTERNS = (
+    re.compile(
+        r"(?P<year>20\d{2})[-_](?P<month>\d{2})[-_](?P<day>\d{2})"
+        r"(?:[T _-](?P<hour>\d{2})[-:](?P<minute>\d{2})(?:[-:](?P<second>\d{2}))?)?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?P<year>20\d{2})(?P<month>\d{2})(?P<day>\d{2})"
+        r"(?:[T _-]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})?)?",
+        re.IGNORECASE,
+    ),
+)
+
+
+def infer_recorded_at_from_path(path: str | Path) -> Optional[str]:
+    text = str(path or "").strip()
+    if not text:
+        return None
+    filename = Path(text).name
+    for pattern in _RECORDED_AT_FILENAME_PATTERNS:
+        match = pattern.search(filename)
+        if not match:
+            continue
+        try:
+            year = int(match.group("year"))
+            month = int(match.group("month"))
+            day = int(match.group("day"))
+            hour = int(match.group("hour") or 0)
+            minute = int(match.group("minute") or 0)
+            second = int(match.group("second") or 0)
+            return datetime(year, month, day, hour, minute, second).isoformat()
+        except Exception:
+            continue
+    return None
+
+
+def infer_recorded_day_from_path(path: str | Path) -> Optional[str]:
+    recorded_at = infer_recorded_at_from_path(path)
+    if not recorded_at:
+        return None
+    try:
+        return datetime.fromisoformat(recorded_at).date().isoformat()
+    except Exception:
+        return recorded_at[:10] if len(recorded_at) >= 10 else None
 
 
 def _compute_file_hash(path: str) -> str:
@@ -62,6 +109,9 @@ def _normalize_assets_index(index: dict) -> tuple[dict, bool]:
     for media_id, data in sorted_items:
         path = str(data.get("path") or "")
         file_hash = str(data.get("file_hash") or "")
+        if path and not Path(path).exists():
+            changed = True
+            continue
         if (path and path in seen_paths) or (file_hash and file_hash in seen_hashes):
             changed = True
             continue
@@ -162,6 +212,14 @@ def register_asset(path: str, metadata: Optional[dict] = None) -> MediaAsset:
     modality = _detect_modality(path)
     probe_info = _probe_media(path) if modality in (Modality.AUDIO, Modality.VIDEO) else {}
 
+    merged_metadata = dict(metadata or {})
+    inferred_recorded_at = infer_recorded_at_from_path(resolved_path)
+    inferred_recorded_day = infer_recorded_day_from_path(resolved_path)
+    if inferred_recorded_at and not str(merged_metadata.get("recorded_at") or "").strip():
+        merged_metadata["recorded_at"] = inferred_recorded_at
+    if inferred_recorded_day and not str(merged_metadata.get("recorded_day") or "").strip():
+        merged_metadata["recorded_day"] = inferred_recorded_day
+
     asset = MediaAsset(
         media_id=existing_media_id or MediaAsset().media_id,
         path=resolved_path,
@@ -176,7 +234,7 @@ def register_asset(path: str, metadata: Optional[dict] = None) -> MediaAsset:
         codec=probe_info.get("codec", ""),
         created_at=file_path.stat().st_mtime,
         indexed_at=time.time(),
-        metadata=metadata or {},
+        metadata=merged_metadata,
     )
     asset.file_hash = existing_file_hash or asset.compute_hash()
 
@@ -264,7 +322,17 @@ def save_artifact(artifact: DerivedArtifact):
         except (json.JSONDecodeError, OSError):
             bundle = {"media_id": artifact.media_id, "artifacts": []}
 
-    artifact_payload = {
+    artifact_payload = _artifact_payload(artifact)
+    artifacts = [a for a in bundle.get("artifacts", []) if a.get("artifact_id") != artifact.artifact_id]
+    artifacts.append(artifact_payload)
+    artifacts.sort(key=lambda a: (a.get("start_s", 0.0), a.get("end_s", 0.0), a.get("kind", "")))
+    bundle["media_id"] = artifact.media_id
+    bundle["artifacts"] = artifacts
+    bundle_file.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+
+
+def _artifact_payload(artifact: DerivedArtifact) -> dict:
+    return {
         "artifact_id": artifact.artifact_id,
         "media_id": artifact.media_id,
         "kind": artifact.kind,
@@ -275,38 +343,59 @@ def save_artifact(artifact: DerivedArtifact):
         "metadata": artifact.metadata,
         "source_refs": artifact.source_refs,
     }
-    artifacts = [a for a in bundle.get("artifacts", []) if a.get("artifact_id") != artifact.artifact_id]
-    artifacts.append(artifact_payload)
-    artifacts.sort(key=lambda a: (a.get("start_s", 0.0), a.get("end_s", 0.0), a.get("kind", "")))
-    bundle["media_id"] = artifact.media_id
-    bundle["artifacts"] = artifacts
-    bundle_file.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
 
 
-def get_artifacts(media_id: str, kind: Optional[str] = None) -> list[DerivedArtifact]:
-    """Get all artifacts for a media asset, optionally filtered by kind."""
+def save_artifact_bundle(media_id: str, artifacts: list[DerivedArtifact], bundle_metadata: Optional[dict] = None):
+    """Persist a full per-media artifact bundle for technical trace inspection."""
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    bundle_file = ARTIFACTS_DIR / f"{media_id}.json"
+    metadata = bundle_metadata or {}
+    payload = {
+        "media_id": media_id,
+        "bundle_metadata": metadata,
+        "archivist_pipeline": metadata.get("archivist_pipeline", {}),
+        "artifacts": sorted(
+            [_artifact_payload(artifact) for artifact in artifacts],
+            key=lambda a: (a.get("start_s", 0.0), a.get("end_s", 0.0), a.get("kind", "")),
+        ),
+    }
+    bundle_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _deserialize_artifacts(artifacts_data: list[dict], kind: Optional[str] = None) -> list[DerivedArtifact]:
+    artifacts = []
+    for data in artifacts_data:
+        if kind and data.get("kind") != kind:
+            continue
+        artifacts.append(DerivedArtifact(
+            artifact_id=data["artifact_id"],
+            media_id=data["media_id"],
+            kind=data.get("kind", ""),
+            start_s=data.get("start_s", 0.0),
+            end_s=data.get("end_s", 0.0),
+            content=data.get("content", ""),
+            confidence=data.get("confidence", 1.0),
+            metadata=data.get("metadata", {}),
+            source_refs=data.get("source_refs", []),
+        ))
+    return sorted(artifacts, key=lambda a: (a.start_s, a.end_s, a.kind))
+
+
+def get_artifacts(media_id: str, kind: Optional[str] = None, scope: str = "public") -> list[DerivedArtifact]:
+    """Get artifacts for a media asset.
+
+    `scope="public"` returns the clean artifact package from the canonical pipeline
+    result. `scope="trace"` returns the low-level technical trace bundle.
+    """
+    normalized_scope = (scope or "public").strip().lower()
     result_file = PIPELINE_RESULTS_DIR / f"{media_id}.json"
-    if result_file.exists():
+
+    if normalized_scope != "trace" and result_file.exists():
         try:
             payload = json.loads(result_file.read_text(encoding="utf-8"))
             artifacts_data = payload.get("artifacts", [])
             if artifacts_data:
-                artifacts = []
-                for data in artifacts_data:
-                    if kind and data.get("kind") != kind:
-                        continue
-                    artifacts.append(DerivedArtifact(
-                        artifact_id=data["artifact_id"],
-                        media_id=data["media_id"],
-                        kind=data.get("kind", ""),
-                        start_s=data.get("start_s", 0.0),
-                        end_s=data.get("end_s", 0.0),
-                        content=data.get("content", ""),
-                        confidence=data.get("confidence", 1.0),
-                        metadata=data.get("metadata", {}),
-                        source_refs=data.get("source_refs", []),
-                    ))
-                return sorted(artifacts, key=lambda a: (a.start_s, a.end_s, a.kind))
+                return _deserialize_artifacts(artifacts_data, kind=kind)
         except (json.JSONDecodeError, OSError, KeyError):
             pass
 
@@ -314,22 +403,16 @@ def get_artifacts(media_id: str, kind: Optional[str] = None) -> list[DerivedArti
     if bundle_file.exists():
         try:
             payload = json.loads(bundle_file.read_text(encoding="utf-8"))
-            artifacts = []
-            for data in payload.get("artifacts", []):
-                if kind and data.get("kind") != kind:
-                    continue
-                artifacts.append(DerivedArtifact(
-                    artifact_id=data["artifact_id"],
-                    media_id=data["media_id"],
-                    kind=data.get("kind", ""),
-                    start_s=data.get("start_s", 0.0),
-                    end_s=data.get("end_s", 0.0),
-                    content=data.get("content", ""),
-                    confidence=data.get("confidence", 1.0),
-                    metadata=data.get("metadata", {}),
-                    source_refs=data.get("source_refs", []),
-                ))
-            return sorted(artifacts, key=lambda a: (a.start_s, a.end_s, a.kind))
+            return _deserialize_artifacts(payload.get("artifacts", []), kind=kind)
+        except (json.JSONDecodeError, OSError, KeyError):
+            return []
+
+    if normalized_scope == "trace" and result_file.exists():
+        try:
+            payload = json.loads(result_file.read_text(encoding="utf-8"))
+            artifacts_data = payload.get("artifacts", [])
+            if artifacts_data:
+                return _deserialize_artifacts(artifacts_data, kind=kind)
         except (json.JSONDecodeError, OSError, KeyError):
             return []
 

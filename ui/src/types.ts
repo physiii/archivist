@@ -244,6 +244,7 @@ export type IndexingOverview = {
       ready: boolean;
       resolved_path: string;
       used_host_fallback?: boolean;
+      excluded_child_targets?: string[];
     }
   >;
   storage_ready: boolean;
@@ -279,6 +280,200 @@ export type IndexingLogResponse = {
   } | null;
 };
 
+export type McpIntegration = {
+  id: string;
+  key?: string;
+  name: string;
+  description: string;
+  connected: boolean;
+  status: "connected" | "needs_auth" | "error" | "timeout" | "not_installed" | "no_response" | "unknown";
+  error?: string | null;
+  account?: string;
+  account_id?: string;
+  server_name?: string;
+  server_version?: string;
+};
+
+export type GoogleAccountServiceStatus = {
+  id: string;
+  name: string;
+  description?: string;
+  connected: boolean;
+  status: "connected" | "needs_auth" | "error" | "timeout" | "not_installed" | "no_response" | "unknown";
+  error?: string | null;
+};
+
+export type GoogleEnabledService = {
+  key: string;
+  id: string;
+  name: string;
+  description: string;
+  scopes: string[];
+};
+
+export type GoogleAccountStatus = {
+  id: string;
+  label: string;
+  account?: string | null;
+  token_path?: string | null;
+  legacy?: boolean;
+  connected: boolean;
+  fully_connected: boolean;
+  connected_services: number;
+  service_count: number;
+  services: GoogleAccountServiceStatus[];
+};
+
+export type GoogleIntegrationsSummary = {
+  connected: boolean;
+  configured: boolean;
+  accountCount: number;
+  connectedAccountCount: number;
+  fullyConnectedAccountCount: number;
+  accounts: GoogleAccountStatus[];
+  services: GoogleAccountServiceStatus[];
+  enabledServices?: GoogleEnabledService[];
+  requestedScopes?: string[];
+  archive?: {
+    available: boolean;
+    accountCount: number;
+    gmailMessages: number;
+    calendarEvents: number;
+    driveFiles?: number;
+    chatMessages?: number;
+    dayCount: number;
+    lastImportedAt?: string | null;
+  };
+  import?: {
+    running: boolean;
+    message?: string | null;
+    startedAt?: string | null;
+    finishedAt?: string | null;
+    accounts?: Array<{
+      account?: string;
+      gmailMessages?: number;
+      calendarEvents?: number;
+      driveFiles?: number;
+      chatMessages?: number;
+      dayCount?: number;
+      error?: string;
+      errors?: string[];
+    }>;
+  };
+  tokenPaths?: string[];
+  clientSecretPath?: string | null;
+};
+
+export type JournalOverviewSource = {
+  key: string;
+  label: string;
+  shortLabel: string;
+  cadence: string;
+  contribution: string;
+  detail: string;
+  chipClass?: string;
+  accent: string;
+};
+
+export type JournalOverviewSignal = {
+  key: string;
+  count: string;
+  note: string;
+};
+
+export type JournalOverviewSection = {
+  label: string;
+  text: string;
+};
+
+export type JournalOverviewEvidenceItem = {
+  title: string;
+  meta?: string;
+  detail?: string;
+  kind?: string;
+};
+
+export type JournalOverviewEvidenceGroup = {
+  key: string;
+  count: number;
+  items: JournalOverviewEvidenceItem[];
+};
+
+export type JournalOverviewScore = {
+  overall: number;
+  rank: number;
+  percentile: number;
+  label: string;
+  mood: string;
+  reasons: string[];
+  metrics: {
+    activity: number;
+    importance: number;
+    intensity: number;
+    excitement: number;
+    wonder: number;
+    sadness: number;
+    friction: number;
+    connection: number;
+    momentum: number;
+  };
+};
+
+export type JournalOverviewDay = {
+  id: string;
+  date: string;
+  title: string;
+  summary: string;
+  tone: string;
+  focus: string;
+  movement: string;
+  signalCount: number;
+  sources: string[];
+  sections: JournalOverviewSection[];
+  signals: JournalOverviewSignal[];
+  evidence?: JournalOverviewEvidenceGroup[];
+  score?: JournalOverviewScore;
+  closing: string;
+};
+
+export type JournalOverviewResponse = {
+  available: boolean;
+  generatedAt?: string;
+  accountCount: number;
+  gmailMessages: number;
+  calendarEvents: number;
+  driveFiles?: number;
+  chatMessages?: number;
+  dayCount: number;
+  days: JournalOverviewDay[];
+  sources: JournalOverviewSource[];
+  mode?: "live" | "empty" | string;
+  lastImportedAt?: string | null;
+  import?: GoogleIntegrationsSummary["import"];
+  archive?: GoogleIntegrationsSummary["archive"];
+};
+
+export type GitHubIntegrationStatus = {
+  connected: boolean;
+  login?: string;
+  name?: string;
+  avatar_url?: string;
+  expires_at?: string;
+  scopes?: string;
+  rate_limit?: number;
+  rate_remaining?: number;
+  error?: string | null;
+};
+
+export type IntegrationsStatusResponse = {
+  integrations: McpIntegration[];
+  google?: GoogleIntegrationsSummary;
+  github?: GitHubIntegrationStatus;
+  token_path?: string | null;
+  token_paths?: string[];
+  client_secret_path?: string | null;
+};
+
 export type EmbeddingsPreviewPoint = {
   id: string | number;
   vector: number[];
@@ -310,4 +505,81 @@ export type EmbeddingsPreviewResponse = {
     projection_method?: string;
     axis_labels?: string[];
   };
+};
+
+export type MediaAsset = {
+  media_id: string;
+  path: string;
+  filename: string;
+  modality: string;
+  duration_s: number;
+  file_hash: string;
+  file_size_bytes: number;
+  created_at: number;
+  indexed_at: number;
+  codec?: string;
+  sample_rate?: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  metadata?: Record<string, unknown>;
+  pipeline_current?: boolean;
+  pipeline_version?: string | null;
+  subject_line?: string | null;
+  has_result?: boolean;
+};
+
+export type MediaPipelineJob = {
+  job_id: string;
+  media_id: string;
+  status: string;
+  current_layer: string;
+  progress: number;
+  started_at: number;
+  finished_at: number;
+  error: string;
+  artifacts_count: number;
+  events_count: number;
+  recaps_count: number;
+};
+
+export type MediaArtifact = {
+  artifact_id: string;
+  kind: string;
+  start_s: number;
+  end_s: number;
+  content: string;
+  confidence: number;
+  metadata: Record<string, unknown>;
+  source_refs: string[];
+};
+
+export type MediaDocumentSection = {
+  heading: string;
+  content?: string;
+  kind?: string;
+  source_refs?: string[];
+};
+
+export type MediaPipelineResult = {
+  media_id?: string;
+  artifact_count?: number;
+  trace_artifact_count?: number;
+  trace_artifact_counts?: Record<string, number>;
+  layers?: Record<string, Record<string, unknown>>;
+  document?: {
+    title?: string;
+    format?: string;
+    sections?: MediaDocumentSection[];
+    full_text?: string;
+    subject_line?: string;
+  } | null;
+  subject_line?: string;
+  transcript?: {
+    text?: string;
+    segments?: Array<{ text?: string }>;
+    vtt_text?: string;
+  } | null;
+  injection?: Record<string, unknown> | null;
+  [key: string]: unknown;
 };

@@ -38,7 +38,7 @@ def test_backup_linked_schedule_snapshot_uses_backup_schedule(monkeypatch):
 def test_schedule_worker_triggers_indexing_for_due_backup_slot(monkeypatch):
     now = datetime.now(timezone.utc)
     time_of_day = (now - timedelta(minutes=1)).strftime("%H:%M")
-    calls: list[str] = []
+    calls: list[dict] = []
 
     class OneShotStop:
         def __init__(self) -> None:
@@ -65,10 +65,19 @@ def test_schedule_worker_triggers_indexing_for_due_backup_slot(monkeypatch):
     )
     monkeypatch.setattr(indexing_service, "_save_schedule_state", lambda: None)
     monkeypatch.setattr(indexing_service, "_schedule_loaded", True)
-    monkeypatch.setattr(indexing_service, "start_indexing", lambda: calls.append("started"))
+    monkeypatch.setenv("MILVUS_HOST", "host.docker.internal")
+    monkeypatch.setenv("EMBEDDING_HOST", "host.docker.internal")
+    monkeypatch.setenv("EMBEDDING_PORT", "8000")
+    monkeypatch.setattr(indexing_service, "start_indexing", lambda **kwargs: calls.append(kwargs))
     indexing_service._schedule.last_triggered_at = None
 
     indexing_service._schedule_worker()
 
-    assert calls == ["started"]
+    assert calls == [
+        {
+            "embedding_host": "host.docker.internal",
+            "embedding_port": 8000,
+            "ip_address": "host.docker.internal",
+        }
+    ]
     assert indexing_service._schedule.last_triggered_at is not None

@@ -85,6 +85,82 @@ def test_indexing_file_discovery_includes_documents(tmp_path):
     assert [Path(path).name for path in files] == ["a.pdf", "b.docx", "c.txt"]
 
 
+def test_indexing_file_discovery_dedupes_media_sidecars(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "meeting.mkv").write_bytes(b"media")
+    (docs_dir / "meeting.vtt").write_text(
+        "WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nhello from the sidecar\n",
+        encoding="utf-8",
+    )
+    (docs_dir / "audio.mp3").write_bytes(b"media")
+
+    files = indexing_service._iter_target_files(str(docs_dir), recursive=False)
+    count, timed_out = indexing_service._target_scan_count(str(docs_dir), recursive=False)
+
+    assert timed_out is False
+    assert count == 2
+    assert [Path(path).name for path in files] == ["audio.mp3", "meeting.vtt"]
+
+
+def test_media_files_routed_to_pipeline(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "media.pipeline.process_media_file",
+        lambda path, **kwargs: calls.append(path) or {"media_id": "test"},
+    )
+    chunks, reason = indexing_service._parse_file_job("/tmp/test.mp4", "/tmp/test.mp4")
+    assert chunks == []
+    assert reason == "routed:media"
+    assert len(calls) == 1
+    assert calls[0] == "/tmp/test.mp4"
+
+
+def test_media_extensions_excluded_from_direct_indexing():
+    for ext in indexing_service.MEDIA_EXTS:
+        assert indexing_service._is_media_file(f"/tmp/test{ext}"), f"{ext} should be recognized as media"
+
+
+def test_parent_target_scan_excludes_nested_target(tmp_path):
+    root = tmp_path / "docs"
+    child = root / "versant-home"
+    child.mkdir(parents=True)
+    (root / "parent.pdf").write_text("parent", encoding="utf-8")
+    (child / "child.pdf").write_text("child", encoding="utf-8")
+    parent_target = {"id": "parent", "path": str(root), "recursive": True, "enabled": True}
+    child_target = {"id": "child", "path": str(child), "recursive": True, "enabled": True}
+
+    exclude_roots = indexing_service._target_exclude_roots(parent_target, [parent_target, child_target])
+    parent_count, parent_timed_out = indexing_service._target_scan_count(
+        str(root),
+        recursive=True,
+        exclude_roots=exclude_roots,
+    )
+    child_count, child_timed_out = indexing_service._target_scan_count(str(child), recursive=True)
+
+    assert parent_timed_out is False
+    assert child_timed_out is False
+    assert parent_count == 1
+    assert child_count == 1
+
+
+def test_indexing_scan_prunes_generated_directories(tmp_path):
+    root = tmp_path / "docs"
+    (root / "node_modules" / "package").mkdir(parents=True)
+    (root / ".cache").mkdir(parents=True)
+    (root / "notes").mkdir(parents=True)
+    (root / "node_modules" / "package" / "dependency.pdf").write_text("dependency", encoding="utf-8")
+    (root / ".cache" / "cached.pdf").write_text("cached", encoding="utf-8")
+    (root / "notes" / "real.pdf").write_text("real", encoding="utf-8")
+
+    files = indexing_service._iter_target_files(str(root), recursive=True)
+    count, timed_out = indexing_service._target_scan_count(str(root), recursive=True)
+
+    assert timed_out is False
+    assert count == 1
+    assert [Path(path).name for path in files] == ["real.pdf"]
+
+
 def test_collection_and_version_dispatch_for_documents():
     assert indexing_service._collection_name_for_path("/docs/file.pdf") == indexing_service.DOCUMENTS_COLLECTION
     assert indexing_service._collection_name_for_path("/docs/file.docx") == indexing_service.DOCUMENTS_COLLECTION
@@ -109,3 +185,21 @@ def test_timestamped_txt_stays_transcript(tmp_path):
 
     assert indexing_service._collection_name_for_path(str(path)) == indexing_service.TRANSCRIPT_COLLECTION
     assert indexing_service._content_version_for_path(str(path)) == indexing_service.INDEXING_CONTENT_VERSION
+
+
+def test_serialize_tags_caps_payload_length():
+    tags = [
+        "integration:google",
+        "service:drive",
+        "account:physiphile-gmail-com",
+        "mime:application-vnd-google-apps-presentation",
+        "drive_owner:very-long-owner-name-that-keeps-going-and-going@example.com",
+        "topic:" + ("x" * 220),
+        "path:" + ("nested/" * 40),
+    ]
+
+    encoded = indexing_service._serialize_tags(tags)
+
+    assert len(encoded) <= indexing_service.TAGS_FIELD_MAX_LENGTH
+    assert "integration:google" in encoded
+    assert "service:drive" in encoded

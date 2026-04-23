@@ -8,7 +8,12 @@
 
 The media processing pipeline transforms raw audio, video, and image files into structured, searchable knowledge. It operates as a **seven-stage hierarchical pipeline**: evidence through composition (L0-L5), vectorstore projection (L6), and a final subject-line inference stage (L7) that creates a one-sentence description for the file.
 
-Every intermediate output preserves full provenance back to source evidence. Each layer is independently testable, replaceable, and produces persistent artifacts.
+The design rule is: **compress aggressively, never lose provenance**. Chronology and raw evidence remain canonical. Higher layers are derived views that point back to timestamps, frames, OCR spans, transcript timing, and stored artifacts.
+
+Every intermediate output preserves full provenance back to source evidence. Each layer is independently testable and replaceable, but the persisted outputs are split into two tiers:
+
+- `public bundle`: the clean sidecar and pipeline JSON attached back to the media file
+- `trace bundle`: the low-level internal evidence used for troubleshooting
 
 ```
 Raw Media File
@@ -20,19 +25,19 @@ Raw Media File
   [--] Transcription ------------ Whisper segments (word-level timestamps)
     |
     v
-  [L1] Filtering & Detection ---- SceneSegments, SpeechSegments
+  [L1] Filtering & Detection ---- SceneSegments, SpeechSegments, word timing, OCR, keyframes
     |
     v
-  [L2] Atomic Event Extraction --- Typed AtomicEvents with confidence
+  [L2] Atomic Event Extraction --- Typed AtomicEvents with evidence refs
     |
     v
-  [L3] Local Recap Building ------ 60-second window summaries
+  [L3] Local Recap Building ------ Step-by-step event ledger windows
     |
     v
-  [L4] Contextual Memory --------- Actors, themes, open loops
+  [L4] Contextual Memory --------- Compressed contextual account
     |
     v
-  [L5] Document Composition ------ Task-specific output format
+  [L5] Document Composition ------ Presentation-specific document view
     |
     v
   [L6] Vectorstore Projection ---- Multi-granularity Milvus chunks
@@ -66,8 +71,9 @@ Registers raw media files, computes SHA-256 hashes for deduplication, and extrac
 - `register_asset(path, metadata)` -- creates a `MediaAsset` record
 - `_detect_modality(path)` -- extension-based modality classification
 - `_probe_media(path)` -- extracts duration, sample rate, bitrate, resolution, codec, FPS
-- `save_artifact(artifact)` -- persists any `DerivedArtifact` to disk
-- `get_artifacts(media_id, kind)` -- retrieves artifacts, optionally filtered
+- `save_artifact(artifact)` -- persists a single raw-trace `DerivedArtifact`
+- `save_artifact_bundle(media_id, artifacts)` -- persists the full technical trace bundle
+- `get_artifacts(media_id, kind, scope)` -- retrieves either the clean public artifact package or the technical trace
 
 **Storage layout:**
 
@@ -133,13 +139,22 @@ ACTION_ITEM  CONTRADICTION  REFERENCE  LOW_CONFIDENCE
 BOILERPLATE  DUPLICATE
 ```
 
-**Output:** `AtomicEvent` objects carrying timestamps, speakers, visual entities, text evidence, confidence, source references, and metadata (entities, word count, segment count).
+**Output:** `AtomicEvent` objects carrying timestamps, speakers, visual entities, text evidence, confidence, source references, and provenance-rich metadata. Current metadata includes:
+
+- raw text and cleaned text
+- transcript span timing
+- speaker turns
+- word timestamps when available
+- OCR text and OCR lines for visual events
+- representative frame references
+- cross-modal overlap references
+- evidence refs back to speech segments, scene spans, and keyframes
 
 ### L3: Local Recaps
 
 **Module:** `media/recaps.py`
 
-Groups events into meaningful windows and generates plain-language summaries.
+Groups events into meaningful windows and generates inspectable step-by-step ledgers.
 
 **Grouping strategies:**
 1. `group_events_by_time_window(events, window_s=60.0)` -- fixed 60-second windows (default)
@@ -153,13 +168,13 @@ Groups events into meaningful windows and generates plain-language summaries.
 - Builds a mechanical recap if no LLM text is provided
 - `build_recap_prompt(events)` generates system + user prompts for optional LLM enhancement
 
-**Output:** `LocalRecap` objects carrying group type, time range, recap text, salient entities, unresolved questions, emotional tone, causal links, event IDs, and source references.
+**Output:** `LocalRecap` objects carrying group type, time range, recap text, a structured `window_summary`, salient entities, unresolved questions, emotional tone, causal links, event IDs, summary-level refs, ledger entries, and source references.
 
 ### L4: Contextual Memory
 
 **Module:** `media/memory.py`
 
-Compresses recaps into a working memory structure.
+Compresses recaps into a contextual account that stays distinct from the walkthrough.
 
 **Aggregation logic:**
 - **Main actors:** entities appearing in 2+ recaps (top 20)
@@ -167,17 +182,18 @@ Compresses recaps into a working memory structure.
 - **Open loops:** unresolved questions collected from recaps
 - **Inferred themes:** recurring entities across recaps
 - **Locations, risk/safety issues, contradictions:** initialized for LLM enhancement
-- **Notable evidence, final takeaways:** populated when LLM is available
+- **Notable evidence, final takeaways:** compact high-value memory traces
+- **Interpretive notes:** optional derived interpretations stored separately from factual evidence
 
 `build_memory_prompt(recaps)` generates prompts for LLM-enhanced memory construction.
 
-**Output:** `ContextualMemory` object containing main actors, timeline anchors, locations, open loops, inferred themes, risk/safety issues, contradictions, notable evidence, final takeaways, and recap IDs.
+**Output:** `ContextualMemory` object containing a compressed `context_overview`, main actors, timeline anchors, locations, open loops, inferred themes, risk/safety issues, contradictions, notable evidence, final takeaways, interpretive notes, an `evidence_map`, and recap IDs.
 
 ### L5: Document Composition
 
 **Module:** `media/composer.py`
 
-Generates task-specific output documents.
+Generates task-specific output documents from the event ledger and compressed memory, not directly from the raw transcript.
 
 **Format auto-selection (`select_output_format`):**
 - Multiple speakers + decisions/questions --> `MEETING_MINUTES`
@@ -198,7 +214,7 @@ Generates task-specific output documents.
 | `INCIDENT_REPORT` | Investigation-oriented structure |
 | `EXECUTIVE_BRIEF` | High-level summary for busy stakeholders |
 
-`compose_document()` accepts optional LLM-composed text and falls back to mechanical composition. Final output is parsed into markdown sections.
+`compose_document()` accepts optional LLM-composed text and falls back to mechanical composition. Final output is parsed into markdown sections with explicit section kinds so compressed context and walkthrough remain separate.
 
 **Output:** `ComposedDocument` carrying format, title, sections (heading + content pairs), full markdown text, memory ID, source references, and generation timestamp.
 
@@ -232,8 +248,45 @@ Builds a single-sentence subject line from the full artifact bundle after docume
 - Falls back to a deterministic heuristic sentence when the gateway is unavailable
 - Persists the result as:
   - top-level `subject_line` in the pipeline result
-  - a `subject_line` derived artifact in the canonical artifact bundle
+  - a `subject_line` derived artifact in the clean public artifact bundle
   - embedded media title metadata, with the composed document title retained as description metadata when different
+
+---
+
+## 3.5 Artifact Packaging
+
+The pipeline produces many intermediate objects, but they are not all equal.
+
+### Public bundle
+
+Written to:
+
+- `/data/media_pipeline/{media_id}.json`
+- `{media_path}.json`
+- embedded back into the source media file as `archivist_media_pipeline.json`
+
+This bundle is intentionally small and human-readable. It contains only:
+
+- `subject_line`
+- `memory`
+- `document`
+- `transcript`
+
+### Trace bundle
+
+Written to:
+
+- `/data/media_store/artifacts/{media_id}.json`
+
+This bundle keeps low-level pipeline evidence such as:
+
+- `speech_segment`
+- `scene`
+- `keyframe`
+- `event`
+- `recap`
+
+The UI should only load this bundle when the operator explicitly opens the technical raw-trace view.
 
 ---
 

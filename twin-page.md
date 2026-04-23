@@ -1,0 +1,19 @@
+- generic [ref=e3]:
+  - generic [ref=e102]:
+    - generic [ref=e103] [cursor=pointer]:
+      - generic [ref=e104]: T
+      - generic [ref=e105]
+    - list [ref=e108]:
+      - listitem [ref=e109]
+      - listitem [ref=e117]
+      - listitem [ref=e125]
+    - generic [ref=e133]: Twin v1.0
+  - main [ref=e10]:
+    - generic [ref=e135]: Dashboard
+    - generic [ref=e14]:
+      - generic [ref=e15]
+      - generic [ref=e20]
+  - button "Open chat" [ref=e97] [cursor=pointer]:
+    - generic [ref=e98]:
+      - img [ref=e99]
+      - generic: "0"

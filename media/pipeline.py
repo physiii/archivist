@@ -3,8 +3,8 @@
 Coordinates the 6-layer processing of media files:
 L0 -> L1 -> L2 -> L3 -> L4 -> L5
 
-Supports both synchronous single-file processing and watched-folder
-background processing for incoming media.
+Directory discovery is handled by the indexing service, which routes
+media files here for rich processing.
 """
 
 from __future__ import annotations
@@ -12,15 +12,23 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 from media.evidence_store import (
-    ALL_MEDIA_EXTS,
+    _save_asset,
+    get_asset,
+    get_artifacts,
+    infer_recorded_at_from_path,
+    infer_recorded_day_from_path,
+    list_assets,
     register_asset,
     _load_assets_index,
+    save_artifact_bundle,
 )
 from media.event_extraction import (
     extract_events_from_scenes,
@@ -43,14 +51,23 @@ from media.models import (
 )
 from media.recaps import build_recap_from_events, build_recaps, group_events_by_time_window
 from media.composer import build_compose_prompt, compose_document, select_output_format
+from media.text_cleanup import (
+    build_readable_transcript_text,
+    clean_transcript_segments,
+    extract_inline_topic_terms,
+    extract_topic_phrases,
+    is_generic_topic_phrase,
+    is_weak_topic_phrase,
+    strip_summary_boilerplate,
+)
 
 logger = logging.getLogger("archivist.media.pipeline")
 
 PIPELINE_STORE_DIR = Path(os.getenv("MEDIA_PIPELINE_DIR", "/data/media_pipeline"))
-WATCH_INTERVAL_S = int(os.getenv("MEDIA_WATCH_INTERVAL_S", "30"))
+MEDIA_PIPELINE_COMPAT_VERSION = os.getenv("MEDIA_PIPELINE_COMPAT_VERSION", "2026-04-11.1").strip() or "2026-04-11.1"
 OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789").rstrip("/")
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
-OPENCLAW_CHAT_MODEL = os.getenv("OPENCLAW_CHAT_MODEL", "openclaw/default").strip()
+OPENCLAW_CHAT_MODEL = os.getenv("OPENCLAW_CHAT_MODEL", "").strip()
 SUBJECT_MAX_WORDS = max(8, int(os.getenv("MEDIA_SUBJECT_MAX_WORDS", "24")))
 SUBJECT_MAX_CONTEXT_ARTIFACTS = max(6, int(os.getenv("MEDIA_SUBJECT_MAX_CONTEXT_ARTIFACTS", "12")))
 SUBJECT_MAX_PREVIEW_CHARS = max(80, int(os.getenv("MEDIA_SUBJECT_MAX_PREVIEW_CHARS", "220")))
@@ -59,14 +76,186 @@ SUBJECT_STOP_TERMS = {
     "no", "none", "nope", "obviously", "okay", "so", "they", "versus", "wait",
     "whereas", "yep", "yes",
 }
+SUBJECT_PARTICIPANT_STOP_TERMS = SUBJECT_STOP_TERMS | {
+    "everybody", "everyone", "he", "i", "it", "me", "she", "team", "them",
+    "us", "we", "you", "your",
+}
+SUBJECT_INVALID_PATTERNS = (
+    r"^(and|but|or)\b",
+    r"\bcurrent workstream\b",
+    r"\bdiscussion focused\b",
+    r"\bmain activity\b",
+    r"\bopen questions around\b",
+    r"\bsegment covers\b",
+    r"\btalk about\b",
+    r"\bthinking about\b",
+    r"\band follow\b",
+    r"\band and\b",
+    r"\bthis window\b",
+    r"^this (video|audio|media|recording) file\b",
+)
+PUBLIC_ARTIFACT_ORDER = {
+    "subject_line": 0,
+    "memory": 1,
+    "document": 2,
+    "transcript": 3,
+}
+PUBLIC_ARTIFACT_KINDS = set(PUBLIC_ARTIFACT_ORDER)
+
+
+def _repo_root_path() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _openclaw_media_agent_id() -> str:
+    for env_name in ("ARCHIVIST_OPENCLAW_MEDIA_AGENT_ID", "ARCHIVIST_OPENCLAW_CONSOLE_AGENT_ID"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return "archivist-main"
+
+
+def _openclaw_media_model() -> str:
+    if OPENCLAW_CHAT_MODEL and not OPENCLAW_CHAT_MODEL.endswith("/default"):
+        return OPENCLAW_CHAT_MODEL
+    return f"openclaw/{_openclaw_media_agent_id()}"
+
+
+def _candidate_repo_roots() -> list[Path]:
+    candidates = [
+        os.getenv("ARCHIVIST_REPO_ROOT", "").strip(),
+        str(_repo_root_path()),
+        str(Path.cwd()),
+        "/home/andy/archivist",
+    ]
+    seen: set[str] = set()
+    roots: list[Path] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate).expanduser().resolve()
+        except OSError:
+            continue
+        path_text = str(path)
+        if path_text in seen:
+            continue
+        seen.add(path_text)
+        roots.append(path)
+    return roots
+
+
+def _resolve_git_dir(root: Path) -> Optional[Path]:
+    git_entry = root / ".git"
+    if git_entry.is_dir():
+        return git_entry
+    if not git_entry.is_file():
+        return None
+    try:
+        raw = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw.lower().startswith("gitdir:"):
+        return None
+    git_dir = raw.split(":", 1)[1].strip()
+    if not git_dir:
+        return None
+    try:
+        resolved = (root / git_dir).resolve() if not Path(git_dir).is_absolute() else Path(git_dir).resolve()
+    except OSError:
+        return None
+    return resolved if resolved.exists() else None
+
+
+def _read_git_ref_commit(git_dir: Path, ref_name: str) -> str:
+    ref_path = git_dir / ref_name
+    try:
+        if ref_path.is_file():
+            commit_hash = ref_path.read_text(encoding="utf-8").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", commit_hash):
+                return commit_hash
+    except OSError:
+        pass
+
+    packed_refs = git_dir / "packed-refs"
+    try:
+        if packed_refs.is_file():
+            for line in packed_refs.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith("^"):
+                    continue
+                commit_hash, _, packed_ref = stripped.partition(" ")
+                if packed_ref.strip() != ref_name:
+                    continue
+                commit_hash = commit_hash.strip().lower()
+                if re.fullmatch(r"[0-9a-f]{40}", commit_hash):
+                    return commit_hash
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_repo_commit_hash_from_git_files(root: Path) -> str:
+    git_dir = _resolve_git_dir(root)
+    if git_dir is None:
+        return ""
+    head_path = git_dir / "HEAD"
+    try:
+        head_value = head_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if head_value.lower().startswith("ref:"):
+        ref_name = head_value.split(":", 1)[1].strip()
+        return _read_git_ref_commit(git_dir, ref_name)
+    head_value = head_value.lower()
+    return head_value if re.fullmatch(r"[0-9a-f]{40}", head_value) else ""
+
+
+def _resolve_repo_commit_hash(repo_root: Optional[Path] = None) -> str:
+    roots = [Path(repo_root).expanduser().resolve()] if repo_root is not None else _candidate_repo_roots()
+    for root in roots:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            result = None
+        if result is None or result.returncode != 0:
+            commit_hash = _resolve_repo_commit_hash_from_git_files(root)
+        else:
+            commit_hash = str(result.stdout or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", commit_hash):
+            return commit_hash
+        commit_hash = _resolve_repo_commit_hash_from_git_files(root)
+        if re.fullmatch(r"[0-9a-f]{40}", commit_hash):
+            return commit_hash
+    return ""
+
+
+def _resolve_repo_version_tag(commit_hash: str, suffix_len: int = 12) -> str:
+    normalized = str(commit_hash or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", normalized):
+        return ""
+    width = max(6, int(suffix_len or 0))
+    return normalized[-width:]
+
+
+REPO_COMMIT_HASH = _resolve_repo_commit_hash()
+REPO_VERSION_TAG = _resolve_repo_version_tag(REPO_COMMIT_HASH)
+MEDIA_PIPELINE_VERSION = (
+    os.getenv("MEDIA_PIPELINE_VERSION_TAG", "").strip()
+    or os.getenv("MEDIA_PIPELINE_VERSION", "").strip()
+    or REPO_VERSION_TAG
+    or "unknown"
+)
 
 # ── Active job tracking ─────────────────────────────────────────────────
 
 _active_jobs: dict[str, PipelineJob] = {}
 _jobs_lock = threading.Lock()
-_watcher_thread: Optional[threading.Thread] = None
-_watcher_stop = threading.Event()
-_watch_dirs: list[str] = []
 
 
 def get_active_jobs() -> list[dict]:
@@ -90,13 +279,71 @@ def get_active_jobs() -> list[dict]:
         ]
 
 
+def _media_job_active(media_id: str) -> bool:
+    with _jobs_lock:
+        return any(
+            job.media_id == media_id and not float(job.finished_at or 0.0)
+            for job in _active_jobs.values()
+        )
+
+
 def _update_job(job: PipelineJob, **kwargs):
     for key, value in kwargs.items():
         setattr(job, key, value)
 
 
+def _artifact_kind_counts(artifacts: list[DerivedArtifact]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for artifact in artifacts:
+        counts[artifact.kind] = counts.get(artifact.kind, 0) + 1
+    return counts
+
+
+def _public_artifact_sort_key(artifact: DerivedArtifact) -> tuple[int, float, float, str]:
+    return (
+        PUBLIC_ARTIFACT_ORDER.get(artifact.kind, 99),
+        artifact.start_s,
+        artifact.end_s,
+        artifact.artifact_id,
+    )
+
+
+def _select_public_artifacts(artifacts: list[DerivedArtifact]) -> list[DerivedArtifact]:
+    selected = [artifact for artifact in artifacts if artifact.kind in PUBLIC_ARTIFACT_KINDS]
+    return sorted(selected, key=_public_artifact_sort_key)
+
+
+def _sidecar_candidate_paths(asset_path: str | Path, suffix: str) -> list[Path]:
+    path = Path(asset_path)
+    return [
+        path.with_suffix(suffix),
+        path.with_name(f"{path.stem}.archivist{suffix}"),
+        path.with_name(f"{path.name}.archivist{suffix}"),
+    ]
+
+
+def _sidecar_path_for_write(asset_path: str | Path, suffix: str) -> Path:
+    for candidate in _sidecar_candidate_paths(asset_path, suffix):
+        try:
+            if not candidate.exists() or candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return _sidecar_candidate_paths(asset_path, suffix)[-1]
+
+
+def _existing_sidecar_path(asset_path: str | Path, suffix: str) -> Optional[Path]:
+    for candidate in _sidecar_candidate_paths(asset_path, suffix):
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 def _pipeline_sidecar_path(asset_path: str | Path) -> Path:
-    return Path(asset_path).with_suffix(".json")
+    return _sidecar_path_for_write(asset_path, ".json")
 
 
 def _write_pipeline_sidecar(asset: MediaAsset, result: dict) -> Optional[Path]:
@@ -114,10 +361,229 @@ def _media_output_complete(media_id: str) -> bool:
     return bool(media_id) and (PIPELINE_STORE_DIR / f"{media_id}.json").exists()
 
 
+def _load_saved_pipeline_result(media_id: str) -> Optional[dict]:
+    if not media_id:
+        return None
+    result_path = PIPELINE_STORE_DIR / f"{media_id}.json"
+    if not result_path.exists():
+        return None
+    try:
+        return json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _current_source_mtime_ns(path: str | Path) -> Optional[int]:
+    try:
+        return int(Path(path).stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _expected_output_format_label(output_format: Optional[OutputFormat]) -> Optional[str]:
+    if output_format is None:
+        return None
+    return output_format.value if hasattr(output_format, "value") else str(output_format)
+
+
+def _asset_result_payload(asset: MediaAsset) -> dict[str, object]:
+    recorded_at = (
+        str((asset.metadata or {}).get("recorded_at") or "").strip()
+        or infer_recorded_at_from_path(asset.path)
+        or ""
+    )
+    recorded_day = (
+        str((asset.metadata or {}).get("recorded_day") or "").strip()
+        or infer_recorded_day_from_path(asset.path)
+        or ""
+    )
+    payload: dict[str, object] = {
+        "path": asset.path,
+        "filename": asset.filename,
+        "modality": asset.modality.value,
+        "duration_s": asset.duration_s,
+        "file_hash": asset.file_hash,
+    }
+    if recorded_at:
+        payload["recorded_at"] = recorded_at
+    if recorded_day:
+        payload["recorded_day"] = recorded_day
+    return payload
+
+
+def _build_pipeline_stamp(
+    asset: MediaAsset,
+    *,
+    output_format: Optional[OutputFormat],
+    document_format: Optional[str] = None,
+    generated_at: Optional[float] = None,
+) -> dict[str, object]:
+    return {
+        "pipeline_version": MEDIA_PIPELINE_VERSION,
+        "pipeline_compat_version": MEDIA_PIPELINE_COMPAT_VERSION,
+        "repo_commit": REPO_COMMIT_HASH,
+        "repo_commit_suffix": REPO_VERSION_TAG or MEDIA_PIPELINE_VERSION,
+        "source_path": asset.path,
+        "source_file_hash": asset.file_hash,
+        "source_size_bytes": int(asset.file_size_bytes or 0),
+        "source_mtime_ns": _current_source_mtime_ns(asset.path),
+        "source_recorded_at": (
+            str((asset.metadata or {}).get("recorded_at") or "").strip()
+            or infer_recorded_at_from_path(asset.path)
+            or None
+        ),
+        "source_recorded_day": (
+            str((asset.metadata or {}).get("recorded_day") or "").strip()
+            or infer_recorded_day_from_path(asset.path)
+            or None
+        ),
+        "requested_output_format": _expected_output_format_label(output_format),
+        "document_format": document_format,
+        "generated_at": float(generated_at or time.time()),
+    }
+
+
+def _refresh_asset_state_from_disk(asset: MediaAsset) -> MediaAsset:
+    stat = Path(asset.path).stat()
+    asset.file_size_bytes = int(stat.st_size)
+    asset.file_hash = asset.compute_hash()
+    asset.indexed_at = time.time()
+    _save_asset(asset)
+    return asset
+
+
+def _expected_vectorstore_source_id(media_id: str) -> str:
+    return f"media:{media_id}"
+
+
+def _vectorstore_layer_is_current(
+    result: Optional[dict],
+    *,
+    media_id: str,
+    asset_file_hash: Optional[str],
+) -> bool:
+    if not isinstance(result, dict):
+        return False
+    layers = result.get("layers")
+    if not isinstance(layers, dict):
+        return False
+    stats = layers.get("L6_vectorstore")
+    if not isinstance(stats, dict) or stats.get("error"):
+        return False
+
+    chunks_created = int(stats.get("chunks_created") or 0)
+    chunks_inserted = int(stats.get("chunks_inserted") or 0)
+    if chunks_created <= 0 or chunks_inserted != chunks_created:
+        return False
+
+    if str(stats.get("collection") or "") != "documents_transcripts":
+        return False
+    if str(stats.get("source_id") or "") != _expected_vectorstore_source_id(media_id):
+        return False
+    if asset_file_hash and str(stats.get("file_hash") or "") != asset_file_hash:
+        return False
+    return True
+
+
+def _embedded_processing_stamp_text(pipeline_stamp: dict[str, object]) -> str:
+    hash_text = str(pipeline_stamp.get("source_file_hash") or "").strip()
+    hash_preview = hash_text[:12] if hash_text else "unknown"
+    version_tag = str(
+        pipeline_stamp.get("repo_commit_suffix")
+        or pipeline_stamp.get("pipeline_version")
+        or "unknown"
+    ).strip()
+    compat_version = str(
+        pipeline_stamp.get("pipeline_compat_version")
+        or "unknown"
+    ).strip()
+    format_label = str(
+        pipeline_stamp.get("document_format")
+        or pipeline_stamp.get("requested_output_format")
+        or "auto"
+    ).strip()
+    source_mtime_ns = pipeline_stamp.get("source_mtime_ns")
+    return (
+        f"Archivist pipeline {version_tag}"
+        f" | compat={compat_version}"
+        f" | format={format_label}"
+        f" | hash={hash_preview}"
+        f" | mtime_ns={source_mtime_ns if source_mtime_ns is not None else 'unknown'}"
+    )
+
+
+def _pipeline_result_is_current(
+    result: Optional[dict],
+    *,
+    asset_path: str,
+    asset_file_hash: Optional[str] = None,
+    asset_file_size_bytes: Optional[int] = None,
+    requested_output_format: Optional[OutputFormat] = None,
+) -> bool:
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+
+    stamp = result.get("archivist_pipeline")
+    if not isinstance(stamp, dict):
+        return False
+
+    stamped_compat_version = str(stamp.get("pipeline_compat_version") or "").strip()
+    if stamped_compat_version:
+        if stamped_compat_version != MEDIA_PIPELINE_COMPAT_VERSION:
+            return False
+    elif str(stamp.get("pipeline_version") or "").strip() != MEDIA_PIPELINE_COMPAT_VERSION:
+        return False
+
+    resolved_path = str(Path(asset_path).resolve())
+    if str(stamp.get("source_path") or "") != resolved_path:
+        return False
+
+    current_mtime_ns = _current_source_mtime_ns(resolved_path)
+    stamped_mtime_ns = stamp.get("source_mtime_ns")
+    if current_mtime_ns is None or stamped_mtime_ns is None or int(stamped_mtime_ns) != current_mtime_ns:
+        return False
+
+    if asset_file_size_bytes is not None:
+        stamped_size = stamp.get("source_size_bytes")
+        if stamped_size is None or int(stamped_size) != int(asset_file_size_bytes):
+            return False
+
+    if asset_file_hash:
+        if str(stamp.get("source_file_hash") or "") != asset_file_hash:
+            return False
+
+    expected_format = _expected_output_format_label(requested_output_format)
+    if expected_format:
+        existing_format = str(
+            stamp.get("document_format")
+            or ((result.get("document") or {}).get("format") if isinstance(result.get("document"), dict) else "")
+            or ""
+        )
+        if existing_format != expected_format:
+            return False
+
+    return True
+
+
 def _asset_record_complete(asset_data: dict) -> bool:
     path = str(asset_data.get("path") or "")
     media_id = str(asset_data.get("media_id") or "")
-    return bool(path) and Path(path).exists() and _media_output_complete(media_id)
+    if not path or not media_id or not Path(path).exists() or not _media_output_complete(media_id):
+        return False
+    result = _load_saved_pipeline_result(media_id)
+    pipeline_current = _pipeline_result_is_current(
+        result,
+        asset_path=path,
+        asset_file_hash=str(asset_data.get("file_hash") or "") or None,
+        asset_file_size_bytes=int(asset_data.get("file_size_bytes") or 0) or None,
+    )
+    if not pipeline_current:
+        return False
+    return _vectorstore_layer_is_current(
+        result,
+        media_id=media_id,
+        asset_file_hash=str(asset_data.get("file_hash") or "") or None,
+    )
 
 
 def _clip_subject_text(text: str, limit: int = SUBJECT_MAX_PREVIEW_CHARS) -> str:
@@ -156,14 +622,65 @@ def _join_subject_terms(values: list[str], limit: int = 3) -> str:
 def _clean_subject_terms(values: list[str], limit: Optional[int] = None) -> list[str]:
     cleaned: list[str] = []
     for value in values:
-        term = _clip_subject_text(value, limit=80).strip(" ,.;:-")
-        if not term or term.lower() in SUBJECT_STOP_TERMS:
+        term = strip_summary_boilerplate(_clip_subject_text(value, limit=80)).strip(" ,.;:-")
+        if not term or term.lower() in SUBJECT_STOP_TERMS or is_generic_topic_phrase(term) or is_weak_topic_phrase(term):
             continue
         if term not in cleaned:
             cleaned.append(term)
         if limit is not None and len(cleaned) >= limit:
             break
     return cleaned
+
+
+def _is_subject_participant(value: str) -> bool:
+    candidate = " ".join(str(value or "").split()).strip(" ,.;:-")
+    if not candidate or candidate.isupper():
+        return False
+    parts = [part.strip(" ,.;:-") for part in candidate.split() if part.strip(" ,.;:-")]
+    if not parts or len(parts) > 3:
+        return False
+    if any(not part[:1].isupper() for part in parts):
+        return False
+    lowered = [part.lower() for part in parts]
+    if any(part in SUBJECT_PARTICIPANT_STOP_TERMS for part in lowered):
+        return False
+    if len(parts) == 1 and len(parts[0]) <= 1:
+        return False
+    return True
+
+
+def _clean_subject_participants(values: list[str], limit: Optional[int] = None) -> list[str]:
+    cleaned: list[str] = []
+    for value in values:
+        candidate = _clip_subject_text(value, limit=80).strip(" ,.;:-")
+        if not _is_subject_participant(candidate):
+            continue
+        if candidate not in cleaned:
+            cleaned.append(candidate)
+        if limit is not None and len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def _join_subject_participants(values: list[str], limit: int = 3) -> str:
+    cleaned = _clean_subject_participants(values, limit=limit)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
+def _subject_noun(document: Optional[ComposedDocument]) -> str:
+    if document and document.format == OutputFormat.MEETING_MINUTES:
+        return "Meeting"
+    if document and document.format == OutputFormat.INCIDENT_REPORT:
+        return "Incident review"
+    if document and document.format == OutputFormat.EXECUTIVE_BRIEF:
+        return "Briefing"
+    return "Discussion"
 
 
 def _infer_subject_activity(artifacts: list[DerivedArtifact], document: Optional[ComposedDocument]) -> str:
@@ -176,20 +693,196 @@ def _infer_subject_activity(artifacts: list[DerivedArtifact], document: Optional
             event_type_counts[label] = event_type_counts.get(label, 0) + 1
 
     if event_type_counts.get("decision") and event_type_counts.get("question"):
-        return "discuss decisions and open questions"
+        return "covers decisions and open questions"
+    if event_type_counts.get("decision") and event_type_counts.get("action"):
+        return "covers decisions and follow-up work"
     if event_type_counts.get("decision"):
-        return "work through decisions"
+        return "reaches concrete decisions"
     if event_type_counts.get("question"):
-        return "work through open questions"
+        return "surfaces open questions"
     if event_type_counts.get("action"):
-        return "review ongoing actions"
+        return "tracks follow-up work"
     if document and document.format == OutputFormat.MEETING_MINUTES:
-        return "discuss the main topics"
+        return "covers the main discussion"
     if document and document.format == OutputFormat.INCIDENT_REPORT:
-        return "document an incident"
+        return "documents the incident review"
     if document and document.format == OutputFormat.EXECUTIVE_BRIEF:
-        return "capture the main points"
-    return "capture the main activity"
+        return "captures the main points"
+    return "captures the main developments"
+
+
+def _subject_topic(memory: ContextualMemory, artifacts: list[DerivedArtifact], document: Optional[ComposedDocument]) -> str:
+    direct_candidates = _clean_subject_terms(memory.inferred_themes, limit=3)
+    if direct_candidates:
+        return _join_subject_terms(direct_candidates, limit=3)
+
+    source_texts: list[str] = []
+    if memory.context_overview:
+        source_texts.append(memory.context_overview)
+    for takeaway in memory.final_takeaways[:4]:
+        source_texts.append(takeaway)
+    if document:
+        for section in document.sections:
+            content = str(section.get("content") or "").strip()
+            if content:
+                source_texts.append(content)
+    for artifact in sorted(
+        artifacts,
+        key=lambda artifact: (_subject_artifact_priority(artifact.kind), artifact.start_s, artifact.end_s),
+    ):
+        if artifact.kind == "event":
+            source_texts.append(str(artifact.metadata.get("brief") or artifact.content))
+            source_texts.extend(str(entity) for entity in artifact.metadata.get("entities", []) or [])
+            source_texts.extend(str(term) for term in artifact.metadata.get("topic_terms", []) or [])
+        elif artifact.kind == "recap":
+            source_texts.append(str(artifact.metadata.get("window_summary") or artifact.content))
+        if len(source_texts) >= 16:
+            break
+
+    extracted = _clean_subject_terms(extract_topic_phrases(source_texts, limit=4), limit=3)
+    if extracted:
+        return _join_subject_terms(extracted, limit=3)
+
+    inline_terms = _clean_subject_terms([
+        term
+        for text in source_texts
+        for term in extract_inline_topic_terms(text, limit=3)
+    ], limit=3)
+    if inline_terms:
+        return _join_subject_terms(inline_terms, limit=3)
+
+    for text in source_texts:
+        candidate = strip_summary_boilerplate(str(text or "")).strip(" .")
+        if not candidate or is_generic_topic_phrase(candidate) or is_weak_topic_phrase(candidate):
+            continue
+        first_sentence = candidate.split(".", 1)[0].strip()
+        if re.search(r"\b(i|we|they|he|she|it|this|that)\b", first_sentence, re.IGNORECASE):
+            continue
+        if 2 <= len(first_sentence.split()) <= 6:
+            return first_sentence
+    return ""
+
+
+def _subject_line_is_unusable(text: str) -> bool:
+    clean = " ".join(str(text or "").split()).strip(" .")
+    if len(clean.split()) < 4:
+        return True
+    return any(re.search(pattern, clean, re.IGNORECASE) for pattern in SUBJECT_INVALID_PATTERNS)
+
+
+def _resolve_openclaw_gateway_token() -> str:
+    if OPENCLAW_GATEWAY_TOKEN:
+        return OPENCLAW_GATEWAY_TOKEN
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return ""
+    explicit = (os.getenv("OPENCLAW_CONFIG_PATH") or "").strip()
+    state_dir = (os.getenv("OPENCLAW_STATE_DIR") or "").strip()
+    config_paths = [
+        Path(explicit).expanduser() if explicit else None,
+        (Path(state_dir).expanduser() / "openclaw.json") if state_dir else None,
+        _repo_root_path() / ".openclaw" / "openclaw.json",
+        Path("/host/.openclaw/openclaw.json"),
+        Path.home() / ".openclaw" / "openclaw.json",
+    ]
+    for path in config_paths:
+        try:
+            if path is None or not path.exists():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            token = str((((payload.get("gateway") or {}).get("auth") or {}).get("token")) or "").strip()
+            if token:
+                return token
+        except Exception:
+            continue
+    return ""
+
+
+def _call_openclaw_gateway(
+    *,
+    asset: MediaAsset,
+    system_prompt: str,
+    user_prompt: str,
+    purpose: str,
+    timeout: int = 120,
+) -> tuple[str, Optional[str]]:
+    token = _resolve_openclaw_gateway_token()
+    if not token:
+        return "", "gateway_unconfigured"
+
+    try:
+        import requests
+
+        agent_id = _openclaw_media_agent_id()
+        session_key = f"agent:{agent_id}:{purpose}:{asset.media_id}"
+
+        response = requests.post(
+            f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
+            json={
+                "model": _openclaw_media_model(),
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "user": session_key,
+            },
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "x-openclaw-agent-id": agent_id,
+                "x-openclaw-session-key": session_key,
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = str(payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        return content, None
+    except Exception as exc:
+        logger.warning("%s inference failed for %s: %s", purpose, asset.filename, exc)
+        return "", str(exc)
+
+
+def _subject_event_summary(artifacts: list[DerivedArtifact]) -> str:
+    event_priority = {"decision": 0, "action": 1, "question": 2, "observation": 3, "speech": 4}
+    ranked = sorted(
+        [
+            artifact
+            for artifact in artifacts
+            if artifact.kind == "event" and str(artifact.metadata.get("event_type") or "").strip()
+        ],
+        key=lambda artifact: (
+            event_priority.get(str(artifact.metadata.get("event_type") or "").strip().lower(), 9),
+            artifact.start_s,
+            artifact.end_s,
+        ),
+    )
+
+    for artifact in ranked:
+        event_type = str(artifact.metadata.get("event_type") or "").strip().lower()
+        brief = strip_summary_boilerplate(str(artifact.metadata.get("brief") or artifact.content)).strip(" .")
+        if not brief or is_generic_topic_phrase(brief):
+            continue
+        if event_type == "decision":
+            match = re.match(r"^(?:we|i)\s+decid(?:e|ed)\s+to\s+(.+)$", brief, re.IGNORECASE)
+            if match:
+                candidate = f"Decision to {match.group(1).strip(' .')}"
+            else:
+                candidate = f"Decision: {brief}"
+        elif event_type == "action":
+            match = re.match(r"^(?:i(?:'ll| will)|we(?:'ll| will)|let me)\s+(.+)$", brief, re.IGNORECASE)
+            if match:
+                candidate = f"Follow-up: {match.group(1).strip(' .')}"
+            else:
+                candidate = f"Follow-up: {brief}"
+        elif event_type == "question":
+            candidate = f"Open question: {brief.rstrip('?')}"
+        else:
+            candidate = brief
+
+        if candidate and not _subject_line_is_unusable(candidate):
+            return candidate
+    return ""
 
 
 def _build_subject_line_fallback(
@@ -198,8 +891,8 @@ def _build_subject_line_fallback(
     memory: ContextualMemory,
     document: Optional[ComposedDocument],
 ) -> str:
-    participants = _join_subject_terms(memory.main_actors, limit=3)
-    themes = _join_subject_terms(memory.inferred_themes, limit=2)
+    participants = _join_subject_participants(memory.main_actors, limit=2)
+    topic = _subject_topic(memory, artifacts, document)
 
     entities: list[str] = []
     for artifact in artifacts:
@@ -218,26 +911,21 @@ def _build_subject_line_fallback(
     entity_text = _join_subject_terms(entities, limit=2)
 
     activity = _infer_subject_activity(artifacts, document)
-    format_phrase = "recorded file"
-    if document and document.format == OutputFormat.MEETING_MINUTES:
-        format_phrase = "recorded meeting"
-    elif document and document.format == OutputFormat.INCIDENT_REPORT:
-        format_phrase = "recorded incident review"
-    elif document and document.format == OutputFormat.EXECUTIVE_BRIEF:
-        format_phrase = "recorded briefing"
+    subject_noun = _subject_noun(document)
+    event_summary = _subject_event_summary(artifacts)
 
-    if participants and themes:
-        return f"{participants} {activity} around {themes}."
-    if participants:
-        return f"{participants} {activity} in a {format_phrase}."
-    if themes:
-        return f"This {asset.modality.value} file {activity} around {themes}."
+    if topic:
+        return f"{subject_noun} on {topic} {activity}."
+    if event_summary:
+        return f"{event_summary}."
     if entity_text:
-        return f"This {asset.modality.value} file {activity} involving {entity_text}."
+        return f"{subject_noun} involving {entity_text} {activity}."
+    if participants:
+        return f"{participants} lead a {subject_noun.lower()} that {activity}."
     if document and document.title:
         title_text = _clip_subject_text(document.title, limit=100).strip(" .")
-        return f"This {asset.modality.value} file documents {title_text.lower()}."
-    return f"This {asset.modality.value} file {activity}."
+        return f"{subject_noun} documents {title_text.lower()}."
+    return f"The recording {activity}."
 
 
 def _normalize_subject_line(text: str, fallback: str) -> str:
@@ -257,6 +945,9 @@ def _normalize_subject_line(text: str, fallback: str) -> str:
     words = clean.split()
     if len(words) > SUBJECT_MAX_WORDS:
         clean = " ".join(words[:SUBJECT_MAX_WORDS]).rstrip(" ,;:-")
+
+    if _subject_line_is_unusable(clean):
+        clean = fallback
 
     if clean and clean[-1] not in ".!?":
         clean = f"{clean}."
@@ -297,24 +988,30 @@ def build_subject_line_prompt(
         context_lines.append(f"- [{artifact.kind}] {preview}")
         source_refs.append(artifact.artifact_id)
 
+    topic = _subject_topic(memory, artifacts, document)
     summary_lines = [
         f"Filename: {asset.filename}",
         f"Modality: {asset.modality.value}",
         f"Duration seconds: {asset.duration_s:.1f}",
         f"Document format: {document.format.value if document and hasattr(document.format, 'value') else ''}",
-        f"Document title: {document.title if document else ''}",
         f"Main actors: {', '.join(memory.main_actors[:6]) or 'none'}",
         f"Themes: {', '.join(memory.inferred_themes[:6]) or 'none'}",
+        f"Best topic candidate: {topic or 'none'}",
         f"Open loops: {len(memory.open_loops)}",
         "Artifact counts: " + ", ".join(f"{kind}={count}" for kind, count in sorted(kind_counts.items())),
         "Representative artifacts:",
         *(context_lines or ["- [none] no artifact context available"]),
         "",
-        f"Write one factual sentence only, under {SUBJECT_MAX_WORDS} words, describing what this file is about.",
+        f"Write one factual sentence only, under {SUBJECT_MAX_WORDS} words, describing what the recording is about.",
+        "Write like a professional editor: specific, clean, and complete.",
+        "Lead with the topic, not with a file label or a speaker list.",
+        "Avoid vague phrasing such as current workstream, main activity, discussion focused, and open questions around.",
+        "Do not begin with conjunctions like And/But/Or.",
+        "Mention people only when they are clearly relevant and confidently identified.",
     ]
     system_prompt = (
         "You create concise archival subject lines for processed media files. "
-        "Return exactly one sentence with no markdown, no quotes, no file IDs, and no speaker labels."
+        "Return exactly one sentence with no markdown, no quotes, no file IDs, and no speaker labels unless they are essential to understanding the topic."
     )
     return system_prompt, "\n".join(summary_lines), source_refs
 
@@ -335,42 +1032,96 @@ def _generate_subject_line(
         "error": None,
     }
 
-    if not OPENCLAW_GATEWAY_TOKEN:
+    if not _resolve_openclaw_gateway_token():
         return _normalize_subject_line(fallback, fallback), details | {"reason": "gateway_unconfigured"}
 
     try:
-        import requests
-
-        response = requests.post(
-            f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
-            json={
-                "model": OPENCLAW_CHAT_MODEL,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "user": f"media-subject:{asset.media_id}",
-            },
-            headers={
-                "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
-                "Content-Type": "application/json",
-                "x-openclaw-session-key": f"media-subject:{asset.media_id}",
-            },
+        content, error = _call_openclaw_gateway(
+            asset=asset,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            purpose="media-subject",
             timeout=90,
         )
-        response.raise_for_status()
-        payload = response.json()
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if error:
+            raise RuntimeError(error)
         subject_line = _normalize_subject_line(content, fallback)
-        return subject_line, details | {"generator": "openclaw", "model": OPENCLAW_CHAT_MODEL}
+        return subject_line, details | {"generator": "openclaw", "model": _openclaw_media_model()}
     except Exception as exc:
         logger.warning("Subject line inference failed for %s: %s", asset.filename, exc)
         return _normalize_subject_line(fallback, fallback), details | {
             "reason": "gateway_error",
             "error": str(exc),
-            "model": OPENCLAW_CHAT_MODEL,
+            "model": _openclaw_media_model(),
         }
+
+
+def _compose_document_via_openclaw(
+    asset: MediaAsset,
+    memory: ContextualMemory,
+    recaps: list[LocalRecap],
+    events: list,
+    output_format: OutputFormat,
+) -> Optional[ComposedDocument]:
+    if not _resolve_openclaw_gateway_token():
+        return None
+
+    system_prompt, user_prompt = build_compose_prompt(memory, recaps, events, output_format)
+    user_prompt = (
+        f"{user_prompt}\n\n"
+        "## Output constraints\n"
+        "Return markdown only.\n"
+        "Use the exact requested section headings.\n"
+        "Write like a professional technical writer: clear, relevant, concrete, and concise.\n"
+        "Do not invent participants, decisions, or follow-up work.\n"
+        "Avoid filler, hedging, and repetitive phrasing.\n"
+    )
+    content, error = _call_openclaw_gateway(
+        asset=asset,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        purpose="media-compose",
+        timeout=180,
+    )
+    if error or not content or "## " not in content:
+        return None
+    try:
+        return compose_document(memory, recaps, events, output_format=output_format, composed_text=content)
+    except Exception:
+        logger.warning("Failed to parse composed markdown for %s", asset.filename)
+        return None
+
+
+def _backfill_memory_from_document(memory: ContextualMemory, document: Optional[ComposedDocument]) -> ContextualMemory:
+    if not document or not document.sections:
+        return memory
+
+    context_section = next((section for section in document.sections if str(section.get("heading") or "").strip().lower() == "context overview"), None)
+    topic_section = next((section for section in document.sections if str(section.get("heading") or "").strip().lower() == "key topics"), None)
+
+    if context_section:
+        paragraphs = [part.strip() for part in str(context_section.get("content") or "").split("\n\n") if part.strip()]
+        if paragraphs:
+            memory.context_overview = paragraphs[0]
+
+    if topic_section:
+        topics: list[str] = []
+        for line in str(topic_section.get("content") or "").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            topic = re.sub(r"^\-\s*(?:\[[^\]]+\]\s*)?", "", stripped).strip()
+            topic = strip_summary_boilerplate(topic).strip(" .")
+            if not topic or is_weak_topic_phrase(topic) or is_generic_topic_phrase(topic):
+                continue
+            if topic not in topics:
+                topics.append(topic)
+            if len(topics) >= 6:
+                break
+        if topics:
+            memory.inferred_themes = topics
+
+    return memory
 
 
 # ── Pipeline Execution ──────────────────────────────────────────────────
@@ -381,6 +1132,7 @@ def process_media_file(
     output_format: Optional[OutputFormat] = None,
     recap_window_s: float = 60.0,
     metadata: Optional[dict] = None,
+    force_reprocess: bool = False,
 ) -> dict:
     """Process a single media file through the full pipeline.
 
@@ -404,13 +1156,42 @@ def process_media_file(
         asset = register_asset(path, metadata=metadata)
         job.media_id = asset.media_id
         result["media_id"] = asset.media_id
-        result["asset"] = {
-            "path": asset.path,
-            "filename": asset.filename,
-            "modality": asset.modality.value,
-            "duration_s": asset.duration_s,
-            "file_hash": asset.file_hash,
-        }
+        result["asset"] = _asset_result_payload(asset)
+
+        if not force_reprocess:
+            existing_result = _load_saved_pipeline_result(asset.media_id)
+            pipeline_current = _pipeline_result_is_current(
+                existing_result,
+                asset_path=asset.path,
+                asset_file_hash=asset.file_hash,
+                asset_file_size_bytes=asset.file_size_bytes,
+                requested_output_format=output_format,
+            )
+            if pipeline_current:
+                if not _vectorstore_layer_is_current(
+                    existing_result,
+                    media_id=asset.media_id,
+                    asset_file_hash=asset.file_hash,
+                ):
+                    backfill_stats = _backfill_saved_vectorstore_projection(asset, existing_result)
+                    if isinstance(existing_result, dict):
+                        layers = dict(existing_result.get("layers") or {})
+                        layers["L6_vectorstore"] = backfill_stats
+                        existing_result["layers"] = layers
+
+                if _vectorstore_layer_is_current(
+                    existing_result,
+                    media_id=asset.media_id,
+                    asset_file_hash=asset.file_hash,
+                ):
+                    reused_result = dict(existing_result)
+                    reused_result["job_id"] = job.job_id
+                    reused_result["reused_existing_result"] = True
+                    reused_result["skip_reason"] = "current_pipeline_result"
+                    reused_result["asset"] = _asset_result_payload(asset)
+                    _update_job(job, status="done", current_layer="", progress=1.0, finished_at=time.time())
+                    logger.info("Skipping unchanged media file %s; current pipeline result already exists", asset.filename)
+                    return reused_result
 
         # ── Derive transcription for audio/video ────────────────────
         transcript_payload = None
@@ -423,6 +1204,7 @@ def process_media_file(
                 "text": transcript_payload.get("text", ""),
                 "meta": transcript_payload.get("meta", {}),
                 "segment_count": len(transcript_segments or []),
+                "vtt_text": _build_transcript_vtt_text(asset, transcript_payload),
             }
 
         # ── L1: Filter ──────────────────────────────────────────────
@@ -458,15 +1240,18 @@ def process_media_file(
         job.recaps_count = len(recaps)
         result["layers"]["L3_recaps"] = {
             "recap_count": len(recaps),
+            "ledger_entry_count": sum(len(recap.ledger_entries) for recap in recaps),
         }
 
         # ── L4: Build memory ───────────────────────────────────────
         _update_job(job, status="memorizing", current_layer="L4_memory", progress=0.85)
-        memory = build_memory_from_recaps(recaps, media_id=asset.media_id)
+        memory = build_memory_from_recaps(recaps, media_id=asset.media_id, events=all_events)
         result["layers"]["L4_memory"] = {
+            "context_overview": memory.context_overview,
             "main_actors": memory.main_actors,
             "themes": memory.inferred_themes,
             "open_loops_count": len(memory.open_loops),
+            "evidence_map_keys": sorted(memory.evidence_map.keys()),
         }
 
         # ── L5: Compose document ───────────────────────────────────
@@ -475,6 +1260,17 @@ def process_media_file(
             output_format = select_output_format(memory, all_events)
 
         document = compose_document(memory, recaps, all_events, output_format=output_format)
+        llm_document = _compose_document_via_openclaw(asset, memory, recaps, all_events, output_format)
+        if llm_document is not None:
+            document = llm_document
+            memory = _backfill_memory_from_document(memory, document)
+            result["layers"]["L4_memory"] = {
+                "context_overview": memory.context_overview,
+                "main_actors": memory.main_actors,
+                "themes": memory.inferred_themes,
+                "open_loops_count": len(memory.open_loops),
+                "evidence_map_keys": sorted(memory.evidence_map.keys()),
+            }
         result["layers"]["L5_compose"] = {
             "format": document.format.value,
             "title": document.title,
@@ -489,7 +1285,7 @@ def process_media_file(
         }
 
         # ── Build and persist canonical artifact bundle ────────────
-        artifacts = _build_layer_artifacts(
+        trace_artifacts = _build_layer_artifacts(
             asset,
             transcript_payload,
             filter_results,
@@ -499,16 +1295,6 @@ def process_media_file(
             document,
             job,
         )
-        result["artifacts"] = [_artifact_to_dict(artifact) for artifact in artifacts]
-        result["artifact_count"] = len(result["artifacts"])
-
-        # ── L6: Vectorstore projection ─────────────────────────────
-        # Insert transcript chunks into Milvus for hybrid search.
-        # This makes the transcribed media searchable via the same
-        # collections/search infrastructure as manually-indexed files.
-        _update_job(job, status="indexing", current_layer="L6_vectorstore", progress=0.96)
-        vectorstore_result = _insert_into_vectorstore(asset, filter_results, all_events, recaps, memory, document)
-        result["layers"]["L6_vectorstore"] = vectorstore_result
 
         # Store prompts for optional LLM enhancement
         result["prompts"] = {}
@@ -526,16 +1312,16 @@ def process_media_file(
 
         # ── Final subject line inference ───────────────────────────
         _update_job(job, status="summarizing", current_layer="L7_subject_line", progress=0.98)
-        subject_sys, subject_user, _ = build_subject_line_prompt(asset, artifacts, memory, document)
+        subject_sys, subject_user, _ = build_subject_line_prompt(asset, trace_artifacts, memory, document)
         result["prompts"]["subject_line"] = {"system": subject_sys, "user": subject_user}
-        subject_line, subject_details = _generate_subject_line(asset, artifacts, memory, document)
+        subject_line, subject_details = _generate_subject_line(asset, trace_artifacts, memory, document)
         result["subject_line"] = subject_line
         result["document"]["subject_line"] = subject_line
         result["layers"]["L7_subject_line"] = {
             "subject_line": subject_line,
             **subject_details,
         }
-        artifacts.append(DerivedArtifact(
+        trace_artifacts.append(DerivedArtifact(
             media_id=asset.media_id,
             kind="subject_line",
             start_s=0.0,
@@ -550,10 +1336,25 @@ def process_media_file(
             },
             source_refs=subject_details.get("context_artifact_refs", []),
         ))
-        artifacts.sort(key=lambda artifact: (artifact.start_s, artifact.end_s, artifact.kind, artifact.artifact_id))
-        result["artifacts"] = [_artifact_to_dict(artifact) for artifact in artifacts]
-        result["artifact_count"] = len(result["artifacts"])
-        job.artifacts_count = len(artifacts)
+        trace_artifacts.sort(key=lambda artifact: (artifact.start_s, artifact.end_s, artifact.kind, artifact.artifact_id))
+        public_artifacts = _select_public_artifacts(trace_artifacts)
+        pipeline_stamp = _build_pipeline_stamp(
+            asset,
+            output_format=output_format,
+            document_format=document.format.value if hasattr(document.format, "value") else str(document.format),
+        )
+        result["archivist_pipeline"] = pipeline_stamp
+        result["document"]["archivist_pipeline"] = pipeline_stamp
+        result["artifacts"] = [_artifact_to_dict(artifact) for artifact in public_artifacts]
+        result["artifact_count"] = len(public_artifacts)
+        result["trace_artifact_count"] = len(trace_artifacts)
+        result["trace_artifact_counts"] = _artifact_kind_counts(trace_artifacts)
+        job.artifacts_count = len(public_artifacts)
+        save_artifact_bundle(
+            asset.media_id,
+            trace_artifacts,
+            bundle_metadata={"archivist_pipeline": pipeline_stamp},
+        )
 
         # Persist the canonical result before embedding it into the media file.
         result_path = _save_pipeline_result(asset.media_id, result)
@@ -570,7 +1371,33 @@ def process_media_file(
             transcript_payload=transcript_payload,
             result_path=sidecar_path or result_path,
             subject_line=result.get("subject_line"),
+            pipeline_stamp=pipeline_stamp,
         )
+        asset = _refresh_asset_state_from_disk(asset)
+        result["asset"] = _asset_result_payload(asset)
+        final_pipeline_stamp = _build_pipeline_stamp(
+            asset,
+            output_format=output_format,
+            document_format=document.format.value if hasattr(document.format, "value") else str(document.format),
+            generated_at=pipeline_stamp.get("generated_at") if isinstance(pipeline_stamp, dict) else None,
+        )
+        result["archivist_pipeline"] = final_pipeline_stamp
+        result["document"]["archivist_pipeline"] = final_pipeline_stamp
+        save_artifact_bundle(
+            asset.media_id,
+            trace_artifacts,
+            bundle_metadata={"archivist_pipeline": final_pipeline_stamp},
+        )
+        if transcript_payload:
+            refreshed_vtt_path = _write_transcript_sidecar(asset, transcript_payload, pipeline_stamp=final_pipeline_stamp)
+            if refreshed_vtt_path is not None:
+                result["injection"]["transcript_sidecar_path"] = str(refreshed_vtt_path)
+
+        # ── L6: Vectorstore projection ─────────────────────────────
+        # Insert transcript chunks into Milvus after metadata embedding so the
+        # stored file hash matches the final on-disk asset state.
+        _update_job(job, status="indexing", current_layer="L6_vectorstore", progress=0.99)
+        result["layers"]["L6_vectorstore"] = _insert_trace_artifacts_into_vectorstore(asset, trace_artifacts)
         _save_pipeline_result(asset.media_id, result)
         if sidecar_path is not None:
             _write_pipeline_sidecar(asset, result)
@@ -607,6 +1434,11 @@ def _artifact_to_dict(artifact: DerivedArtifact) -> dict:
 
 def _derive_transcript(asset: MediaAsset, job: PipelineJob) -> Optional[dict]:
     """Derive a transcript from audio/video using the configured transcription backend."""
+    existing_payload = _load_existing_transcript_payload(asset)
+    if existing_payload:
+        logger.info("Reusing transcript sidecar for %s", asset.filename)
+        return existing_payload
+
     try:
         import transcription_service
         if not transcription_service.is_available():
@@ -620,7 +1452,14 @@ def _derive_transcript(asset: MediaAsset, job: PipelineJob) -> Optional[dict]:
             filename=asset.filename,
             word_timestamps=True,
         )
-        return {"text": transcription, "meta": meta, "segments": segments}
+        cleaned_segments, cleanup_meta = clean_transcript_segments(segments)
+        transcript_meta = dict(meta or {})
+        transcript_meta.update(cleanup_meta)
+        transcript_meta["segment_count"] = len(cleaned_segments)
+        readable_text = build_readable_transcript_text(cleaned_segments)
+        if not readable_text:
+            readable_text = " ".join(str(part.get("text") or "").strip() for part in cleaned_segments).strip()
+        return {"text": readable_text, "meta": transcript_meta, "segments": cleaned_segments}
 
     except ImportError:
         logger.info("transcription_service not available")
@@ -733,7 +1572,7 @@ def _build_layer_artifacts(
                 "speakers": evt.speakers,
                 "visual_entities": evt.visual_entities,
                 "salience_tags": [t.value if hasattr(t, 'value') else str(t) for t in evt.salience_tags],
-                "entities": evt.metadata.get("entities", []),
+                **evt.metadata,
             },
             source_refs=evt.source_refs,
         ))
@@ -751,11 +1590,14 @@ def _build_layer_artifacts(
                 "layer": "L3",
                 "recap_id": recap.recap_id,
                 "group_type": recap.group_type,
+                "window_summary": recap.window_summary,
                 "salient_entities": recap.salient_entities,
                 "unresolved_questions": recap.unresolved_questions,
                 "emotional_tone": recap.emotional_tone,
                 "causal_links": recap.causal_links,
                 "event_ids": recap.event_ids,
+                "summary_refs": recap.summary_refs,
+                "ledger_entries": recap.ledger_entries,
             },
             source_refs=recap.source_refs,
         ))
@@ -768,6 +1610,7 @@ def _build_layer_artifacts(
         end_s=asset.duration_s,
         content=_json.dumps({
             "memory_id": memory.memory_id,
+            "context_overview": memory.context_overview,
             "main_actors": memory.main_actors,
             "timeline_anchors": memory.timeline_anchors,
             "locations": memory.locations,
@@ -777,6 +1620,8 @@ def _build_layer_artifacts(
             "contradictions": memory.contradictions,
             "notable_evidence": memory.notable_evidence,
             "final_takeaways": memory.final_takeaways,
+            "interpretive_notes": memory.interpretive_notes,
+            "evidence_map": memory.evidence_map,
             "recap_ids": memory.recap_ids,
         }),
         confidence=1.0,
@@ -803,11 +1648,10 @@ def _build_layer_artifacts(
     ))
 
     artifacts.sort(key=lambda artifact: (artifact.start_s, artifact.end_s, artifact.kind, artifact.artifact_id))
-    job.artifacts_count = len(artifacts)
 
     logger.info(
-        "Saved %d artifacts for %s (scenes=%d, events=%d, recaps=%d, memory=1, doc=1)",
-        job.artifacts_count, asset.filename,
+        "Saved %d trace artifacts for %s (scenes=%d, events=%d, recaps=%d, memory=1, doc=1)",
+        len(artifacts), asset.filename,
         len(filter_results.get("scenes", [])), len(events), len(recaps),
     )
     return artifacts
@@ -822,14 +1666,42 @@ def _format_vtt_timestamp(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02}.{millis:03}"
 
 
-def _write_transcript_sidecar(asset: MediaAsset, transcript_payload: Optional[dict]) -> Optional[Path]:
+def _parse_vtt_timestamp_seconds(value: str) -> float:
+    raw = str(value or "").strip().replace(",", ".")
+    parts = raw.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid VTT timestamp: {value}")
+    hours = int(parts[0])
+    minutes = int(parts[1])
+    seconds = float(parts[2])
+    return max(0.0, hours * 3600 + minutes * 60 + seconds)
+
+
+def _write_transcript_sidecar(
+    asset: MediaAsset,
+    transcript_payload: Optional[dict],
+    pipeline_stamp: Optional[dict[str, object]] = None,
+) -> Optional[Path]:
+    vtt_text = _build_transcript_vtt_text(asset, transcript_payload, pipeline_stamp=pipeline_stamp)
+    if not vtt_text:
+        return None
+
+    vtt_path = _sidecar_path_for_write(asset.path, ".vtt")
+    vtt_path.write_text(vtt_text, encoding="utf-8")
+    return vtt_path
+
+
+def _build_transcript_vtt_text(
+    asset: MediaAsset,
+    transcript_payload: Optional[dict],
+    pipeline_stamp: Optional[dict[str, object]] = None,
+) -> Optional[str]:
     if not transcript_payload:
         return None
     segments = transcript_payload.get("segments") or []
     if not segments:
         return None
 
-    vtt_path = Path(asset.path).with_suffix(".vtt")
     meta = transcript_payload.get("meta", {})
     lines = [
         "WEBVTT",
@@ -837,8 +1709,29 @@ def _write_transcript_sidecar(asset: MediaAsset, transcript_payload: Optional[di
         "NOTE",
         f"Source: {asset.path}",
         f"Language: {meta.get('lang', 'en')}",
+        (
+            f"Archivist-Pipeline: {pipeline_stamp.get('pipeline_version')}"
+            if isinstance(pipeline_stamp, dict) and pipeline_stamp.get("pipeline_version")
+            else None
+        ),
+        (
+            f"Archivist-Commit: {pipeline_stamp.get('repo_commit')}"
+            if isinstance(pipeline_stamp, dict) and pipeline_stamp.get("repo_commit")
+            else None
+        ),
+        (
+            f"Archivist-Compat: {pipeline_stamp.get('pipeline_compat_version')}"
+            if isinstance(pipeline_stamp, dict) and pipeline_stamp.get("pipeline_compat_version")
+            else None
+        ),
+        (
+            f"Archivist-Stamp: {_embedded_processing_stamp_text(pipeline_stamp)}"
+            if isinstance(pipeline_stamp, dict)
+            else None
+        ),
         "",
     ]
+    lines = [line for line in lines if line is not None]
     for segment in segments:
         if isinstance(segment, dict):
             start_s = float(segment.get("start", 0.0) or 0.0)
@@ -857,15 +1750,90 @@ def _write_transcript_sidecar(asset: MediaAsset, transcript_payload: Optional[di
         ])
     if len(lines) <= 6:
         return None
-    vtt_path.write_text("\n".join(lines), encoding="utf-8")
-    return vtt_path
+    return "\n".join(lines)
 
 
 def _existing_transcript_sidecar(asset: MediaAsset) -> Optional[Path]:
-    vtt_path = Path(asset.path).with_suffix(".vtt")
-    if vtt_path.exists() and vtt_path.stat().st_size > 0:
-        return vtt_path
-    return None
+    return _existing_sidecar_path(asset.path, ".vtt")
+
+
+def _load_existing_transcript_payload(asset: MediaAsset) -> Optional[dict]:
+    vtt_path = _existing_transcript_sidecar(asset)
+    if vtt_path is None:
+        return None
+
+    try:
+        raw = vtt_path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+    except OSError as exc:
+        logger.warning("Failed to read transcript sidecar for %s: %s", asset.filename, exc)
+        return None
+
+    segments: list[dict] = []
+    transcript_lines: list[str] = []
+    language = "en"
+    lines = raw.split("\n")
+    index = 0
+
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line:
+            index += 1
+            continue
+        if line.startswith("NOTE"):
+            index += 1
+            while index < len(lines) and lines[index].strip():
+                note_line = lines[index].strip()
+                if note_line.lower().startswith("language:"):
+                    language = note_line.split(":", 1)[1].strip() or language
+                index += 1
+            continue
+        if "-->" not in line:
+            index += 1
+            continue
+
+        try:
+            start_raw, end_raw = [part.strip() for part in line.split("-->", 1)]
+            start_s = _parse_vtt_timestamp_seconds(start_raw.split()[0])
+            end_s = _parse_vtt_timestamp_seconds(end_raw.split()[0])
+        except (ValueError, IndexError):
+            index += 1
+            continue
+
+        index += 1
+        cue_lines: list[str] = []
+        while index < len(lines) and lines[index].strip():
+            cue_lines.append(lines[index].strip())
+            index += 1
+
+        text = " ".join(cue_lines).strip()
+        if not text or end_s <= start_s:
+            continue
+
+        transcript_lines.append(text)
+        segments.append({
+            "start": start_s,
+            "end": end_s,
+            "text": text,
+            "no_speech_prob": 0.0,
+        })
+
+    if not segments:
+        return None
+
+    cleaned_segments, cleanup_meta = clean_transcript_segments(segments)
+    readable_text = build_readable_transcript_text(cleaned_segments)
+
+    return {
+        "text": readable_text,
+        "meta": {
+            "lang": language,
+            "source": "transcript_sidecar",
+            "reused": True,
+            "segment_count": len(cleaned_segments),
+            **cleanup_meta,
+        },
+        "segments": cleaned_segments,
+    }
 
 
 def _count_ffprobe_streams(path: Path, stream_selector: str) -> int:
@@ -941,6 +1909,7 @@ def _inject_metadata_into_file(
     transcript_payload: Optional[dict] = None,
     result_path: Optional[Path] = None,
     subject_line: Optional[str] = None,
+    pipeline_stamp: Optional[dict[str, object]] = None,
 ) -> dict:
     """Inject transcript, artifact bundle, and summary metadata back into the source file."""
     import subprocess
@@ -963,7 +1932,7 @@ def _inject_metadata_into_file(
         logger.warning("Cannot inject metadata - %s", info["error"])
         return info
 
-    transcript_sidecar = _write_transcript_sidecar(asset, transcript_payload)
+    transcript_sidecar = _write_transcript_sidecar(asset, transcript_payload, pipeline_stamp=pipeline_stamp)
     if transcript_sidecar is None:
         transcript_sidecar = _existing_transcript_sidecar(asset)
     if transcript_sidecar:
@@ -979,13 +1948,15 @@ def _inject_metadata_into_file(
     description_parts = []
     if memory.inferred_themes:
         description_parts.append(f"Themes: {', '.join(memory.inferred_themes)}")
-    cleaned_participants = _clean_subject_terms(memory.main_actors, limit=8)
+    cleaned_participants = _clean_subject_participants(memory.main_actors, limit=8)
     if cleaned_participants:
         description_parts.append(f"Participants: {', '.join(cleaned_participants)}")
     if memory.open_loops:
         description_parts.append(f"Open questions: {len(memory.open_loops)}")
     if result_path:
         description_parts.append(f"Archivist bundle: {result_path.name}")
+    if pipeline_stamp:
+        description_parts.append(_embedded_processing_stamp_text(pipeline_stamp))
     if description_parts:
         metadata_args.extend(["-metadata", f"comment={' | '.join(description_parts)}"])
 
@@ -995,6 +1966,25 @@ def _inject_metadata_into_file(
     if document and document.format:
         fmt_label = document.format.value if hasattr(document.format, "value") else str(document.format)
         metadata_args.extend(["-metadata", f"genre={fmt_label}"])
+    if pipeline_stamp:
+        hash_preview = str(pipeline_stamp.get("source_file_hash") or "").strip()[:12]
+        version_tag = str(
+            pipeline_stamp.get("repo_commit_suffix")
+            or pipeline_stamp.get("pipeline_version")
+            or MEDIA_PIPELINE_VERSION
+        ).strip()
+        compat_version = str(
+            pipeline_stamp.get("pipeline_compat_version")
+            or MEDIA_PIPELINE_COMPAT_VERSION
+        ).strip()
+        metadata_args.extend([
+            "-metadata",
+            (
+                "keywords="
+                f"archivist,media-pipeline,version:{version_tag or 'unknown'},"
+                f"compat:{compat_version or 'unknown'},hash:{hash_preview or 'unknown'}"
+            ),
+        ])
 
     suffix = src.suffix.lower()
     embed_transcript_stream = transcript_sidecar is not None and suffix in {".mkv", ".mp4"}
@@ -1086,6 +2076,326 @@ def _inject_metadata_into_file(
     return info
 
 
+def _trace_artifacts_to_vectorstore_chunks(
+    asset: MediaAsset,
+    trace_artifacts: list[DerivedArtifact],
+):
+    from hashlib import sha256
+    from transcripts.chunking import TranscriptChunk
+
+    source_id = _expected_vectorstore_source_id(asset.media_id)
+    display_path = asset.path
+    chunks: list[TranscriptChunk] = []
+
+    for artifact in trace_artifacts:
+        text = str(artifact.content or "").strip()
+        if artifact.kind == "speech_segment":
+            if len(text.split()) < 3:
+                continue
+            chunk_seed = (
+                f"{source_id}|0|{int(artifact.start_s * 1000)}|"
+                f"{int((artifact.end_s - artifact.start_s))}|{text[:100]}"
+            )
+            chunk_id = sha256(chunk_seed.encode()).hexdigest()[:24]
+            chunks.append(
+                TranscriptChunk(
+                    chunk_id=chunk_id,
+                    source_id=source_id,
+                    path=display_path,
+                    text=text,
+                    t_start_ms=int(artifact.start_s * 1000),
+                    t_end_ms=int(artifact.end_s * 1000),
+                    chunk_duration_s=max(1, int(artifact.end_s - artifact.start_s)),
+                    level=0,
+                    parent_id=None,
+                    doc_type="media_transcript",
+                    source_type="media",
+                    topic_label=None,
+                    language=None,
+                    tag="utterance",
+                )
+            )
+            continue
+
+        if artifact.kind == "event":
+            if len(text.split()) < 5:
+                continue
+            event_type = str(artifact.metadata.get("event_type") or "event").strip() or "event"
+            speakers = artifact.metadata.get("speakers") or []
+            context_prefix = f"[{', '.join(str(s) for s in speakers)}] " if speakers else ""
+            chunk_seed = (
+                f"{source_id}|1|{int(artifact.start_s * 1000)}|"
+                f"{int(artifact.end_s - artifact.start_s)}|event"
+            )
+            chunk_id = sha256(chunk_seed.encode()).hexdigest()[:24]
+            chunks.append(
+                TranscriptChunk(
+                    chunk_id=chunk_id,
+                    source_id=source_id,
+                    path=display_path,
+                    text=f"{context_prefix}{text}",
+                    t_start_ms=int(artifact.start_s * 1000),
+                    t_end_ms=int(artifact.end_s * 1000),
+                    chunk_duration_s=max(1, int(artifact.end_s - artifact.start_s)),
+                    level=1,
+                    parent_id=None,
+                    doc_type="media_event",
+                    source_type="media",
+                    topic_label=event_type,
+                    language=None,
+                    tag=f"event_{event_type}",
+                )
+            )
+            continue
+
+        if artifact.kind == "recap":
+            if len(text.split()) < 8:
+                continue
+            chunk_seed = f"{source_id}|2|{int(artifact.start_s * 1000)}|60|recap"
+            chunk_id = sha256(chunk_seed.encode()).hexdigest()[:24]
+            chunks.append(
+                TranscriptChunk(
+                    chunk_id=chunk_id,
+                    source_id=source_id,
+                    path=display_path,
+                    text=text,
+                    t_start_ms=int(artifact.start_s * 1000),
+                    t_end_ms=int(artifact.end_s * 1000),
+                    chunk_duration_s=max(1, int(artifact.end_s - artifact.start_s)),
+                    level=2,
+                    parent_id=None,
+                    doc_type="media_recap",
+                    source_type="media",
+                    topic_label=str(artifact.metadata.get("group_type") or "").strip() or None,
+                    language=None,
+                    tag="recap",
+                )
+            )
+            continue
+
+        if artifact.kind == "document":
+            if len(text.split()) < 10:
+                continue
+            chunk_seed = f"{source_id}|3|0|{int(asset.duration_s)}|doc"
+            chunk_id = sha256(chunk_seed.encode()).hexdigest()[:24]
+            chunks.append(
+                TranscriptChunk(
+                    chunk_id=chunk_id,
+                    source_id=source_id,
+                    path=display_path,
+                    text=text[:65000],
+                    t_start_ms=0,
+                    t_end_ms=int(asset.duration_s * 1000),
+                    chunk_duration_s=max(1, int(asset.duration_s)),
+                    level=3,
+                    parent_id=None,
+                    doc_type="media_document",
+                    source_type="media",
+                    topic_label=str(artifact.metadata.get("format") or "").strip() or None,
+                    language=None,
+                    tag="doc_chunk",
+                )
+            )
+
+    return chunks
+
+
+def _insert_vectorstore_chunks(asset: MediaAsset, chunks) -> dict:
+    stats = {
+        "chunks_created": len(chunks),
+        "chunks_inserted": 0,
+        "collection": "documents_transcripts",
+        "error": None,
+        "source_id": _expected_vectorstore_source_id(asset.media_id),
+        "file_hash": asset.file_hash or "",
+    }
+    if not chunks:
+        stats["error"] = "No chunks generated from pipeline output"
+        return stats
+
+    alias = f"media_{asset.media_id[:8]}"
+    collection = None
+    try:
+        import os
+        from indexing_service import (
+            _ensure_chunk_collection,
+            _insert_chunks,
+            TRANSCRIPT_COLLECTION,
+        )
+        from pymilvus import connections
+
+        embedding_host = os.getenv("EMBEDDING_HOST", "localhost")
+        embedding_port = int(os.getenv("EMBEDDING_PORT", "8000"))
+        collection = _ensure_chunk_collection(
+            TRANSCRIPT_COLLECTION,
+            description="Documents and transcripts",
+            alias=alias,
+            ip_address=os.getenv("MILVUS_HOST", "localhost"),
+        )
+        try:
+            collection.load()
+        except Exception:
+            pass
+
+        try:
+            delete_expr = f'source_id == "{_expected_vectorstore_source_id(asset.media_id)}"'
+            collection.delete(delete_expr)
+            collection.flush()
+        except Exception:
+            pass
+
+        inserted = _insert_chunks(
+            collection=collection,
+            chunks=chunks,
+            filehash=asset.file_hash or "",
+            embedding_host=embedding_host,
+            embedding_port=embedding_port,
+        )
+        try:
+            collection.flush()
+        except Exception:
+            pass
+        stats["chunks_inserted"] = inserted
+        stats["collection"] = TRANSCRIPT_COLLECTION
+        logger.info(
+            "Vectorstore: inserted %d/%d chunks for %s into %s",
+            inserted, len(chunks), asset.filename, TRANSCRIPT_COLLECTION,
+        )
+    except Exception as exc:
+        stats["error"] = str(exc)
+        logger.warning("Vectorstore insertion failed for %s: %s", asset.media_id, exc)
+    finally:
+        if collection is not None:
+            try:
+                collection.release()
+            except Exception:
+                pass
+        try:
+            from pymilvus import connections
+
+            connections.disconnect(alias)
+        except Exception:
+            pass
+    return stats
+
+
+def _insert_trace_artifacts_into_vectorstore(asset: MediaAsset, trace_artifacts: list[DerivedArtifact]) -> dict:
+    return _insert_vectorstore_chunks(
+        asset,
+        _trace_artifacts_to_vectorstore_chunks(asset, trace_artifacts),
+    )
+
+
+def _backfill_saved_vectorstore_projection(asset: MediaAsset, result: Optional[dict]) -> dict:
+    if not isinstance(result, dict):
+        return {
+            "chunks_created": 0,
+            "chunks_inserted": 0,
+            "collection": "documents_transcripts",
+            "error": "Saved pipeline result missing",
+            "source_id": _expected_vectorstore_source_id(asset.media_id),
+            "file_hash": asset.file_hash or "",
+        }
+
+    trace_artifacts = get_artifacts(asset.media_id, scope="trace")
+    if not trace_artifacts:
+        return {
+            "chunks_created": 0,
+            "chunks_inserted": 0,
+            "collection": "documents_transcripts",
+            "error": "No trace artifacts available for vectorstore backfill",
+            "source_id": _expected_vectorstore_source_id(asset.media_id),
+            "file_hash": asset.file_hash or "",
+        }
+
+    stats = _insert_trace_artifacts_into_vectorstore(asset, trace_artifacts)
+    layers = dict(result.get("layers") or {})
+    layers["L6_vectorstore"] = stats
+    result["layers"] = layers
+    _save_pipeline_result(asset.media_id, result)
+    return stats
+
+
+def backfill_saved_media_vectorstore(media_ids: Optional[list[str]] = None, limit: Optional[int] = None) -> dict:
+    requested_ids = [str(media_id or "").strip() for media_id in (media_ids or []) if str(media_id or "").strip()]
+    candidates: list[MediaAsset] = []
+    if requested_ids:
+        for media_id in requested_ids:
+            asset = get_asset(media_id)
+            if asset is not None:
+                candidates.append(asset)
+    else:
+        for item in list_assets():
+            media_id = str(item.get("media_id") or "").strip()
+            if not media_id:
+                continue
+            asset = get_asset(media_id)
+            if asset is not None:
+                candidates.append(asset)
+
+    summary = {
+        "checked": 0,
+        "backfilled": 0,
+        "skipped_current": 0,
+        "failed": 0,
+        "results": [],
+    }
+
+    for asset in candidates:
+        if limit is not None and summary["checked"] >= max(0, int(limit)):
+            break
+        summary["checked"] += 1
+        if _media_job_active(asset.media_id):
+            summary["results"].append({
+                "media_id": asset.media_id,
+                "path": asset.path,
+                "status": "skipped_active_job",
+            })
+            continue
+        saved_result = _load_saved_pipeline_result(asset.media_id)
+        if not _pipeline_result_is_current(
+            saved_result,
+            asset_path=asset.path,
+            asset_file_hash=asset.file_hash,
+            asset_file_size_bytes=asset.file_size_bytes,
+        ):
+            summary["results"].append({
+                "media_id": asset.media_id,
+                "path": asset.path,
+                "status": "skipped_pipeline_stale",
+            })
+            continue
+
+        if _vectorstore_layer_is_current(
+            saved_result,
+            media_id=asset.media_id,
+            asset_file_hash=asset.file_hash,
+        ):
+            summary["skipped_current"] += 1
+            summary["results"].append({
+                "media_id": asset.media_id,
+                "path": asset.path,
+                "status": "already_current",
+            })
+            continue
+
+        stats = _backfill_saved_vectorstore_projection(asset, saved_result)
+        if stats.get("error"):
+            summary["failed"] += 1
+            status = "error"
+        else:
+            summary["backfilled"] += 1
+            status = "backfilled"
+        summary["results"].append({
+            "media_id": asset.media_id,
+            "path": asset.path,
+            "status": status,
+            "vectorstore": stats,
+        })
+
+    return summary
+
+
 def _insert_into_vectorstore(
     asset: MediaAsset,
     filter_results: dict,
@@ -1110,7 +2420,16 @@ def _insert_into_vectorstore(
     The hybrid retrieval (dense + BM25 sparse) in the existing search
     infrastructure handles both semantic and keyword matching automatically.
     """
-    stats = {"chunks_created": 0, "chunks_inserted": 0, "collection": "", "error": None}
+    stats = {
+        "chunks_created": 0,
+        "chunks_inserted": 0,
+        "collection": "",
+        "error": None,
+        "source_id": _expected_vectorstore_source_id(asset.media_id),
+        "file_hash": asset.file_hash or "",
+    }
+    alias = f"media_{asset.media_id[:8]}"
+    collection = None
 
     try:
         from transcripts.chunking import TranscriptChunk
@@ -1248,7 +2567,6 @@ def _insert_into_vectorstore(
 
         embedding_host = os.getenv("EMBEDDING_HOST", "localhost")
         embedding_port = int(os.getenv("EMBEDDING_PORT", "8000"))
-        alias = f"media_{asset.media_id[:8]}"
 
         collection = _ensure_chunk_collection(
             TRANSCRIPT_COLLECTION,
@@ -1265,6 +2583,7 @@ def _insert_into_vectorstore(
         try:
             delete_expr = f'source_id == "media:{asset.media_id}"'
             collection.delete(delete_expr)
+            collection.flush()
         except Exception:
             pass
 
@@ -1275,14 +2594,12 @@ def _insert_into_vectorstore(
             embedding_host=embedding_host,
             embedding_port=embedding_port,
         )
-        stats["chunks_inserted"] = inserted
-        stats["collection"] = TRANSCRIPT_COLLECTION
-
-        from pymilvus import connections
         try:
-            connections.disconnect(alias)
+            collection.flush()
         except Exception:
             pass
+        stats["chunks_inserted"] = inserted
+        stats["collection"] = TRANSCRIPT_COLLECTION
 
         logger.info(
             "Vectorstore: inserted %d/%d chunks for %s into %s",
@@ -1292,6 +2609,18 @@ def _insert_into_vectorstore(
     except Exception as e:
         stats["error"] = str(e)
         logger.warning("Vectorstore insertion failed for %s: %s", asset.media_id, e)
+    finally:
+        if collection is not None:
+            try:
+                collection.release()
+            except Exception:
+                pass
+        try:
+            from pymilvus import connections
+
+            connections.disconnect(alias)
+        except Exception:
+            pass
 
     return stats
 
@@ -1306,110 +2635,156 @@ def _save_pipeline_result(media_id: str, result: dict):
     return result_file
 
 
+# ---------------------------------------------------------------------------
+# Compat-version migration and status
+# ---------------------------------------------------------------------------
+
+def pipeline_compat_status() -> dict:
+    """Return counts of current, stale, and broken pipeline results."""
+    current = stale = broken = 0
+    if not PIPELINE_STORE_DIR.is_dir():
+        return {"current": 0, "stale": 0, "broken": 0, "total": 0, "compat_version": MEDIA_PIPELINE_COMPAT_VERSION}
+    for result_file in PIPELINE_STORE_DIR.glob("*.json"):
+        try:
+            data = json.loads(result_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            broken += 1
+            continue
+        stamp = data.get("archivist_pipeline")
+        if not isinstance(stamp, dict):
+            broken += 1
+            continue
+        stamped_cv = str(stamp.get("pipeline_compat_version") or "").strip()
+        if stamped_cv == MEDIA_PIPELINE_COMPAT_VERSION:
+            current += 1
+        elif data.get("document") or data.get("transcript"):
+            stale += 1
+        else:
+            broken += 1
+    return {"current": current, "stale": stale, "broken": broken, "total": current + stale + broken, "compat_version": MEDIA_PIPELINE_COMPAT_VERSION}
+
+
+def migrate_pipeline_compat_version(*, dry_run: bool = False) -> dict:
+    """Stamp existing valid pipeline results with the current compat version.
+
+    Only updates results that have valid data (document or transcript) and
+    whose source file still exists with a matching hash.  Results where the
+    source has changed on disk are skipped so they get reprocessed instead.
+    """
+    migrated = 0
+    skipped_invalid = 0
+    skipped_changed = 0
+    skipped_current = 0
+    errors = 0
+
+    if not PIPELINE_STORE_DIR.is_dir():
+        return {"migrated": 0, "skipped_invalid": 0, "skipped_changed": 0, "skipped_current": 0, "errors": 0, "dry_run": dry_run}
+
+    for result_file in PIPELINE_STORE_DIR.glob("*.json"):
+        try:
+            data = json.loads(result_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            errors += 1
+            continue
+
+        stamp = data.get("archivist_pipeline")
+        if not isinstance(stamp, dict):
+            skipped_invalid += 1
+            continue
+
+        # Already current
+        stamped_cv = str(stamp.get("pipeline_compat_version") or "").strip()
+        if stamped_cv == MEDIA_PIPELINE_COMPAT_VERSION:
+            skipped_current += 1
+            continue
+
+        # Must have produced real output
+        if not (data.get("document") or data.get("transcript")):
+            skipped_invalid += 1
+            continue
+
+        # Verify source file still matches
+        source_path = str(stamp.get("source_path") or "").strip()
+        if source_path:
+            current_mtime = _current_source_mtime_ns(source_path)
+            stamped_mtime = stamp.get("source_mtime_ns")
+            if current_mtime is None:
+                # Source file gone -- skip, needs reprocess
+                skipped_changed += 1
+                continue
+            if stamped_mtime is not None and int(stamped_mtime) != current_mtime:
+                skipped_changed += 1
+                continue
+
+        if not dry_run:
+            stamp["pipeline_compat_version"] = MEDIA_PIPELINE_COMPAT_VERSION
+            try:
+                result_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except OSError:
+                errors += 1
+                continue
+        migrated += 1
+
+    return {
+        "migrated": migrated,
+        "skipped_invalid": skipped_invalid,
+        "skipped_changed": skipped_changed,
+        "skipped_current": skipped_current,
+        "errors": errors,
+        "dry_run": dry_run,
+        "compat_version": MEDIA_PIPELINE_COMPAT_VERSION,
+    }
+
+
 def get_pipeline_result(media_id: str) -> Optional[dict]:
     """Load a stored pipeline result."""
     result_file = PIPELINE_STORE_DIR / f"{media_id}.json"
     if not result_file.exists():
         return None
     try:
-        return json.loads(result_file.read_text(encoding="utf-8"))
+        result = json.loads(result_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+    transcript = result.get("transcript")
+    if not isinstance(transcript, dict):
+        return result
 
+    asset_path = ""
+    asset_info = result.get("asset")
+    if isinstance(asset_info, dict):
+        asset_path = str(asset_info.get("path") or "").strip()
+    if not asset_path:
+        stamp = result.get("archivist_pipeline")
+        if isinstance(stamp, dict):
+            asset_path = str(stamp.get("source_path") or "").strip()
 
-# ── Folder Watcher ──────────────────────────────────────────────────────
+    if asset_path:
+        payload = _load_existing_transcript_payload(MediaAsset(path=asset_path, filename=Path(asset_path).name))
+        if payload:
+            transcript["text"] = payload.get("text", transcript.get("text", ""))
+            transcript["meta"] = {
+                **(transcript.get("meta") if isinstance(transcript.get("meta"), dict) else {}),
+                **(payload.get("meta") if isinstance(payload.get("meta"), dict) else {}),
+            }
+            transcript["segment_count"] = len(payload.get("segments") or [])
 
+    if isinstance(transcript.get("vtt_text"), str) and transcript.get("vtt_text", "").strip():
+        return result
 
-def start_watcher(directories: list[str]):
-    """Start watching directories for new media files."""
-    global _watcher_thread, _watch_dirs
-    _watch_dirs = [d for d in directories if Path(d).is_dir()]
-    if not _watch_dirs:
-        logger.warning("No valid watch directories provided")
-        return
+    injection = result.get("injection")
+    if not isinstance(injection, dict):
+        return result
 
-    if _watcher_thread and _watcher_thread.is_alive():
-        stop_watcher()
+    transcript_sidecar_path = injection.get("transcript_sidecar_path")
+    if not isinstance(transcript_sidecar_path, str) or not transcript_sidecar_path.strip():
+        return result
 
-    _watcher_stop.clear()
-    _watcher_thread = threading.Thread(target=_watcher_loop, daemon=True, name="media-watcher")
-    _watcher_thread.start()
-    logger.info("Media watcher started for %d directories", len(_watch_dirs))
+    vtt_path = Path(transcript_sidecar_path)
+    if not vtt_path.exists():
+        return result
 
-
-def stop_watcher():
-    """Stop the folder watcher."""
-    _watcher_stop.set()
-    if _watcher_thread and _watcher_thread.is_alive():
-        _watcher_thread.join(timeout=10)
-    logger.info("Media watcher stopped")
-
-
-def _watcher_loop():
-    """Background loop that checks watch directories for new media files."""
-    processed_hashes: set[str] = set()
-
-    # Load already-processed hashes
-    index = _load_assets_index()
-    for asset_data in index.values():
-        if asset_data.get("file_hash") and _asset_record_complete(asset_data):
-            processed_hashes.add(asset_data["file_hash"])
-
-    while not _watcher_stop.is_set():
-        for directory in _watch_dirs:
-            try:
-                _scan_directory(directory, processed_hashes)
-            except Exception as e:
-                logger.error("Watcher error scanning %s: %s", directory, e)
-
-        _watcher_stop.wait(timeout=WATCH_INTERVAL_S)
-
-
-def _scan_directory(directory: str, processed_hashes: set[str]):
-    """Scan a directory for new media files and process them."""
-    from hashlib import sha256
-
-    dir_path = Path(directory)
-    index = _load_assets_index()
-    complete_paths = {
-        str(data.get("path") or ""): data
-        for data in index.values()
-        if _asset_record_complete(data)
-    }
-    for file_path in dir_path.rglob("*"):
-        if not file_path.is_file():
-            continue
-        if file_path.suffix.lower() not in ALL_MEDIA_EXTS:
-            continue
-
-        resolved_path = str(file_path.resolve())
-        existing_complete = complete_paths.get(resolved_path)
-        if existing_complete and existing_complete.get("file_hash"):
-            processed_hashes.add(existing_complete["file_hash"])
-            continue
-
-        # Quick hash check to avoid reprocessing
-        try:
-            h = sha256()
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-            file_hash = h.hexdigest()
-        except OSError:
-            continue
-
-        if file_hash in processed_hashes:
-            continue
-
-        logger.info("New media file detected: %s", file_path.name)
-        try:
-            result = process_media_file(str(file_path))
-            if not result.get("error"):
-                processed_hashes.add(file_hash)
-                complete_paths[resolved_path] = {
-                    "path": resolved_path,
-                    "media_id": result.get("media_id", ""),
-                    "file_hash": file_hash,
-                }
-        except Exception as e:
-            logger.error("Failed to process %s: %s", file_path.name, e)
+    try:
+        transcript["vtt_text"] = vtt_path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+    except OSError:
+        return result
+    return result

@@ -141,12 +141,16 @@ def test_is_available_default():
     # Reset state
     transcription_service._model = None
     transcription_service._available = False
+    transcription_service._local_available = False
+    transcription_service._remote_available = False
     assert transcription_service.is_available() is False
 
 
 def test_get_status_not_loaded():
     transcription_service._model = None
     transcription_service._available = False
+    transcription_service._local_available = False
+    transcription_service._remote_available = False
     transcription_service._init_error = None
     status = transcription_service.get_status()
     assert status["available"] is False
@@ -154,10 +158,28 @@ def test_get_status_not_loaded():
     assert status["model"] == transcription_service.TRANSCRIBE_MODEL
 
 
-def test_transcribe_when_unavailable():
+def test_resolve_local_model_name_maps_turbo():
+    assert transcription_service._resolve_local_model_name("turbo") == "large-v3"
+    assert transcription_service._resolve_local_model_name("large-v3") == "large-v3"
+
+
+def test_resolve_local_model_name_respects_override(monkeypatch):
+    monkeypatch.setattr(transcription_service, "LOCAL_TRANSCRIBE_MODEL", "distil-large-v3")
+    assert transcription_service._resolve_local_model_name("turbo") == "distil-large-v3"
+
+
+def test_transcribe_when_unavailable(monkeypatch):
     """Should raise RuntimeError when service is not initialized."""
     transcription_service._model = None
     transcription_service._available = False
+    transcription_service._local_available = False
+    transcription_service._remote_available = False
+    monkeypatch.setattr(transcription_service, "init_transcription_model", lambda: None)
+
+    def raise_unavailable():
+        raise RuntimeError("No transcription backend available")
+
+    monkeypatch.setattr(transcription_service, "_select_backend", raise_unavailable)
     with pytest.raises(RuntimeError, match="not available"):
         transcription_service.transcribe_audio_bytes(b"fake audio data")
 
@@ -204,3 +226,62 @@ def test_build_response_with_mock_segments():
     assert len(response["segments"]) == 1
     assert response["segments"][0]["text"] == "Hello world"
     assert response["segments"][0]["start"] == 0.0
+
+
+def test_build_response_with_dict_segments():
+    response = transcription_service.build_transcribe_response(
+        "Hello world",
+        {"lang": "en", "lang_p": 0.99, "audio_seconds": 1.5, "pipeline": "remote_api", "process_time": 0.1},
+        [{"id": 1, "start": 0.0, "end": 1.5, "text": "Hello world", "words": [{"word": "Hello"}]}],
+        detailed=True,
+        word_timestamps=True,
+    )
+    assert len(response["segments"]) == 1
+    assert response["segments"][0]["text"] == "Hello world"
+    assert response["segments"][0]["words"][0]["word"] == "Hello"
+
+
+def test_transcribe_audio_bytes_uses_remote_backend(monkeypatch):
+    transcription_service._available = True
+    monkeypatch.setattr(transcription_service, "_select_backend", lambda: "remote")
+    monkeypatch.setattr(
+        transcription_service,
+        "_remote_transcribe_audio_bytes",
+        lambda *args, **kwargs: ("hello", {"provider": "remote", "lang": "en"}, [{"text": "hello", "start": 0.0, "end": 1.0}]),
+    )
+    transcription, meta, segments = transcription_service.transcribe_audio_bytes(
+        b"fake",
+        content_type="audio/wav",
+        filename="sample.wav",
+        word_timestamps=True,
+    )
+    assert transcription == "hello"
+    assert meta["provider"] == "remote"
+    assert segments[0]["text"] == "hello"
+
+
+def test_transcribe_media_file_uses_extracted_audio(monkeypatch, tmp_path):
+    media_path = tmp_path / "sample.mkv"
+    media_path.write_bytes(b"media")
+    wav_path = tmp_path / "sample.wav"
+    wav_path.write_bytes(b"wav")
+
+    transcription_service._available = True
+    monkeypatch.setattr(transcription_service, "_select_backend", lambda: "remote")
+    monkeypatch.setattr(transcription_service, "_extract_media_audio_to_wav", lambda path: str(wav_path))
+
+    seen = {}
+
+    def fake_remote(path, **kwargs):
+        seen["path"] = path
+        seen["kwargs"] = kwargs
+        return "hello", {"provider": "remote", "lang": "en"}, [{"text": "hello", "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(transcription_service, "_remote_transcribe_file", fake_remote)
+    transcription, meta, segments = transcription_service.transcribe_media_file(str(media_path))
+    assert transcription == "hello"
+    assert meta["provider"] == "remote"
+    assert seen["path"] == str(wav_path)
+    assert seen["kwargs"]["content_type"] == "audio/wav"
+    assert seen["kwargs"]["upload_name"] == "sample.wav"
+    assert segments[0]["text"] == "hello"

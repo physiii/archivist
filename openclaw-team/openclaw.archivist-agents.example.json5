@@ -1,0 +1,37 @@
+// Archivist agent team configuration for openclaw.json
+{
+  agents: {
+    list: [
+      {
+        id: "archivist-main",
+        name: "Archivist Main",
+        workspace: "/home/andy/archivist",
+        identity: { name: "Archivist Main", emoji: "A", theme: "Collections, backups, indexing, and media evidence operator" }
+      },
+      {
+        id: "archivist-health",
+        name: "Archivist Health",
+        workspace: "/home/andy/archivist",
+        identity: { name: "Archivist Health", emoji: "H", theme: "Runtime health, logs, and service probes" }
+      },
+      {
+        id: "archivist-repair",
+        name: "Archivist Repair",
+        workspace: "/home/andy/archivist",
+        identity: { name: "Archivist Repair", emoji: "R", theme: "Targeted implementation and regression fixes" }
+      },
+      {
+        id: "archivist-observer",
+        name: "Archivist Observer",
+        workspace: "/home/andy/archivist",
+        identity: { name: "Archivist Observer", emoji: "O", theme: "Forensic review of sessions and evidence quality" }
+      },
+      {
+        id: "archivist-verifier",
+        name: "Archivist Verifier",
+        workspace: "/home/andy/archivist",
+        identity: { name: "Archivist Verifier", emoji: "V", theme: "Verification gate, tests, and runtime validation" }
+      }
+    ]
+  }
+}

@@ -3,12 +3,65 @@ import os
 import sys
 import re
 import logging
+import threading
 from collections import Counter
 from pathlib import Path
 from datetime import datetime
 from pymilvus import connections, Collection, utility, AnnSearchRequest, WeightedRanker, RRFRanker
 import traceback
 from uuid import uuid4
+
+
+# ── Shared Milvus connection pool ──────────────────────────────────
+# Reuse connections per host:port instead of creating one per request.
+_milvus_pool_lock = threading.Lock()
+_milvus_pool: dict[str, str] = {}  # "host:port" → alias
+_milvus_pool_refcount: dict[str, int] = {}  # alias → active users
+try:
+    MILVUS_CONNECT_TIMEOUT = float(os.environ.get("MILVUS_CONNECT_TIMEOUT", "3"))
+except (TypeError, ValueError):
+    MILVUS_CONNECT_TIMEOUT = 3.0
+try:
+    MILVUS_LOAD_TIMEOUT = float(os.environ.get("MILVUS_LOAD_TIMEOUT", "60"))
+except (TypeError, ValueError):
+    MILVUS_LOAD_TIMEOUT = 60.0
+
+
+def _get_milvus_connection(host: str, port: str = "19530") -> str:
+    """Return a reusable Milvus connection alias for the given host."""
+    key = f"{host}:{port}"
+    with _milvus_pool_lock:
+        alias = _milvus_pool.get(key)
+        if alias:
+            try:
+                # Verify connection is alive
+                utility.list_collections(using=alias, timeout=MILVUS_CONNECT_TIMEOUT)
+                _milvus_pool_refcount[alias] = _milvus_pool_refcount.get(alias, 0) + 1
+                return alias
+            except Exception:
+                # Stale connection — remove and reconnect
+                try:
+                    connections.disconnect(alias)
+                except Exception:
+                    pass
+                del _milvus_pool[key]
+                _milvus_pool_refcount.pop(alias, None)
+
+        alias = f"pool_{key.replace('.', '_').replace(':', '_')}"
+        connections.connect(alias, host=host, port=port, timeout=MILVUS_CONNECT_TIMEOUT)
+        _milvus_pool[key] = alias
+        _milvus_pool_refcount[alias] = 1
+        return alias
+
+
+def _release_milvus_connection(alias: str):
+    """Decrement refcount for a pooled connection (kept alive for reuse)."""
+    with _milvus_pool_lock:
+        count = _milvus_pool_refcount.get(alias, 1) - 1
+        if count <= 0:
+            _milvus_pool_refcount.pop(alias, None)
+        else:
+            _milvus_pool_refcount[alias] = count
 
 from utils import (
     DEFAULT_EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_DIM,
@@ -210,12 +263,11 @@ def search_vectorstore(
 ):
     start_time = datetime.now()
     logging.info(f"Starting search_vectorstore: query='{query}', collection={collection_name}, ip={ip_address}, mode={mode}")
-    alias = f"search_{uuid4().hex}"
-    
+    alias = _get_milvus_connection(ip_address)
+    collection = None
+
     try:
-        logging.info(f"Connecting to Milvus at {ip_address}...")
-        connections.connect(alias, host=ip_address, port='19530')
-        logging.info("Connected to Milvus successfully")
+        logging.info(f"Connected to Milvus at {ip_address} (pooled)")
 
         # Resolve collection name with compatibility for both prefixed and raw names.
         if collection_name:
@@ -229,7 +281,7 @@ def search_vectorstore(
                 candidates.append(f"documents_{clean_name}")
             chosen = None
             for candidate in candidates:
-                if utility.has_collection(candidate, using=alias):
+                if utility.has_collection(candidate, using=alias, timeout=MILVUS_CONNECT_TIMEOUT):
                     chosen = candidate
                     break
             collection_name = chosen or candidates[-1]
@@ -238,12 +290,13 @@ def search_vectorstore(
         logging.info(f"Using collection: {collection_name}")
 
         # Check if collection exists
-        if not utility.has_collection(collection_name, using=alias):
+        if not utility.has_collection(collection_name, using=alias, timeout=MILVUS_CONNECT_TIMEOUT):
             raise RuntimeError(f"Collection {collection_name} does not exist.")
 
         # Open the collection
         collection = Collection(name=collection_name, using=alias)
         collection.load()
+        utility.wait_for_loading_complete(collection_name, using=alias, timeout=MILVUS_LOAD_TIMEOUT)
         logging.info(f"Collection loaded with {collection.num_entities} entities")
         collection_vector_dim = None
         try:
@@ -591,11 +644,13 @@ def search_vectorstore(
         logging.error(traceback.format_exc())
         raise
     finally:
-        try:
-            connections.disconnect(alias)
-            logging.info("Disconnected from Milvus")
-        except:
-            pass
+        if collection is not None:
+            try:
+                collection.release()
+                logging.info(f"Released collection {collection_name}")
+            except Exception as release_error:
+                logging.warning(f"Failed to release collection {collection_name}: {release_error}")
+        _release_milvus_connection(alias)
         end_time = datetime.now()
         logging.info(f"Search operation completed in {end_time - start_time}.")
 

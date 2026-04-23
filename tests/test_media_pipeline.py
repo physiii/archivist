@@ -3,6 +3,8 @@
 import json
 import subprocess
 import sys
+import threading
+import types
 from pathlib import Path
 
 import numpy as np
@@ -153,6 +155,58 @@ class TestEvidenceStore:
         assert artifacts[0].kind == "transcript"
         assert artifacts[0].content == "hello"
 
+    def test_get_artifacts_scope_trace_prefers_raw_bundle(self, tmp_path, monkeypatch):
+        from media import evidence_store
+
+        monkeypatch.setattr(evidence_store, "PIPELINE_RESULTS_DIR", tmp_path / "pipeline")
+        monkeypatch.setattr(evidence_store, "ARTIFACTS_DIR", tmp_path / "artifacts")
+        evidence_store.PIPELINE_RESULTS_DIR.mkdir(parents=True)
+        evidence_store.ARTIFACTS_DIR.mkdir(parents=True)
+
+        (evidence_store.PIPELINE_RESULTS_DIR / "abc123.json").write_text(
+            '{"artifacts":[{"artifact_id":"pub1","media_id":"abc123","kind":"transcript","start_s":0,"end_s":1,"content":"hello","confidence":1.0,"metadata":{},"source_refs":[]}]}',
+            encoding="utf-8",
+        )
+        (evidence_store.ARTIFACTS_DIR / "abc123.json").write_text(
+            '{"media_id":"abc123","artifacts":[{"artifact_id":"raw1","media_id":"abc123","kind":"speech_segment","start_s":0,"end_s":1,"content":"hello there","confidence":1.0,"metadata":{},"source_refs":[]}]}',
+            encoding="utf-8",
+        )
+
+        public_artifacts = evidence_store.get_artifacts("abc123")
+        trace_artifacts = evidence_store.get_artifacts("abc123", scope="trace")
+
+        assert [artifact.kind for artifact in public_artifacts] == ["transcript"]
+        assert [artifact.kind for artifact in trace_artifacts] == ["speech_segment"]
+
+    def test_save_artifact_bundle_persists_archivist_pipeline_root_metadata(self, tmp_path, monkeypatch):
+        from media import evidence_store
+        from media.models import DerivedArtifact
+
+        monkeypatch.setattr(evidence_store, "ARTIFACTS_DIR", tmp_path / "artifacts")
+        stamp = {
+            "pipeline_version": "5679262e3c86",
+            "pipeline_compat_version": "2026-04-11.1",
+            "repo_commit": "e96b26af4e9a3dc240b202fd35025679262e3c86",
+            "repo_commit_suffix": "5679262e3c86",
+        }
+        artifacts = [
+            DerivedArtifact(
+                media_id="abc123",
+                kind="transcript",
+                content="hello there",
+            ),
+        ]
+
+        evidence_store.save_artifact_bundle(
+            "abc123",
+            artifacts,
+            bundle_metadata={"archivist_pipeline": stamp},
+        )
+
+        payload = json.loads((tmp_path / "artifacts" / "abc123.json").read_text(encoding="utf-8"))
+        assert payload["archivist_pipeline"] == stamp
+        assert payload["bundle_metadata"]["archivist_pipeline"] == stamp
+
     def test_load_assets_index_deduplicates_by_path_and_prefers_pipeline_result(self, tmp_path, monkeypatch):
         from media import evidence_store
 
@@ -164,7 +218,9 @@ class TestEvidenceStore:
         evidence_store.PIPELINE_RESULTS_DIR.mkdir(parents=True)
         store_dir.mkdir(parents=True)
 
-        path = str((tmp_path / "clip.mkv").resolve())
+        clip_path = tmp_path / "clip.mkv"
+        clip_path.write_bytes(b"clip")
+        path = str(clip_path.resolve())
         payload = {
             "newer_with_pipeline": {
                 "media_id": "newer_with_pipeline",
@@ -261,6 +317,23 @@ class TestEventExtraction:
         assert _classify_event_type("I noticed something odd") == EventType.OBSERVATION
         assert _classify_event_type("Hello everyone") == EventType.SPEECH
 
+    def test_classify_event_type_treats_mic_check_as_speech(self):
+        from media.event_extraction import _classify_event_type
+        from media.models import EventType
+
+        text = "check one two hey hello good morning can you hear me right i didn't come in muted"
+        assert _classify_event_type(text) == EventType.SPEECH
+
+    def test_classify_event_type_keeps_setup_walkthrough_as_speech(self):
+        from media.event_extraction import _classify_event_type
+        from media.models import EventType
+
+        text = (
+            "I'm going to show you what this looks like because it actually has the SSH feature. "
+            "What's going on here? This looks different when I click on it."
+        )
+        assert _classify_event_type(text) not in {EventType.DECISION, EventType.ACTION}
+
     def test_extract_entities(self):
         from media.event_extraction import _extract_entities
         entities = _extract_entities("John Smith met with Alice at Central Park")
@@ -271,7 +344,13 @@ class TestEventExtraction:
         from media.models import SpeechSegment
 
         segments = [
-            SpeechSegment(start_s=0, end_s=2, text="Hello everyone, let's begin."),
+            SpeechSegment(
+                start_s=0,
+                end_s=2,
+                text="Hello everyone, let's begin.",
+                speaker="Alice",
+                word_timestamps=[{"start": 0.0, "end": 0.3, "word": "Hello", "confidence": 0.9}],
+            ),
             SpeechSegment(start_s=2, end_s=5, text="What should we discuss first?"),
             SpeechSegment(start_s=20, end_s=25, text="I noticed something unusual."),
         ]
@@ -279,6 +358,10 @@ class TestEventExtraction:
         events = extract_events_from_speech(segments, media_id="test", merge_window_s=5.0)
         assert len(events) >= 2  # First two should merge, third is separate
         assert events[0].source_refs[0].startswith("test:")
+        assert events[0].metadata["transcript_span"]["start_s"] == 0
+        assert events[0].metadata["speaker_turns"][0]["speaker"] == "Alice"
+        assert events[0].metadata["word_timestamps"][0]["word"] == "Hello"
+        assert events[0].metadata["evidence_refs"][0]["kind"] == "speech_segment"
 
     def test_extract_events_empty(self):
         from media.event_extraction import extract_events_from_speech
@@ -315,6 +398,18 @@ class TestEventExtraction:
         assert "Because" not in entities
         assert "Yeah" not in entities
 
+    def test_extract_entities_keeps_acronyms_and_filters_noise(self):
+        from media.event_extraction import _extract_entities
+
+        entities = _extract_entities(
+            "Who was that? Casey said the VOA and VOI routing should hit EPA after deployment."
+        )
+        assert "VOA" in entities
+        assert "VOI" in entities
+        assert "EPA" in entities
+        assert "Casey" in entities
+        assert "Who" not in entities
+
     def test_merge_events_chronological(self):
         from media.event_extraction import merge_events
         from media.models import AtomicEvent, EventType
@@ -331,6 +426,7 @@ class TestEventExtraction:
         assert len(merged) == 3
         # Should be sorted by time
         assert merged[0].time_start <= merged[1].time_start <= merged[2].time_start
+        assert "cross_modal_refs" in merged[0].metadata or "cross_modal_refs" in merged[1].metadata
 
 
 # ── L3: Recaps ──────────────────────────────────────────────────────────
@@ -385,8 +481,112 @@ class TestRecaps:
         assert recap.group_type == "conversation"
         assert recap.time_start == 0
         assert recap.time_end == 10
+        assert recap.window_summary
         assert len(recap.event_ids) == 2
+        assert recap.summary_refs
+        assert recap.ledger_entries[0]["event_id"] == events[0].event_id
         assert "What about the deadline?" in recap.unresolved_questions
+
+    def test_build_recap_filters_noise_and_answered_questions(self):
+        from media.models import AtomicEvent, EventType
+        from media.recaps import build_recap_from_events
+
+        events = [
+            AtomicEvent(
+                time_start=0,
+                time_end=3,
+                text_evidence="What's up? What's up?",
+                event_type=EventType.QUESTION,
+                metadata={"question_text": "What's up? What's up?"},
+            ),
+            AtomicEvent(
+                time_start=3,
+                time_end=10,
+                text_evidence="Any updates from your side? Yeah, I pushed a PR for the manual review routing.",
+                event_type=EventType.QUESTION,
+                metadata={"question_text": "Any updates from your side?"},
+            ),
+            AtomicEvent(
+                time_start=10,
+                time_end=18,
+                text_evidence="What should happen to reports that missed manual review?",
+                event_type=EventType.QUESTION,
+                metadata={"question_text": "What should happen to reports that missed manual review?"},
+            ),
+        ]
+
+        recap = build_recap_from_events(events, group_type="conversation")
+        assert "What's up? What's up?" not in recap.unresolved_questions
+        assert "Any updates from your side?" not in recap.unresolved_questions
+        assert "What should happen to reports that missed manual review?" in recap.unresolved_questions
+        assert "What's up? What's up?" not in recap.recap_text
+        assert "pushed a PR for the manual review routing" in recap.recap_text
+
+    def test_extract_topic_phrases_filters_noise_bigrams(self):
+        from media.text_cleanup import extract_topic_phrases
+
+        phrases = extract_topic_phrases(
+            [
+                "Discussion focused on You Know and Alpha Evolve.",
+                "Alpha Evolve should help the VOA rollout.",
+                "You know, the VOA rollout needs validation.",
+            ],
+            limit=4,
+        )
+
+        assert "Alpha Evolve" in phrases
+        assert "VOA" in phrases
+        assert "You Know" not in phrases
+
+    def test_extract_topic_phrases_prefers_domain_terms_over_conversational_glue(self):
+        from media.text_cleanup import extract_topic_phrases
+
+        phrases = extract_topic_phrases(
+            [
+                "The segment covers talk about and follow-up work.",
+                "I've been thinking about AI, FPGA, chip design, and silicon.",
+                "We talked about semiconductor design and the chip model.",
+                "The chip design and FPGA work connect to AI models.",
+            ],
+            limit=6,
+        )
+
+        assert any(term in phrases for term in ["AI", "FPGA", "Chip", "Semiconductor", "Silicon"])
+        assert "And" not in phrases
+        assert "Talk About" not in phrases
+        assert "And Follow" not in phrases
+        assert "Thinking About" not in phrases
+
+    def test_extract_inline_topic_terms_filters_contractions_and_greetings(self):
+        from media.text_cleanup import extract_inline_topic_terms
+
+        terms = extract_inline_topic_terms(
+            "Good morning. I've been thinking about FPGA, chip design, RTL, and semiconductor work.",
+            limit=6,
+        )
+
+        assert any(term in terms for term in ["FPGA", "Chip Design", "RTL", "Semiconductor"])
+        assert "Morning" not in terms
+        assert "I'Ve" not in terms
+
+    def test_build_recap_summary_avoids_greeting_fragments(self):
+        from media.models import AtomicEvent, EventType
+        from media.recaps import build_recap_from_events
+
+        events = [
+            AtomicEvent(
+                time_start=0,
+                time_end=30,
+                text_evidence="Good morning and thanks for joining. We should review the FPGA prototype and chip design.",
+                event_type=EventType.DECISION,
+                metadata={"brief": "We should review the FPGA prototype and chip design."},
+            )
+        ]
+
+        recap = build_recap_from_events(events, group_type="conversation")
+        assert "Morning" not in recap.window_summary
+        assert "follow-up work" not in recap.window_summary
+        assert any(term in recap.window_summary for term in ["FPGA", "Prototype", "Chip"])
 
     def test_build_recap_prompt(self):
         from media.models import AtomicEvent, EventType
@@ -395,6 +595,7 @@ class TestRecaps:
         events = [AtomicEvent(time_start=0, time_end=5, text_evidence="Hello", event_type=EventType.SPEECH)]
         sys_prompt, user_prompt = build_recap_prompt(events)
         assert "step-by-step" in sys_prompt.lower()
+        assert "event ledger" in user_prompt.lower()
         assert "Hello" in user_prompt
 
     def test_build_recaps_integration(self):
@@ -432,9 +633,11 @@ class TestMemory:
 
         memory = build_memory_from_recaps(recaps, media_id="test123")
         assert memory.media_id == "test123"
+        assert memory.context_overview
         # Project X appears in both recaps
         assert "Project X" in memory.main_actors or "Project X" in memory.inferred_themes
         assert len(memory.timeline_anchors) >= 2
+        assert "final_takeaways" in memory.evidence_map
 
     def test_build_memory_empty(self):
         from media.memory import build_memory_from_recaps
@@ -449,6 +652,9 @@ class TestMemory:
         recaps = [LocalRecap(time_start=0, time_end=30, recap_text="Test recap")]
         sys_prompt, user_prompt = build_memory_prompt(recaps)
         assert "contextual memory" in sys_prompt.lower()
+        assert "compressed context layer" in user_prompt.lower()
+        assert "interpretive notes" in user_prompt.lower()
+        assert "evidence anchors" in user_prompt.lower()
         assert "Test recap" in user_prompt
 
     def test_build_memory_filters_noisy_entities(self):
@@ -476,6 +682,149 @@ class TestMemory:
         assert "They" not in memory.main_actors
         assert "Yep" not in memory.main_actors
         assert "Whereas" not in memory.inferred_themes
+
+    def test_build_memory_does_not_treat_technical_nouns_as_people(self):
+        from media.memory import build_memory_from_recaps
+        from media.models import LocalRecap
+
+        recaps = [
+            LocalRecap(
+                time_start=0,
+                time_end=60,
+                recap_text="Recap one",
+                salient_entities=["Drive", "Studio", "Andy"],
+            ),
+            LocalRecap(
+                time_start=60,
+                time_end=120,
+                recap_text="Recap two",
+                salient_entities=["Drive", "Studio", "Andy"],
+            ),
+        ]
+
+        memory = build_memory_from_recaps(recaps, media_id="test123")
+        assert "Andy" in memory.main_actors
+        assert "Drive" not in memory.main_actors
+        assert "Studio" not in memory.main_actors
+
+    def test_build_memory_uses_event_vocatives_and_dedupes_questions(self):
+        from media.memory import build_memory_from_recaps
+        from media.models import AtomicEvent, EventType, LocalRecap
+
+        recaps = [
+            LocalRecap(
+                time_start=0,
+                time_end=60,
+                recap_text="Summary: Discussion focused on VOA, VOI, and manual review.",
+                salient_entities=["Rocky", "VOA", "VOI"],
+                unresolved_questions=[
+                    "What should happen to reports that missed manual review?",
+                    "What should happen to reports that missed manual review?",
+                ],
+            )
+        ]
+        events = [
+            AtomicEvent(
+                time_start=0,
+                time_end=10,
+                text_evidence="Hey, Rocky, can you review the VOA change?",
+                metadata={"entities": ["Rocky", "VOA"]},
+            ),
+            AtomicEvent(
+                time_start=10,
+                time_end=20,
+                text_evidence="Well, Grayson, let's verify the VOI rollout.",
+                metadata={"entities": ["Grayson", "VOI"]},
+            ),
+        ]
+
+        memory = build_memory_from_recaps(recaps, media_id="test123", events=events)
+        assert "Rocky" in memory.main_actors
+        assert "Grayson" in memory.main_actors
+        assert "Hey" not in memory.main_actors
+        assert "Well" not in memory.main_actors
+        assert memory.open_loops == ["What should happen to reports that missed manual review?"]
+        assert any(theme in memory.inferred_themes for theme in ["VOA", "VOI"])
+        assert any(item.get("source_refs") for item in memory.evidence_map["final_takeaways"])
+        assert any(item.get("source_refs") for item in memory.evidence_map["open_loops"])
+
+    def test_build_memory_vocatives_ignore_product_names(self):
+        from media.memory import build_memory_from_recaps
+        from media.models import AtomicEvent, LocalRecap
+
+        recaps = [LocalRecap(time_start=0, time_end=60, recap_text="Recap")]
+        events = [
+            AtomicEvent(
+                time_start=0,
+                time_end=10,
+                text_evidence="Hey, Rocky, can you review the rollout?",
+                metadata={"entities": ["Rocky"]},
+            ),
+            AtomicEvent(
+                time_start=10,
+                time_end=20,
+                text_evidence="I call it Sonic, right? It has two GPUs in it.",
+                metadata={"entities": ["Sonic"]},
+            ),
+        ]
+
+        memory = build_memory_from_recaps(recaps, media_id="test123", events=events)
+        assert "Rocky" in memory.main_actors
+        assert "Sonic" not in memory.main_actors
+
+    def test_build_memory_ignores_generic_summary_boilerplate(self):
+        from media.memory import build_memory_from_recaps
+        from media.models import AtomicEvent, EventType, LocalRecap
+
+        recaps = [
+            LocalRecap(
+                time_start=0,
+                time_end=60,
+                recap_text="Window summary: Discussion focused on the current workstream.\n\nEvent ledger:\n- [5.0s] [decision] Review AI and ID scope.",
+                window_summary="Discussion focused on the current workstream.",
+                salient_entities=["AI", "ID", "Sean"],
+            )
+        ]
+        events = [
+            AtomicEvent(
+                time_start=5,
+                time_end=20,
+                text_evidence="Sean reviewed AI and ID scope and raised open questions.",
+                event_type=EventType.DECISION,
+                metadata={"entities": ["Sean", "AI", "ID"], "brief": "Review AI and ID scope."},
+            )
+        ]
+
+        memory = build_memory_from_recaps(recaps, media_id="test123", events=events)
+        assert "Current Workstream" not in memory.inferred_themes
+        assert any(theme in memory.inferred_themes for theme in ["AI", "ID"])
+
+    def test_build_memory_prefers_event_topic_terms_over_weak_window_summary(self):
+        from media.memory import build_memory_from_recaps
+        from media.models import AtomicEvent, EventType, LocalRecap
+
+        recaps = [
+            LocalRecap(
+                time_start=0,
+                time_end=60,
+                recap_text="Window summary: The segment covers This and follow-up work.",
+                window_summary="The segment covers This and follow-up work.",
+                salient_entities=[],
+            )
+        ]
+        events = [
+            AtomicEvent(
+                time_start=0,
+                time_end=30,
+                text_evidence="We should review the FPGA prototype and chip design.",
+                event_type=EventType.DECISION,
+                metadata={"brief": "Review the FPGA prototype and chip design.", "topic_terms": ["FPGA", "Prototype", "Chip Design"]},
+            )
+        ]
+
+        memory = build_memory_from_recaps(recaps, media_id="test123", events=events)
+        assert "This" not in memory.inferred_themes
+        assert any(theme in memory.inferred_themes for theme in ["FPGA", "Prototype", "Chip Design"])
 
 
 # ── L5: Composer ────────────────────────────────────────────────────────
@@ -536,6 +885,8 @@ class TestComposer:
         assert doc.format == OutputFormat.CHRONOLOGICAL
         assert doc.full_text
         assert len(doc.sections) > 0
+        assert any(section.get("kind") == "context" for section in doc.sections)
+        assert any(section.get("kind") == "walkthrough" for section in doc.sections)
 
     def test_compose_prompt(self):
         from media.composer import build_compose_prompt
@@ -548,6 +899,123 @@ class TestComposer:
         sys_p, user_p = build_compose_prompt(memory, recaps, events, OutputFormat.MEETING_MINUTES)
         assert "document composer" in sys_p.lower()
         assert "meeting minutes" in user_p.lower()
+        assert "context overview" in user_p.lower()
+        assert "walkthrough" in user_p.lower()
+        assert "chronology is the canonical truth" in user_p.lower()
+        assert "prefer evidence anchors" in user_p.lower()
+
+    def test_recap_summary_line_falls_back_from_weak_summary(self):
+        from media.composer import _recap_summary_line
+        from media.models import LocalRecap
+
+        recap = LocalRecap(
+            time_start=0,
+            time_end=30,
+            recap_text="Window summary: The segment covers Morning and follow-up work.",
+            summary_refs=[{"summary": "Review AI and FPGA architecture."}],
+            ledger_entries=[{"summary": "Review AI and FPGA architecture."}],
+        )
+
+        summary = _recap_summary_line(recap)
+        assert "Morning" not in summary
+        assert any(term in summary for term in ["AI", "FPGA", "architecture"])
+
+    def test_compose_meeting_minutes_uses_structured_sections(self):
+        from media.composer import compose_document
+        from media.models import AtomicEvent, ContextualMemory, EventType, LocalRecap, OutputFormat
+
+        events = [
+            AtomicEvent(
+                time_start=5,
+                time_end=15,
+                text_evidence="We should deploy the routing fix after the release note.",
+                event_type=EventType.DECISION,
+                metadata={"brief": "Deploy the routing fix after the release note."},
+            ),
+            AtomicEvent(
+                time_start=15,
+                time_end=30,
+                text_evidence="I'll check the logs after this meeting.",
+                event_type=EventType.ACTION,
+                metadata={"brief": "Check the logs after the meeting."},
+            ),
+        ]
+        recaps = [
+            LocalRecap(
+                time_start=0,
+                time_end=30,
+                recap_text=(
+                    "Window summary: Discussion focused on VOA and VOI rollout.\n\n"
+                    "Event ledger:\n"
+                    "- [5.0s] [decision] Deploy the routing fix after the release note.\n"
+                    "- [15.0s] [action] Check the logs after the meeting.\n"
+                ),
+            )
+        ]
+        memory = ContextualMemory(
+            media_id="test",
+            main_actors=["Rocky", "Grayson"],
+            open_loops=["What should happen to reports that missed manual review?"],
+            inferred_themes=["VOA", "VOI"],
+        )
+
+        doc = compose_document(memory, recaps, events, output_format=OutputFormat.MEETING_MINUTES)
+        assert "## Context Overview" in doc.full_text
+        assert "## Key Topics" in doc.full_text
+        assert "## Decisions and Follow-Ups" in doc.full_text
+        assert "## Walkthrough" in doc.full_text
+        assert any(section.get("kind") == "walkthrough" for section in doc.sections)
+        walkthrough = next(section for section in doc.sections if section.get("kind") == "walkthrough")
+        assert "### [0.0s - 30.0s]" in walkthrough["content"]
+        for section in doc.sections:
+            if section.get("kind") == "context":
+                assert "### [0.0s - 30.0s]" not in section.get("content", "")
+
+    def test_build_layer_artifacts_persists_recap_and_memory_provenance(self):
+        from media.pipeline import _build_layer_artifacts
+        from media.models import ComposedDocument, ContextualMemory, LocalRecap, MediaAsset, PipelineJob, OutputFormat
+
+        asset = MediaAsset(media_id="media123", filename="clip.mkv", duration_s=30.0)
+        recap = LocalRecap(
+            recap_id="recap_1",
+            group_type="segment",
+            time_start=0.0,
+            time_end=30.0,
+            recap_text="Window summary: Discussion focused on launch readiness.\n\nEvent ledger:\n- [5.0s] [decision] Ship on Friday.",
+            window_summary="Discussion focused on launch readiness.",
+            summary_refs=[{"event_id": "evt_1", "time_start": 5.0, "time_end": 8.0, "source_refs": ["speech_5.00"]}],
+            ledger_entries=[{"event_id": "evt_1", "summary": "Ship on Friday.", "source_refs": ["speech_5.00"]}],
+            source_refs=["speech_5.00"],
+        )
+        memory = ContextualMemory(
+            media_id="media123",
+            context_overview="This media is primarily about launch readiness.",
+            main_actors=["Alice"],
+            final_takeaways=["Discussion focused on launch readiness."],
+            evidence_map={"final_takeaways": [{"text": "Discussion focused on launch readiness.", "source_refs": ["speech_5.00"]}]},
+        )
+        document = ComposedDocument(media_id="media123", format=OutputFormat.CHRONOLOGICAL, title="Chronological - media123")
+
+        artifacts = _build_layer_artifacts(
+            asset=asset,
+            transcript_payload=None,
+            filter_results={},
+            events=[],
+            recaps=[recap],
+            memory=memory,
+            document=document,
+            job=PipelineJob(media_id="media123"),
+        )
+
+        recap_artifact = next(artifact for artifact in artifacts if artifact.kind == "recap")
+        memory_artifact = next(artifact for artifact in artifacts if artifact.kind == "memory")
+        memory_payload = json.loads(memory_artifact.content)
+
+        assert recap_artifact.metadata["window_summary"] == "Discussion focused on launch readiness."
+        assert recap_artifact.metadata["summary_refs"][0]["event_id"] == "evt_1"
+        assert recap_artifact.metadata["ledger_entries"][0]["source_refs"] == ["speech_5.00"]
+        assert memory_payload["context_overview"] == "This media is primarily about launch readiness."
+        assert memory_payload["evidence_map"]["final_takeaways"][0]["source_refs"] == ["speech_5.00"]
 
 
 # ── Pipeline Integration ────────────────────────────────────────────────
@@ -565,6 +1033,101 @@ class TestPipeline:
         monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", tmp_path)
         result = pipeline.get_pipeline_result("nonexistent")
         assert result is None
+
+    def test_get_pipeline_result_hydrates_vtt_from_sidecar(self, tmp_path, monkeypatch):
+        from media import pipeline
+
+        monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", tmp_path)
+        sidecar_path = tmp_path / "clip.vtt"
+        sidecar_path.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\nHello world\n", encoding="utf-8")
+        (tmp_path / "clip123.json").write_text(
+            json.dumps(
+                {
+                    "media_id": "clip123",
+                    "transcript": {"text": "Hello world"},
+                    "injection": {"transcript_sidecar_path": str(sidecar_path)},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = pipeline.get_pipeline_result("clip123")
+
+        assert result is not None
+        assert result["transcript"]["vtt_text"].startswith("WEBVTT")
+        assert "Hello world" in result["transcript"]["vtt_text"]
+
+    def test_get_pipeline_result_rebuilds_clean_readable_transcript_from_sidecar(self, tmp_path, monkeypatch):
+        from media import pipeline
+
+        monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", tmp_path)
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        sidecar_path = media_path.with_suffix(".vtt")
+        sidecar_path.write_text(
+            "WEBVTT\n\nNOTE\nSource: clip.mkv\nLanguage: en\n\n"
+            "00:00:00.000 --> 00:00:01.000\nYou\n\n"
+            "00:00:01.000 --> 00:00:02.000\nThanks for watching!\n\n"
+            "00:00:02.000 --> 00:00:04.000\nActual discussion.\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "clip123.json").write_text(
+            json.dumps(
+                {
+                    "media_id": "clip123",
+                    "asset": {"path": str(media_path)},
+                    "transcript": {"text": "You Thanks for watching! Actual discussion."},
+                    "injection": {"transcript_sidecar_path": str(sidecar_path)},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = pipeline.get_pipeline_result("clip123")
+
+        assert result is not None
+        assert result["transcript"]["text"] == "Actual discussion."
+        assert result["transcript"]["meta"]["removed_segment_count"] == 2
+        assert "Thanks for watching!" in result["transcript"]["vtt_text"]
+
+    def test_insert_vectorstore_chunks_releases_loaded_collection(self, monkeypatch):
+        import indexing_service
+        from media import pipeline
+        from media.models import MediaAsset
+
+        calls: list[str] = []
+
+        class FakeCollection:
+            def load(self):
+                calls.append("load")
+
+            def delete(self, _expr):
+                calls.append("delete")
+
+            def flush(self):
+                calls.append("flush")
+
+            def release(self):
+                calls.append("release")
+
+        fake_collection = FakeCollection()
+        monkeypatch.setattr(
+            indexing_service,
+            "_ensure_chunk_collection",
+            lambda *args, **kwargs: fake_collection,
+        )
+        monkeypatch.setattr(
+            indexing_service,
+            "_insert_chunks",
+            lambda collection, chunks, filehash, embedding_host, embedding_port: len(chunks),
+        )
+
+        asset = MediaAsset(media_id="media123", path="/tmp/clip.mkv", filename="clip.mkv", file_hash="hash123")
+
+        stats = pipeline._insert_vectorstore_chunks(asset, [object()])
+
+        assert stats["chunks_inserted"] == 1
+        assert calls[-1] == "release"
 
     def test_write_transcript_sidecar(self, tmp_path):
         from media.pipeline import _write_transcript_sidecar
@@ -585,6 +1148,204 @@ class TestPipeline:
         assert "WEBVTT" in content
         assert "Hello world" in content
 
+    def test_write_transcript_sidecar_falls_back_when_default_path_is_directory(self, tmp_path):
+        from media.pipeline import _write_transcript_sidecar
+        from media.models import MediaAsset
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        media_path.with_suffix(".vtt").mkdir()
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        payload = {
+            "meta": {"lang": "en"},
+            "segments": [{"start": 0.0, "end": 1.25, "text": "Hello world"}],
+        }
+
+        vtt_path = _write_transcript_sidecar(asset, payload)
+
+        assert vtt_path == media_path.with_name("clip.archivist.vtt")
+        assert vtt_path.exists()
+        assert "Hello world" in vtt_path.read_text(encoding="utf-8")
+
+    def test_sidecar_path_for_write_skips_candidates_that_raise_oserror(self, monkeypatch):
+        from media import pipeline
+
+        class _FakeCandidate:
+            def __init__(self, label, exists_error=False, exists_value=False, is_file_value=False):
+                self.label = label
+                self.exists_error = exists_error
+                self.exists_value = exists_value
+                self.is_file_value = is_file_value
+
+            def exists(self):
+                if self.exists_error:
+                    raise OSError(24, "Too many open files")
+                return self.exists_value
+
+            def is_file(self):
+                return self.is_file_value
+
+        broken = _FakeCandidate("broken", exists_error=True)
+        fallback = _FakeCandidate("fallback", exists_value=False)
+        monkeypatch.setattr(pipeline, "_sidecar_candidate_paths", lambda asset_path, suffix: [broken, fallback])
+
+        chosen = pipeline._sidecar_path_for_write("/tmp/clip.mkv", ".vtt")
+
+        assert chosen is fallback
+
+    def test_refresh_asset_state_from_disk_updates_saved_hash_and_size(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import MediaAsset, Modality
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"old")
+        asset = MediaAsset(
+            media_id="media123",
+            path=str(media_path),
+            filename=media_path.name,
+            modality=Modality.VIDEO,
+            file_hash="stale",
+            file_size_bytes=1,
+        )
+        media_path.write_bytes(b"updated-content")
+
+        saved_hashes = []
+        monkeypatch.setattr(pipeline, "_save_asset", lambda saved_asset: saved_hashes.append(saved_asset.file_hash))
+
+        refreshed = pipeline._refresh_asset_state_from_disk(asset)
+
+        assert refreshed.file_size_bytes == len(b"updated-content")
+        assert refreshed.file_hash == asset.compute_hash()
+        assert saved_hashes == [refreshed.file_hash]
+
+    def test_load_existing_transcript_payload(self, tmp_path):
+        from media.pipeline import _load_existing_transcript_payload
+        from media.models import MediaAsset
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        vtt_path = media_path.with_suffix(".vtt")
+        vtt_path.write_text(
+            "WEBVTT\n\nNOTE\nSource: clip.mkv\nLanguage: en\n\n"
+            "00:00:00.000 --> 00:00:01.250\nHello world\n\n"
+            "00:00:01.250 --> 00:00:02.000\nSecond line\n",
+            encoding="utf-8",
+        )
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        payload = _load_existing_transcript_payload(asset)
+
+        assert payload is not None
+        assert payload["meta"]["source"] == "transcript_sidecar"
+        assert payload["meta"]["reused"] is True
+        assert payload["meta"]["segment_count"] == 2
+        assert payload["segments"][0]["start"] == pytest.approx(0.0)
+        assert payload["segments"][0]["end"] == pytest.approx(1.25)
+        assert payload["segments"][0]["text"] == "Hello world"
+        assert payload["text"] == "Hello world Second line"
+
+    def test_load_existing_transcript_payload_finds_archivist_fallback_sidecar(self, tmp_path):
+        from media.pipeline import _load_existing_transcript_payload
+        from media.models import MediaAsset
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        media_path.with_suffix(".vtt").mkdir()
+        media_path.with_name("clip.archivist.vtt").write_text(
+            "WEBVTT\n\nNOTE\nSource: clip.mkv\nLanguage: en\n\n"
+            "00:00:00.000 --> 00:00:01.000\nFallback transcript\n",
+            encoding="utf-8",
+        )
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        payload = _load_existing_transcript_payload(asset)
+
+        assert payload is not None
+        assert payload["segments"][0]["text"] == "Fallback transcript"
+
+    def test_load_existing_transcript_payload_filters_repeated_whisper_noise(self, tmp_path):
+        from media.pipeline import _load_existing_transcript_payload
+        from media.models import MediaAsset
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        media_path.with_suffix(".vtt").write_text(
+            "WEBVTT\n\nNOTE\nSource: clip.mkv\nLanguage: en\n\n"
+            "00:00:00.000 --> 00:00:01.000\nYou\n\n"
+            "00:00:01.000 --> 00:00:02.000\nThanks for watching!\n\n"
+            "00:00:02.000 --> 00:00:05.000\nActual roadmap discussion starts here.\n\n"
+            "00:00:05.000 --> 00:00:06.000\nThank you.\n",
+            encoding="utf-8",
+        )
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        payload = _load_existing_transcript_payload(asset)
+
+        assert payload is not None
+        assert payload["text"] == "Actual roadmap discussion starts here."
+        assert [segment["text"] for segment in payload["segments"]] == ["Actual roadmap discussion starts here."]
+        assert payload["meta"]["raw_segment_count"] == 4
+        assert payload["meta"]["clean_segment_count"] == 1
+        assert payload["meta"]["removed_segment_count"] == 3
+
+    def test_derive_transcript_prefers_existing_sidecar(self, tmp_path, monkeypatch):
+        from media.pipeline import _derive_transcript
+        from media.models import MediaAsset, PipelineJob
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        media_path.with_suffix(".vtt").write_text(
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello world\n",
+            encoding="utf-8",
+        )
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        fake_transcription = types.SimpleNamespace(
+            is_available=lambda: (_ for _ in ()).throw(AssertionError("transcription backend should not be used")),
+            init_transcription_model=lambda: (_ for _ in ()).throw(AssertionError("transcription init should not run")),
+            transcribe_media_file=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("transcription should not run")),
+        )
+        monkeypatch.setitem(sys.modules, "transcription_service", fake_transcription)
+
+        payload = _derive_transcript(asset, PipelineJob())
+
+        assert payload is not None
+        assert payload["meta"]["source"] == "transcript_sidecar"
+        assert payload["segments"][0]["text"] == "Hello world"
+
+    def test_derive_transcript_filters_whisper_boilerplate_from_backend_segments(self, tmp_path, monkeypatch):
+        from media.pipeline import _derive_transcript
+        from media.models import MediaAsset, PipelineJob
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+
+        fake_transcription = types.SimpleNamespace(
+            is_available=lambda: True,
+            init_transcription_model=lambda: None,
+            transcribe_media_file=lambda *args, **kwargs: (
+                "You Thanks for watching! Real planning discussion. Thank you.",
+                {"lang": "en"},
+                [
+                    {"text": "You", "start": 0.0, "end": 1.0, "no_speech_prob": 0.0},
+                    {"text": "Thanks for watching!", "start": 1.0, "end": 2.0, "no_speech_prob": 0.0},
+                    {"text": "Real planning discussion.", "start": 2.0, "end": 5.0, "no_speech_prob": 0.0},
+                    {"text": "Thank you.", "start": 5.0, "end": 6.0, "no_speech_prob": 0.0},
+                ],
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "transcription_service", fake_transcription)
+
+        payload = _derive_transcript(asset, PipelineJob())
+
+        assert payload is not None
+        assert payload["text"] == "Real planning discussion."
+        assert [segment["text"] for segment in payload["segments"]] == ["Real planning discussion."]
+        assert payload["meta"]["raw_segment_count"] == 4
+        assert payload["meta"]["clean_segment_count"] == 1
+        assert payload["meta"]["removed_segment_count"] == 3
+
     def test_write_pipeline_sidecar(self, tmp_path):
         from media.pipeline import _write_pipeline_sidecar
         from media.models import MediaAsset
@@ -596,6 +1357,23 @@ class TestPipeline:
 
         sidecar_path = _write_pipeline_sidecar(asset, result)
         assert sidecar_path == media_path.with_suffix(".json")
+        assert sidecar_path.exists()
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert payload["media_id"] == "abc123"
+
+    def test_write_pipeline_sidecar_falls_back_when_default_path_is_directory(self, tmp_path):
+        from media.pipeline import _write_pipeline_sidecar
+        from media.models import MediaAsset
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        media_path.with_suffix(".json").mkdir()
+        asset = MediaAsset(path=str(media_path), filename=media_path.name)
+        result = {"media_id": "abc123", "artifacts": [{"kind": "transcript"}]}
+
+        sidecar_path = _write_pipeline_sidecar(asset, result)
+
+        assert sidecar_path == media_path.with_name("clip.archivist.json")
         assert sidecar_path.exists()
         payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
         assert payload["media_id"] == "abc123"
@@ -628,7 +1406,7 @@ class TestPipeline:
         ]
 
         subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
-        assert subject_line == "Andy and Brianna work through decisions around launch planning."
+        assert subject_line == "Meeting on launch planning reaches concrete decisions."
         assert details["generator"] == "heuristic"
         assert details["reason"] == "gateway_unconfigured"
 
@@ -673,6 +1451,9 @@ class TestPipeline:
             def post(url, json=None, headers=None, timeout=None):
                 assert url == "http://gateway/v1/chat/completions"
                 assert json["model"] == "test-model"
+                assert headers["x-openclaw-agent-id"] == "archivist-main"
+                assert headers["x-openclaw-session-key"] == "agent:archivist-main:media-subject:abc123"
+                assert json["user"] == "agent:archivist-main:media-subject:abc123"
                 return _FakeResponse()
 
         monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "token")
@@ -710,8 +1491,97 @@ class TestPipeline:
         ]
 
         subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
-        assert subject_line == "Evan, Andy, and Brianna work through decisions in a recorded meeting."
+        assert subject_line == "Decision to move the launch to Friday."
         assert details["generator"] == "heuristic"
+
+    def test_generate_subject_line_rejects_conjunction_led_output(self, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, DerivedArtifact, MediaAsset, Modality, OutputFormat
+
+        asset = MediaAsset(
+            media_id="abc123",
+            filename="clip.mkv",
+            modality=Modality.VIDEO,
+            duration_s=90.0,
+        )
+        memory = ContextualMemory(
+            main_actors=["Sean"],
+            inferred_themes=["AI", "ID"],
+        )
+        document = ComposedDocument(format=OutputFormat.MEETING_MINUTES, title="Meeting Minutes - abc123")
+        artifacts = [
+            DerivedArtifact(
+                artifact_id="evt1",
+                media_id="abc123",
+                kind="event",
+                content="We decided to keep AI and ID linked.",
+                metadata={"event_type": "decision", "entities": ["AI", "ID"]},
+            ),
+            DerivedArtifact(
+                artifact_id="evt2",
+                media_id="abc123",
+                kind="event",
+                content="What should happen to the fallback identity flow?",
+                metadata={"event_type": "question", "entities": ["identity"]},
+            ),
+        ]
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "And, Atlassian, and Sean discuss decisions and open questions around AI and ID."
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeRequests:
+            @staticmethod
+            def post(url, json=None, headers=None, timeout=None):
+                assert url == "http://gateway/v1/chat/completions"
+                assert json["model"] == "test-model"
+                assert headers["x-openclaw-agent-id"] == "archivist-main"
+                assert headers["x-openclaw-session-key"] == "agent:archivist-main:media-subject:abc123"
+                assert json["user"] == "agent:archivist-main:media-subject:abc123"
+                return _FakeResponse()
+
+        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "token")
+        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_URL", "http://gateway")
+        monkeypatch.setattr(pipeline, "OPENCLAW_CHAT_MODEL", "test-model")
+        monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
+
+        subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
+        assert subject_line == "Meeting on AI and ID covers decisions and open questions."
+        assert details["generator"] == "openclaw"
+
+    def test_select_public_artifacts_keeps_only_clean_bundle_outputs(self):
+        from media import pipeline
+        from media.models import DerivedArtifact
+
+        artifacts = [
+            DerivedArtifact(artifact_id="evt1", media_id="abc123", kind="event"),
+            DerivedArtifact(artifact_id="seg1", media_id="abc123", kind="speech_segment"),
+            DerivedArtifact(artifact_id="doc1", media_id="abc123", kind="document"),
+            DerivedArtifact(artifact_id="mem1", media_id="abc123", kind="memory"),
+            DerivedArtifact(artifact_id="tx1", media_id="abc123", kind="transcript"),
+            DerivedArtifact(artifact_id="sub1", media_id="abc123", kind="subject_line"),
+            DerivedArtifact(artifact_id="rec1", media_id="abc123", kind="recap"),
+            DerivedArtifact(artifact_id="kf1", media_id="abc123", kind="keyframe"),
+        ]
+
+        public_artifacts = pipeline._select_public_artifacts(artifacts)
+        assert [artifact.kind for artifact in public_artifacts] == [
+            "subject_line",
+            "memory",
+            "document",
+            "transcript",
+        ]
 
     def test_inject_metadata_into_mkv_embeds_transcript_and_bundle(self, tmp_path, monkeypatch):
         from media import pipeline
@@ -912,6 +1782,83 @@ class TestPipeline:
         assert "-0:4" in ffmpeg_cmd
         assert "-0:5" in ffmpeg_cmd
 
+    def test_inject_metadata_writes_processing_stamp(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import ComposedDocument, ContextualMemory, MediaAsset, Modality, OutputFormat
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"source")
+        bundle_path = tmp_path / "bundle.json"
+        bundle_path.write_text("{}", encoding="utf-8")
+
+        commands = []
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            commands.append(cmd)
+            if cmd[0] == "ffprobe":
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"streams":[]}', stderr="")
+            if cmd[0] == "ffmpeg":
+                tmp_output = tmp_path / "clip.archivist_tmp.mkv"
+                tmp_output.write_bytes(b"remuxed")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        asset = MediaAsset(path=str(media_path), filename=media_path.name, modality=Modality.VIDEO, file_hash="abc123def456")
+        memory = ContextualMemory(main_actors=["Andy"], inferred_themes=["Journal"])
+        document = ComposedDocument(format=OutputFormat.MEETING_MINUTES, title="Meeting Minutes - test")
+        payload = {"meta": {"lang": "en"}, "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}]}
+        stamp = {
+            "pipeline_version": "test-version",
+            "pipeline_compat_version": "compat-version",
+            "repo_commit": "0123456789abcdef0123456789abcdef01234567",
+            "repo_commit_suffix": "456789abcdef",
+            "source_file_hash": "abc123def4567890",
+            "source_mtime_ns": 123456789,
+            "document_format": "meeting_minutes",
+        }
+
+        pipeline._inject_metadata_into_file(
+            asset,
+            memory,
+            document,
+            transcript_payload=payload,
+            result_path=bundle_path,
+            subject_line="Andy reviews the journal pipeline behavior.",
+            pipeline_stamp=stamp,
+        )
+
+        ffmpeg_cmd = next(cmd for cmd in commands if cmd[0] == "ffmpeg")
+        joined = " ".join(str(part) for part in ffmpeg_cmd)
+        assert "Archivist pipeline 456789abcdef" in joined
+        assert "keywords=archivist,media-pipeline,version:456789abcdef,compat:compat-version,hash:abc123def456" in joined
+
+    def test_resolve_repo_version_tag_uses_commit_suffix(self):
+        from media import pipeline
+
+        commit_hash = "e96b26af4e9a3dc240b202fd35025679262e3c86"
+        assert pipeline._resolve_repo_version_tag(commit_hash) == "5679262e3c86"
+
+    def test_resolve_repo_commit_hash_reads_git_files_without_git_binary(self, tmp_path, monkeypatch):
+        from media import pipeline
+
+        repo_root = tmp_path / "repo"
+        git_dir = repo_root / ".git"
+        refs_dir = git_dir / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        commit_hash = "e96b26af4e9a3dc240b202fd35025679262e3c86"
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (refs_dir / "main").write_text(f"{commit_hash}\n", encoding="utf-8")
+
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError("git not installed")
+
+        monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+
+        assert pipeline._resolve_repo_commit_hash(repo_root) == commit_hash
+
     def test_asset_record_complete_requires_pipeline_result(self, tmp_path, monkeypatch):
         from media import pipeline
 
@@ -920,11 +1867,212 @@ class TestPipeline:
         media_path = tmp_path / "clip.mkv"
         media_path.write_bytes(b"video")
 
-        asset_data = {"media_id": "abc123", "path": str(media_path)}
+        asset_data = {
+            "media_id": "abc123",
+            "path": str(media_path),
+            "file_hash": "hash123",
+            "file_size_bytes": media_path.stat().st_size,
+        }
         assert pipeline._asset_record_complete(asset_data) is False
 
-        (pipeline.PIPELINE_STORE_DIR / "abc123.json").write_text("{}", encoding="utf-8")
+        (pipeline.PIPELINE_STORE_DIR / "abc123.json").write_text(
+            json.dumps(
+                {
+                    "archivist_pipeline": {
+                        "pipeline_version": pipeline.MEDIA_PIPELINE_VERSION,
+                        "pipeline_compat_version": pipeline.MEDIA_PIPELINE_COMPAT_VERSION,
+                        "source_path": str(media_path.resolve()),
+                        "source_file_hash": "hash123",
+                        "source_size_bytes": media_path.stat().st_size,
+                        "source_mtime_ns": media_path.stat().st_mtime_ns,
+                    },
+                    "layers": {
+                        "L6_vectorstore": {
+                            "chunks_created": 3,
+                            "chunks_inserted": 3,
+                            "collection": "documents_transcripts",
+                            "error": None,
+                            "source_id": "media:abc123",
+                            "file_hash": "hash123",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         assert pipeline._asset_record_complete(asset_data) is True
+
+    def test_asset_record_complete_requires_current_pipeline_stamp(self, tmp_path, monkeypatch):
+        from media import pipeline
+
+        monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", tmp_path / "pipeline")
+        pipeline.PIPELINE_STORE_DIR.mkdir(parents=True)
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+
+        current_mtime_ns = media_path.stat().st_mtime_ns
+        asset_data = {
+            "media_id": "abc123",
+            "path": str(media_path),
+            "file_hash": "hash123",
+            "file_size_bytes": media_path.stat().st_size,
+        }
+
+        stale_result = {
+            "archivist_pipeline": {
+                "pipeline_version": "old-version",
+                "source_path": str(media_path.resolve()),
+                "source_file_hash": "hash123",
+                "source_size_bytes": media_path.stat().st_size,
+                "source_mtime_ns": current_mtime_ns,
+            }
+        }
+        (pipeline.PIPELINE_STORE_DIR / "abc123.json").write_text(json.dumps(stale_result), encoding="utf-8")
+        assert pipeline._asset_record_complete(asset_data) is False
+
+        current_result = {
+            "archivist_pipeline": {
+                "pipeline_version": "repo-tag-123456",
+                "pipeline_compat_version": pipeline.MEDIA_PIPELINE_COMPAT_VERSION,
+                "source_path": str(media_path.resolve()),
+                "source_file_hash": "hash123",
+                "source_size_bytes": media_path.stat().st_size,
+                "source_mtime_ns": current_mtime_ns,
+            },
+            "layers": {
+                "L6_vectorstore": {
+                    "chunks_created": 2,
+                    "chunks_inserted": 2,
+                    "collection": "documents_transcripts",
+                    "error": None,
+                    "source_id": "media:abc123",
+                    "file_hash": "hash123",
+                }
+            },
+        }
+        (pipeline.PIPELINE_STORE_DIR / "abc123.json").write_text(json.dumps(current_result), encoding="utf-8")
+        assert pipeline._asset_record_complete(asset_data) is True
+
+    def test_process_media_file_reuses_current_result(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import MediaAsset, Modality
+
+        pipeline_dir = tmp_path / "pipeline"
+        pipeline_dir.mkdir()
+        monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", pipeline_dir)
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        asset = MediaAsset(
+            media_id="media123",
+            path=str(media_path.resolve()),
+            filename=media_path.name,
+            modality=Modality.VIDEO,
+            file_size_bytes=media_path.stat().st_size,
+            created_at=media_path.stat().st_mtime,
+            indexed_at=media_path.stat().st_mtime,
+        )
+        asset.compute_hash()
+
+        existing_result = {
+            "media_id": asset.media_id,
+            "document": {"format": "meeting_minutes", "title": "Current result"},
+            "layers": {
+                "L6_vectorstore": {
+                    "chunks_created": 4,
+                    "chunks_inserted": 4,
+                    "collection": "documents_transcripts",
+                    "error": None,
+                    "source_id": f"media:{asset.media_id}",
+                    "file_hash": asset.file_hash,
+                }
+            },
+            "archivist_pipeline": {
+                "pipeline_version": "repo-tag-123456",
+                "pipeline_compat_version": pipeline.MEDIA_PIPELINE_COMPAT_VERSION,
+                "source_path": asset.path,
+                "source_file_hash": asset.file_hash,
+                "source_size_bytes": asset.file_size_bytes,
+                "source_mtime_ns": media_path.stat().st_mtime_ns,
+                "document_format": "meeting_minutes",
+            },
+        }
+        (pipeline_dir / f"{asset.media_id}.json").write_text(json.dumps(existing_result), encoding="utf-8")
+
+        monkeypatch.setattr(pipeline, "register_asset", lambda path, metadata=None: asset)
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("pipeline should have reused the existing current result")
+
+        monkeypatch.setattr(pipeline, "_derive_transcript", fail_if_called)
+
+        result = pipeline.process_media_file(str(media_path))
+
+        assert result["reused_existing_result"] is True
+        assert result["skip_reason"] == "current_pipeline_result"
+        assert result["media_id"] == asset.media_id
+
+    def test_process_media_file_backfills_vectorstore_for_current_result(self, tmp_path, monkeypatch):
+        from media import pipeline
+        from media.models import MediaAsset, Modality
+
+        pipeline_dir = tmp_path / "pipeline"
+        pipeline_dir.mkdir()
+        monkeypatch.setattr(pipeline, "PIPELINE_STORE_DIR", pipeline_dir)
+
+        media_path = tmp_path / "clip.mkv"
+        media_path.write_bytes(b"video")
+        asset = MediaAsset(
+            media_id="media123",
+            path=str(media_path.resolve()),
+            filename=media_path.name,
+            modality=Modality.VIDEO,
+            file_size_bytes=media_path.stat().st_size,
+            created_at=media_path.stat().st_mtime,
+            indexed_at=media_path.stat().st_mtime,
+        )
+        asset.compute_hash()
+
+        existing_result = {
+            "media_id": asset.media_id,
+            "document": {"format": "meeting_minutes", "title": "Current result"},
+            "layers": {},
+            "archivist_pipeline": {
+                "pipeline_version": "repo-tag-123456",
+                "pipeline_compat_version": pipeline.MEDIA_PIPELINE_COMPAT_VERSION,
+                "source_path": asset.path,
+                "source_file_hash": asset.file_hash,
+                "source_size_bytes": asset.file_size_bytes,
+                "source_mtime_ns": media_path.stat().st_mtime_ns,
+                "document_format": "meeting_minutes",
+            },
+        }
+        (pipeline_dir / f"{asset.media_id}.json").write_text(json.dumps(existing_result), encoding="utf-8")
+
+        monkeypatch.setattr(pipeline, "register_asset", lambda path, metadata=None: asset)
+        monkeypatch.setattr(
+            pipeline,
+            "_backfill_saved_vectorstore_projection",
+            lambda asset, result: {
+                "chunks_created": 4,
+                "chunks_inserted": 4,
+                "collection": "documents_transcripts",
+                "error": None,
+                "source_id": f"media:{asset.media_id}",
+                "file_hash": asset.file_hash,
+            },
+        )
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("pipeline should not rerun when vectorstore backfill succeeds")
+
+        monkeypatch.setattr(pipeline, "_derive_transcript", fail_if_called)
+
+        result = pipeline.process_media_file(str(media_path))
+
+        assert result["reused_existing_result"] is True
+        assert result["skip_reason"] == "current_pipeline_result"
+        assert result["layers"]["L6_vectorstore"]["file_hash"] == asset.file_hash
 
 
 # ── Transcript Parsers ──────────────────────────────────────────────────

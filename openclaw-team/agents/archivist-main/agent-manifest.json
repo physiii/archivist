@@ -1,0 +1,23 @@
+{
+  "agent_id": "archivist-main",
+  "name": "Archivist Main",
+  "emoji": "A",
+  "role": "operator",
+  "summary": "Human-facing operator for the Archivist console and chat surfaces.",
+  "fleet_lane": "system",
+  "owners": ["andy"],
+  "skills": ["agent-console", "engineering-code", "verification-gate"],
+  "target_features": ["collections-search", "backup-ops", "indexing-ops", "media-pipeline", "console", "focus-console"],
+  "target_metrics": ["gateway-health", "session-count", "media-jobs", "focus-priority-latency"],
+  "routes": ["console:chat", "console:fleet", "console:system", "console:tests", "api:agent-chat"],
+  "dependencies": ["openclaw-gateway", "milvus", "embed-gateway"],
+  "status": "active",
+  "last_reviewed": "2026-04-06",
+  "notes": "Primary control-plane operator for Archivist console chat, live diagnosis, and implementation work.",
+  "ui": {
+    "show": true,
+    "group": "Archivist",
+    "sort_key": 10,
+    "badge": "operator"
+  }
+}

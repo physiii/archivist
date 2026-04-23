@@ -144,7 +144,12 @@ class SpeechSegment:
 
 @dataclass
 class AtomicEvent:
-    """A timestamped structured event extracted from evidence."""
+    """A timestamped structured event extracted from evidence.
+
+    The canonical truth of the pipeline lives here. Each event should retain
+    provenance-rich metadata so higher layers can compress aggressively without
+    losing inspectability.
+    """
     event_id: str = field(default_factory=lambda: f"evt_{uuid4().hex[:8]}")
     time_start: float = 0.0
     time_end: float = 0.0
@@ -163,17 +168,20 @@ class AtomicEvent:
 
 @dataclass
 class LocalRecap:
-    """A step-by-step account of a group of atomic events."""
+    """A step-by-step event-ledger view over a group of atomic events."""
     recap_id: str = field(default_factory=lambda: f"recap_{uuid4().hex[:8]}")
     group_type: str = ""  # scene, conversation_turn, chapter, episode, incident_phase
     time_start: float = 0.0
     time_end: float = 0.0
     recap_text: str = ""
+    window_summary: str = ""
     salient_entities: list[str] = field(default_factory=list)
     unresolved_questions: list[str] = field(default_factory=list)
     emotional_tone: str = ""
     causal_links: list[str] = field(default_factory=list)
     event_ids: list[str] = field(default_factory=list)
+    summary_refs: list[dict] = field(default_factory=list)
+    ledger_entries: list[dict] = field(default_factory=list)
     source_refs: list[str] = field(default_factory=list)
 
 
@@ -182,9 +190,10 @@ class LocalRecap:
 
 @dataclass
 class ContextualMemory:
-    """Compressed working memory built from local recaps."""
+    """Compressed contextual account built from local recaps and event provenance."""
     memory_id: str = field(default_factory=lambda: f"mem_{uuid4().hex[:8]}")
     media_id: str = ""
+    context_overview: str = ""
     main_actors: list[str] = field(default_factory=list)
     timeline_anchors: list[dict] = field(default_factory=list)
     locations: list[str] = field(default_factory=list)
@@ -194,6 +203,8 @@ class ContextualMemory:
     contradictions: list[str] = field(default_factory=list)
     notable_evidence: list[str] = field(default_factory=list)
     final_takeaways: list[str] = field(default_factory=list)
+    interpretive_notes: list[dict] = field(default_factory=list)
+    evidence_map: dict[str, list[dict]] = field(default_factory=dict)
     recap_ids: list[str] = field(default_factory=list)
 
 

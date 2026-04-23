@@ -75,7 +75,7 @@ export default function ChatBox() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const sessionKey = `main:web:${sessionId}@archivist`;
+  const sessionKey = `main:web:${sessionId}@archivist-main`;
 
   /* ── Auto-scroll ──────────────────────────────────────────────── */
   useEffect(() => {
@@ -159,8 +159,8 @@ export default function ChatBox() {
 
   const selectSession = useCallback(
     (s: ChatSession) => {
-      // Extract sid from session key format "main:web:<sid>@archivist"
-      const match = s.session_key.match(/^main:web:(.+)@archivist$/);
+      // Extract sid from session key format "main:web:<sid>@<agent-id>"
+      const match = s.session_key.match(/^main:web:(.+)@[^@]+$/);
       if (match) setSessionId(match[1]);
       setViewingOc(null);
       loadSessionMessages(s.session_key);

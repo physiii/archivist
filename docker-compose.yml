@@ -7,10 +7,44 @@ services:
       dockerfile: Dockerfile
     image: archivist:latest
     container_name: archivist
+    init: true
     environment:
+      ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS: "false"
+      ARCHIVIST_HOST_WORKSPACE: /home/andy/archivist
+      ARCHIVIST_GOOGLE_SERVICES: gmail,calendar,drive,chat
+      ARCHIVIST_OPENCLAW_CONSOLE_AGENT_ID: archivist-main
+      ARCHIVIST_OPENCLAW_VISIBLE_AGENT_IDS: archivist-main,archivist-health,archivist-repair,archivist-observer,archivist-verifier
+      ARCHIVIST_WORK_NOTES_ROOT: /home/andy/vnotes
+      ARCHIVIST_FOCUS_SYNC_TIME: "05:30"
+      ARCHIVIST_FOCUS_SYNC_TIMEZONE: America/Chicago
+      ARCHIVIST_FOCUS_MAX_AGE_HOURS: "6"
+      OPENCLAW_STATE_DIR: /host/.openclaw
+      OPENCLAW_CONFIG_PATH: /host/.openclaw/openclaw.json
+      OPENCLAW_GATEWAY_URL: http://host.docker.internal:18789
       MILVUS_HOST: host.docker.internal
+      MILVUS_CONNECT_TIMEOUT: "3"
+      MILVUS_LOAD_TIMEOUT: "60"
       EMBEDDING_HOST: host.docker.internal
       EMBEDDING_PORT: "8000"
+      TRANSCRIBE_PROVIDER: remote_only
+      TRANSCRIBE_API_URL: http://host.docker.internal:8123
+      TRANSCRIBE_API_TIMEOUT_S: "1800"
+      TRANSCRIBE_MODEL: turbo
+      TRANSCRIBE_LOCAL_MODEL: large-v3
+      TRANSCRIBE_COMPUTE_TYPE: int8
+      TRANSCRIBE_BEAM_SIZE: "1"
+      TRANSCRIBE_MAX_CONCURRENT: "1"
+      MEDIA_WATCH_IDLE_ONLY: "true"
+      MEDIA_WATCH_AUTO_RESTORE: "false"
+      MEDIA_WATCH_MAX_LOAD_PER_CPU: "0.70"
+      MEDIA_WATCH_DEFER_LOG_INTERVAL_S: "300"
+      MEDIA_SCENE_MAX_WIDTH: "960"
+      MEDIA_SCENE_SAMPLE_FPS: "1"
+      MEDIA_SCENE_ANALYSIS_MAX_PIXELS: "12000000"
+      MEDIA_LARGE_VIDEO_KEYFRAME_INTERVAL_S: "300"
+      MEDIA_LARGE_VIDEO_MAX_KEYFRAMES: "16"
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_USERNAME: physiii
       VECTORSTORE_METRIC_TYPE: COSINE
       METRIC_TYPE: COSINE
       VECTORSTORE_ZFS_HOST: 192.168.1.42
@@ -25,6 +59,7 @@ services:
       INDEXING_PATH_ALIASES: /media/mass=/media/mass;/home/andy/nas_mass=/home/andy/nas_mass
       INDEXING_SCAN_TIMEOUT_SECONDS: "900"
       INDEXING_FILE_DISCOVERY_TIMEOUT_SECONDS: "900"
+      ARCHIVIST_GIT_REPO_DIRS: /home/andy/archivist:/home/andy/openclaw:/home/andy/MovieTime:/home/andy/MusicTime:/home/andy/collectivefs:/home/andy/custodian:/home/andy/radio-mapper:/home/andy/autoresearch:/home/andy/embed:/home/andy/TranscribeServer:/home/andy/needl:/home/andy/versant:/home/andy/zcoord:/home/andy/vnotes:/home/andy/pyfi-website
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -34,14 +69,31 @@ services:
         aliases:
           - vectorstore
     volumes:
+      - /home/andy:/home/andy:ro
       - vectorstore_vectorstore-backups:/backups
       - vectorstore_vectorstore-indexing:/indexing
       - vectorstore_milvus-data:/data/milvus:ro
       - vectorstore_etcd-data:/data/etcd:ro
       - vectorstore_minio-data:/data/minio:ro
+      - archivist_media-store:/data/media_store
+      - archivist_media-pipeline:/data/media_pipeline
       - /media/mass:/media/mass
       - /home/andy/nas_mass:/home/andy/nas_mass
+      - /home/andy/archivist/.openclaw:/host/archivist/.openclaw
+      - /home/andy/.openclaw:/host/.openclaw:ro
+      - /home/andy/.config/archivist:/root/.config/archivist
       - /home/andy/.ssh:/root/.ssh:ro
+    command:
+      - gunicorn
+      - -w
+      - "2"
+      - --threads
+      - "16"
+      - --timeout
+      - "3600"
+      - -b
+      - 0.0.0.0:5050
+      - main:app
     restart: unless-stopped
 
 volumes:
@@ -55,3 +107,5 @@ volumes:
     external: true
   vectorstore_minio-data:
     external: true
+  archivist_media-store:
+  archivist_media-pipeline:

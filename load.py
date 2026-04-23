@@ -1,13 +1,20 @@
 # load.py
 import os
 import logging
+import threading
 from datetime import datetime
 from hashlib import sha256
-from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility, Function, FunctionType
+from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
 from pymilvus.exceptions import MilvusException
 from tqdm import tqdm
 import traceback
 from uuid import uuid4
+
+try:
+    from pymilvus import Function, FunctionType
+except Exception:  # pragma: no cover
+    Function = None  # type: ignore
+    FunctionType = None  # type: ignore
 
 from utils import (
     DEFAULT_EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_DIM,
@@ -17,11 +24,57 @@ from utils import (
     file_hash, get_creation_date, process_and_insert_lines
 )
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
+
+# ── Shared Milvus connection pool ──────────────────────────────────
+_milvus_pool_lock = threading.Lock()
+_milvus_pool: dict[str, str] = {}  # "host:port" → alias
+_milvus_pool_refcount: dict[str, int] = {}
+try:
+    MILVUS_CONNECT_TIMEOUT = float(os.environ.get("MILVUS_CONNECT_TIMEOUT", "3"))
+except (TypeError, ValueError):
+    MILVUS_CONNECT_TIMEOUT = 3.0
+try:
+    MILVUS_LOAD_TIMEOUT = float(os.environ.get("MILVUS_LOAD_TIMEOUT", "60"))
+except (TypeError, ValueError):
+    MILVUS_LOAD_TIMEOUT = 60.0
+
+
+def _get_milvus_connection(host: str, port: str = "19530") -> str:
+    """Return a reusable Milvus connection alias for the given host."""
+    key = f"{host}:{port}"
+    with _milvus_pool_lock:
+        alias = _milvus_pool.get(key)
+        if alias:
+            try:
+                utility.list_collections(using=alias, timeout=MILVUS_CONNECT_TIMEOUT)
+                _milvus_pool_refcount[alias] = _milvus_pool_refcount.get(alias, 0) + 1
+                return alias
+            except Exception:
+                try:
+                    connections.disconnect(alias)
+                except Exception:
+                    pass
+                del _milvus_pool[key]
+                _milvus_pool_refcount.pop(alias, None)
+
+        alias = f"load_pool_{key.replace('.', '_').replace(':', '_')}"
+        connections.connect(alias, host=host, port=port, timeout=MILVUS_CONNECT_TIMEOUT)
+        _milvus_pool[key] = alias
+        _milvus_pool_refcount[alias] = 1
+        return alias
+
+
+def _release_milvus_connection(alias: str):
+    """Decrement refcount for a pooled connection."""
+    with _milvus_pool_lock:
+        count = _milvus_pool_refcount.get(alias, 1) - 1
+        if count <= 0:
+            _milvus_pool_refcount.pop(alias, None)
+        else:
+            _milvus_pool_refcount[alias] = count
 
 def clear_collection(collection_name, using_alias="default"):
-    if utility.has_collection(collection_name, using=using_alias):
+    if utility.has_collection(collection_name, using=using_alias, timeout=MILVUS_CONNECT_TIMEOUT):
         collection = Collection(name=collection_name, using=using_alias)
         collection.drop()
         logging.info(f"Vector store {collection_name} cleared.")
@@ -33,7 +86,7 @@ def _generate_alias(prefix="conn"):
 
 def clear_vectorstore_collection(collection_name, ip_address="localhost"):
     alias = _generate_alias("clear")
-    connections.connect(alias, host=ip_address, port='19530')
+    connections.connect(alias, host=ip_address, port='19530', timeout=MILVUS_CONNECT_TIMEOUT)
 
     # Standardize collection naming
     collection_name = f"documents_{collection_name}"
@@ -47,7 +100,8 @@ def load_to_vectorstore(args):
     start_time = datetime.now()
     # Honor CLI/env host instead of hardcoded localhost so we hit the real Milvus service.
     milvus_host = getattr(args, "ip_address", None) or os.getenv("MILVUS_HOST", "localhost")
-    connections.connect("default", host=milvus_host, port='19530')
+    connections.connect("default", host=milvus_host, port='19530', timeout=MILVUS_CONNECT_TIMEOUT)
+    collection = None
 
     if args.clear:
         if not args.clear_collection:
@@ -95,6 +149,7 @@ def load_to_vectorstore(args):
         collection.create_index(field_name="vector", index_params=index_params)
 
     collection.load()
+    utility.wait_for_loading_complete(collection_name, using="default", timeout=MILVUS_LOAD_TIMEOUT)
 
     path = os.path.abspath(args.path)
 
@@ -214,6 +269,12 @@ def load_to_vectorstore(args):
             logging.error(f"Error processing {path}: {e}")
             logging.error(traceback.format_exc())
 
+    try:
+        if collection is not None:
+            collection.release()
+            logging.info(f"Released collection {collection_name}")
+    except Exception as release_error:
+        logging.warning(f"Failed to release collection {collection_name}: {release_error}")
     connections.disconnect("default")
     end_time = datetime.now()
     logging.info(f"Operation completed in {end_time - start_time}.")
@@ -221,12 +282,10 @@ def load_to_vectorstore(args):
 def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
                              line_by_line=False, chunk_size=1000, overlap=0, ip_address="localhost", embedding_host="localhost", embedding_port=None):
     logging.info(f"Starting load_text_to_vectorstore: collection={collection_name}, model={embedding_model}, ip={ip_address}")
-    alias = _generate_alias("load")
+    alias = _get_milvus_connection(ip_address)
 
     try:
-        logging.info("Connecting to Milvus...")
-        connections.connect(alias, host=ip_address, port='19530')
-        logging.info("Connected to Milvus successfully")
+        logging.info(f"Connected to Milvus at {ip_address} (pooled)")
 
         # Use local embedding model as default
         embedding_model = embedding_model or LOCAL_EMBEDDING_MODEL
@@ -245,7 +304,7 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
         logging.info(f"Embedding dimension: {embedding_dim}")
 
         # Check if collection exists and has the correct dimension / BM25 schema. Drop if incorrect.
-        if utility.has_collection(collection_name, using=alias):
+        if utility.has_collection(collection_name, using=alias, timeout=MILVUS_CONNECT_TIMEOUT):
             logging.info(f"Collection {collection_name} exists. Checking schema...")
             existing_collection = Collection(name=collection_name, using=alias)
             existing_schema = existing_collection.schema
@@ -298,17 +357,20 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
             FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=64),
             FieldSchema(name="creation_date", dtype=DataType.INT64)
         ]
-        bm25_fn = Function(
-            name="bm25_fn",
-            function_type=FunctionType.BM25,
-            input_field_names=["text"],
-            output_field_names=["sparse"],
-        )
-        schema = CollectionSchema(fields, description="Text Collection", functions=[bm25_fn])
+        schema_kwargs = {}
+        if Function is not None and FunctionType is not None:
+            bm25_fn = Function(
+                name="bm25_fn",
+                function_type=FunctionType.BM25,
+                input_field_names=["text"],
+                output_field_names=["sparse"],
+            )
+            schema_kwargs["functions"] = [bm25_fn]
+        schema = CollectionSchema(fields, description="Text Collection", **schema_kwargs)
         logging.info(f"Using schema with fields: {[f.name for f in fields]}")
 
         # SIMPLIFIED COLLECTION HANDLING - No reload
-        if utility.has_collection(collection_name, using=alias):
+        if utility.has_collection(collection_name, using=alias, timeout=MILVUS_CONNECT_TIMEOUT):
             logging.info(f"Collection {collection_name} already exists - using it")
             collection = Collection(name=collection_name, using=alias)
         else:
@@ -437,11 +499,6 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
             return {"error": "Milvus insertion failed", "details": str(e), "traceback": traceback.format_exc()}
 
     finally:
-        try:
-            connections.disconnect(alias)
-            logging.info("Disconnected from Milvus")
-        except Exception as e:
-            # Log if disconnection fails but don't raise further
-            logging.warning(f"Failed to disconnect from Milvus: {str(e)}")
-            
+        _release_milvus_connection(alias)
+
     return {"message": "Text loaded successfully", "details": results}

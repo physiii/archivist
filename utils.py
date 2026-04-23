@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import re
 import logging
+import threading
 from hashlib import sha256
 from pathlib import Path
 from typing import Iterable
 
 import requests
+from requests.adapters import HTTPAdapter
 from pymilvus import Collection, utility
 
 DEFAULT_EMBEDDING_MODEL = os.getenv("DEFAULT_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
@@ -26,49 +28,32 @@ EMBEDDING_DIMENSIONS: dict[str, int] = {
     "text-embedding-3-large": 3072,
 }
 
-def embed_text_to_vector(
+_embed_session_local = threading.local()
+
+
+def _embedding_session() -> requests.Session:
+    session = getattr(_embed_session_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=32, max_retries=0, pool_block=False)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _embed_session_local.session = session
+    return session
+
+
+def _post_batch_embeddings(
+    session: requests.Session,
+    url: str,
     texts: list[str],
     model: str,
-    is_local: bool = True,
-    ip_address: str | None = None,
-    embedding_host: str | None = None,
-    embedding_port: int | str | None = None,
-) -> list[list[float]]:
-    if not texts:
-        return []
-    host = str(embedding_host or ip_address or os.getenv("EMBEDDING_HOST", "localhost"))
-    port = int(embedding_port or os.getenv("EMBEDDING_PORT", "8000"))
-    # First try per-text /embed endpoint expecting {"text": "..."}.
-    embed_url = f"http://{host}:{port}/embed"
-    out: list[list[float]] = []
-    for text in texts:
-        try:
-            response = requests.post(embed_url, json={"text": text}, timeout=60)
-            if response.status_code >= 300:
-                out = []
-                break
-            body = response.json()
-            embedding = body.get("embedding")
-            if not isinstance(embedding, list):
-                out = []
-                break
-            out.append([float(v) for v in embedding])
-        except Exception:
-            out = []
-            break
-    if len(out) == len(texts):
-        return out
-
-    # Fallback to OpenAI-compatible endpoint in batch mode.
-    v1_url = f"http://{host}:{port}/v1/embeddings"
-    v1_payloads = [{"input": texts}]
-    # Most local embedding gateways reject unknown model labels; only pass
-    # model when caller provided a non-default explicit model value.
+) -> list[list[float]] | None:
+    payloads = [{"input": texts}]
     if model and str(model).strip() not in {LOCAL_EMBEDDING_MODEL, ""}:
-        v1_payloads.insert(0, {"input": texts, "model": model})
-    for payload in v1_payloads:
+        payloads.insert(0, {"input": texts, "model": model})
+    for payload in payloads:
         try:
-            response = requests.post(v1_url, json=payload, timeout=60)
+            response = session.post(url, json=payload, timeout=60)
             if response.status_code >= 300:
                 continue
             body = response.json()
@@ -86,6 +71,58 @@ def embed_text_to_vector(
                 return vectors
         except Exception:
             continue
+    return None
+
+
+def _post_single_embeddings(
+    session: requests.Session,
+    url: str,
+    texts: list[str],
+) -> list[list[float]] | None:
+    out: list[list[float]] = []
+    for text in texts:
+        try:
+            response = session.post(url, json={"text": text}, timeout=60)
+            if response.status_code >= 300:
+                return None
+            body = response.json()
+            embedding = body.get("embedding")
+            if not isinstance(embedding, list):
+                return None
+            out.append([float(v) for v in embedding])
+        except Exception:
+            return None
+    return out if len(out) == len(texts) else None
+
+def embed_text_to_vector(
+    texts: list[str],
+    model: str,
+    is_local: bool = True,
+    ip_address: str | None = None,
+    embedding_host: str | None = None,
+    embedding_port: int | str | None = None,
+) -> list[list[float]]:
+    if not texts:
+        return []
+    host = str(embedding_host or ip_address or os.getenv("EMBEDDING_HOST", "localhost"))
+    port = int(embedding_port or os.getenv("EMBEDDING_PORT", "8000"))
+    session = _embedding_session()
+    embed_url = f"http://{host}:{port}/embed"
+    v1_url = f"http://{host}:{port}/v1/embeddings"
+
+    if len(texts) > 1:
+        batched = _post_batch_embeddings(session, v1_url, texts, model)
+        if batched is not None:
+            return batched
+
+    singles = _post_single_embeddings(session, embed_url, texts)
+    if singles is not None:
+        return singles
+
+    if len(texts) == 1:
+        batched = _post_batch_embeddings(session, v1_url, texts, model)
+        if batched is not None:
+            return batched
 
     message = (
         f"Embedding request failed for host={host} port={port}. "
