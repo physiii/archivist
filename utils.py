@@ -14,12 +14,12 @@ from pymilvus import Collection, utility
 
 DEFAULT_EMBEDDING_MODEL = os.getenv("DEFAULT_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "local-default")
-LOCAL_EMBEDDING_DIM = int(os.getenv("LOCAL_EMBEDDING_DIM", "4096"))
+LOCAL_EMBEDDING_DIM = int(os.getenv("LOCAL_EMBEDDING_DIM", "2560"))
 
 SNIPPET_LENGTH = int(os.getenv("SNIPPET_LENGTH", "65535"))
-INDEX_TYPE = os.getenv("INDEX_TYPE", "IVF_FLAT")
+INDEX_TYPE = os.getenv("VECTORSTORE_INDEX_TYPE") or os.getenv("INDEX_TYPE", "IVF_FLAT")
 METRIC_TYPE = os.getenv("METRIC_TYPE", "COSINE")
-NLIST = int(os.getenv("NLIST", "1024"))
+NLIST = int(os.getenv("VECTORSTORE_NLIST") or os.getenv("NLIST", "1024"))
 
 EMBEDDING_DIMENSIONS: dict[str, int] = {
     DEFAULT_EMBEDDING_MODEL: LOCAL_EMBEDDING_DIM,

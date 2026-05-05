@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -13,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from backups_service import get_schedule_config
+from business_profile import business_tags_for_text
 from documents.chunking import chunk_document_segments
 from documents.extract import extract_document_segments
 from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, utility
@@ -40,6 +43,8 @@ try:
 except Exception:  # pragma: no cover
     fcntl = None  # type: ignore
 
+log = logging.getLogger(__name__)
+
 
 INDEXING_ROOT = Path(os.getenv("VECTORSTORE_INDEXING_DIR", "/indexing"))
 RUNS_DIR = INDEXING_ROOT / "runs"
@@ -52,12 +57,12 @@ RUN_SUMMARY_FILE = "summary.json"
 
 TRANSCRIPT_COLLECTION = "documents_transcripts"
 DOCUMENTS_COLLECTION = "documents"
-SUPPORTED_EXTS = {".vtt", ".srt", ".tsv", ".txt"}
+SUPPORTED_EXTS = {".vtt", ".srt", ".tsv", ".txt", ".log"}
 DOCUMENT_EXTS = {".pdf", ".docx"}
 MEDIA_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts"}
 ALL_INDEX_EXTS = SUPPORTED_EXTS | DOCUMENT_EXTS | MEDIA_EXTS
-INDEXING_CONTENT_VERSION = "transcript_v6"
-DOCUMENT_CONTENT_VERSION = "document_v1"
+INDEXING_CONTENT_VERSION = "transcript_v8_business_tags"
+DOCUMENT_CONTENT_VERSION = "document_v2_business_tags"
 HOST_MOUNT_ROOT = Path(os.getenv("HOST_MOUNT_ROOT", "/host"))
 INDEXING_HOST_PATH_FALLBACK = os.getenv("INDEXING_HOST_PATH_FALLBACK", "1").strip().lower() in {"1", "true", "yes"}
 LEGACY_PATH_PREFIX_ALIASES = {
@@ -68,8 +73,9 @@ TRANSCRIPT_EXT_PRIORITY = {
     ".srt": 1,
     ".tsv": 2,
     ".txt": 3,
+    ".log": 4,
 }
-TRANSCRIPT_PATH_SUFFIX_RE = re.compile(r"(?i)(?:\.ts)?\.(vtt|srt|tsv|txt)$")
+TRANSCRIPT_PATH_SUFFIX_RE = re.compile(r"(?i)(?:\.ts)?\.(vtt|srt|tsv|txt|log)$")
 # Container path aliases for host paths users commonly enter in the UI.
 # Format: "/host/prefix=/container/prefix;/other/host=/other/container"
 INDEXING_PATH_ALIASES = os.getenv(
@@ -134,6 +140,7 @@ DOC_TYPE_BY_EXT = {
     ".srt": "subtitle_srt",
     ".tsv": "transcript_tsv",
     ".txt": "transcript_txt",
+    ".log": "transcript_log",
     ".pdf": "pdf",
     ".docx": "docx",
 }
@@ -832,6 +839,31 @@ def _create_index_best_effort(collection: Collection, field_name: str, index_par
         log.warning("Index creation for %s.%s did not finish: %s", collection.name, field_name, exc)
 
 
+def _dense_index_params() -> dict[str, Any]:
+    return {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
+
+
+def _vector_index_matches(index: Any) -> bool:
+    params = getattr(index, "params", {}) or {}
+    actual_type = str(params.get("index_type") or "").strip().upper()
+    actual_metric = str(params.get("metric_type") or "").strip().upper()
+    desired_type = str(INDEX_TYPE or "").strip().upper()
+    desired_metric = str(METRIC_TYPE or "").strip().upper()
+    if desired_type and actual_type and actual_type != desired_type:
+        return False
+    if desired_metric and actual_metric and actual_metric != desired_metric:
+        return False
+    if desired_type.startswith("IVF"):
+        nested = params.get("params") if isinstance(params.get("params"), dict) else {}
+        try:
+            actual_nlist = int(nested.get("nlist") or 0)
+        except (TypeError, ValueError):
+            actual_nlist = 0
+        if actual_nlist and actual_nlist != int(NLIST):
+            return False
+    return True
+
+
 def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address: str | None = None) -> Collection:
     connections.connect(
         alias,
@@ -845,17 +877,32 @@ def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address
         fields = {field.name: field for field in existing.schema.fields}
         required = required_chunk_field_names()
         if not required.issubset(fields.keys()):
-            recreate = True
-        else:
-            dim = int(getattr(fields.get("vector"), "params", {}).get("dim", 0) or 0)
-            if dim != LOCAL_EMBEDDING_DIM:
-                recreate = True
+            # Schema shape drift (missing required fields) — treat as fatal rather
+            # than silently dropping the user's data. Operators should rename the
+            # collection out of the way or run a migration, not have ingest wipe
+            # it on the next write.
+            missing = required - fields.keys()
+            raise RuntimeError(
+                f"Collection {name!r} is missing required chunk fields "
+                f"{sorted(missing)!r}; refusing to auto-drop. Rename it out of "
+                f"the way (or run the embedding migration) and let a fresh "
+                f"collection be created."
+            )
+        dim = int(getattr(fields.get("vector"), "params", {}).get("dim", 0) or 0)
+        if dim != LOCAL_EMBEDDING_DIM:
+            raise RuntimeError(
+                f"Collection {name!r} has vector dim {dim} but "
+                f"LOCAL_EMBEDDING_DIM={LOCAL_EMBEDDING_DIM}; refusing to "
+                f"auto-drop. Run scripts/migrate_embeddings_to_qwen4b.py (or a "
+                f"similar migration) and cut over before changing the embedding "
+                f"model."
+            )
         if recreate:
             existing.drop(timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
     if not utility.has_collection(name, using=alias, timeout=DEFAULT_MILVUS_CONNECT_TIMEOUT):
         schema = CollectionSchema(_chunk_collection_fields(), description=description, functions=_chunk_collection_functions())
         collection = Collection(name=name, schema=schema, using=alias)
-        dense_index = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
+        dense_index = _dense_index_params()
         _create_index_best_effort(collection, "vector", dense_index)
         _create_index_best_effort(
             collection,
@@ -870,22 +917,19 @@ def _ensure_chunk_collection(name: str, description: str, alias: str, ip_address
         existing = []
     has_vector_index = any(getattr(ix, "field_name", "") == "vector" for ix in existing)
     has_sparse_index = any(getattr(ix, "field_name", "") == "sparse" for ix in existing)
-    vector_metric = None
+    vector_index = None
     for ix in existing:
         if getattr(ix, "field_name", "") != "vector":
             continue
-        params = getattr(ix, "params", {}) or {}
-        metric = params.get("metric_type")
-        if metric:
-            vector_metric = str(metric).strip().upper()
-            break
+        vector_index = ix
+        break
     if not has_vector_index:
-        dense_index = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
+        dense_index = _dense_index_params()
         _create_index_best_effort(collection, "vector", dense_index)
-    elif vector_metric and vector_metric != str(METRIC_TYPE).strip().upper():
+    elif vector_index is not None and not _vector_index_matches(vector_index):
         collection.release(timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
         collection.drop_index(index_name="vector", timeout=DEFAULT_MILVUS_INSERT_TIMEOUT)
-        dense_index = {"index_type": INDEX_TYPE, "metric_type": METRIC_TYPE, "params": {"nlist": NLIST}}
+        dense_index = _dense_index_params()
         _create_index_best_effort(collection, "vector", dense_index)
     if not has_sparse_index:
         _create_index_best_effort(
@@ -1332,6 +1376,105 @@ def _chunk_hash(chunk: TranscriptChunk) -> str:
     return sha256(payload.encode("utf-8")).hexdigest()
 
 
+_RETRIEVAL_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "also",
+    "and",
+    "are",
+    "because",
+    "been",
+    "before",
+    "being",
+    "but",
+    "can",
+    "could",
+    "did",
+    "does",
+    "doing",
+    "for",
+    "from",
+    "get",
+    "got",
+    "had",
+    "has",
+    "have",
+    "how",
+    "into",
+    "just",
+    "kind",
+    "like",
+    "more",
+    "not",
+    "now",
+    "okay",
+    "one",
+    "our",
+    "out",
+    "right",
+    "said",
+    "see",
+    "should",
+    "some",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "thing",
+    "think",
+    "this",
+    "those",
+    "through",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "with",
+    "would",
+    "yeah",
+    "you",
+    "your",
+}
+
+
+def _retrieval_keywords(text: str, limit: int = 8) -> list[str]:
+    tokens = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", text or "")
+        if token.lower() not in _RETRIEVAL_STOPWORDS
+    ]
+    if not tokens:
+        return []
+    return [token for token, _ in Counter(tokens).most_common(limit)]
+
+
+def _retrieval_text_for_chunk(chunk: TranscriptChunk) -> str:
+    evidence = " ".join(str(chunk.text or "").split()).strip()
+    if not evidence:
+        return ""
+    keywords = _retrieval_keywords(evidence)
+    if not keywords:
+        return evidence
+    topic = ", ".join(keywords)
+    intents = [
+        f"Answer-bearing transcript passage about {topic}.",
+        f"What was decided, explained, or changed about {topic}?",
+        f"What actions, risks, status updates, or follow-ups mention {topic}?",
+        f"Where is {topic} discussed in this source?",
+    ]
+    if "?" in evidence or str(chunk.tag or "").startswith("event_question"):
+        intents.insert(0, f"Context and answer evidence around this question: {evidence[:600]}")
+    if chunk.topic_label:
+        intents.append(f"Topic label: {chunk.topic_label}.")
+    return f"{evidence}\n\nSearch intents:\n" + "\n".join(intents)
+
+
 def _insert_chunks(
     collection: Collection,
     chunks: list[TranscriptChunk],
@@ -1348,7 +1491,7 @@ def _insert_chunks(
     embedding_text_max_chars = 12000
     for start in range(0, len(chunks), embedding_batch_size):
         batch_chunks = chunks[start : start + embedding_batch_size]
-        batch_texts = [chunk.text[:embedding_text_max_chars] for chunk in batch_chunks]
+        batch_texts = [_retrieval_text_for_chunk(chunk)[:embedding_text_max_chars] for chunk in batch_chunks]
         vectors = embed_text_to_vector(
             batch_texts,
             LOCAL_EMBEDDING_MODEL,
@@ -1403,6 +1546,14 @@ def _insert_chunks(
             tags.append(f"language:{chunk.language}")
         if chunk.topic_label:
             tags.append(f"topic:{chunk.topic_label}")
+        tags.extend(
+            business_tags_for_text(
+                chunk.text,
+                chunk.path,
+                chunk.source_id,
+                chunk.topic_label or "",
+            )
+        )
         if extra_tags:
             tags.extend(tag for tag in extra_tags if tag)
         return _serialize_tags(tags)
@@ -1849,8 +2000,8 @@ def _schedule_worker() -> None:
 
 # ── GitHub content indexing ──────────────────────────────────────────
 
-GITHUB_CONTENT_VERSION = "github_v1"
-GOOGLE_ARCHIVE_CONTENT_VERSION = "google_archive_v1"
+GITHUB_CONTENT_VERSION = "github_v2_business_tags"
+GOOGLE_ARCHIVE_CONTENT_VERSION = "google_archive_v2_business_tags"
 GOOGLE_ARCHIVE_FILE_MAP = {
     "gmail": "gmail_messages.jsonl",
     "calendar": "calendar_events.jsonl",
@@ -1966,6 +2117,7 @@ def _google_archive_extra_tags(record: dict) -> list[str]:
         space_type = str(record.get("space_type") or "").strip()
         if space_type:
             tags.append(f"space_type:{_google_archive_slug(space_type)}")
+    tags.extend(business_tags_for_text(_google_archive_record_text(record), account, day))
     deduped: list[str] = []
     seen: set[str] = set()
     for tag in tags:
