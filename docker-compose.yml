@@ -29,8 +29,8 @@ services:
       TRANSCRIBE_PROVIDER: remote_only
       TRANSCRIBE_API_URL: http://host.docker.internal:8123
       TRANSCRIBE_API_TIMEOUT_S: "1800"
-      TRANSCRIBE_MODEL: turbo
-      TRANSCRIBE_LOCAL_MODEL: large-v3
+      TRANSCRIBE_MODEL: medium.en
+      TRANSCRIBE_LOCAL_MODEL: medium.en
       TRANSCRIBE_COMPUTE_TYPE: int8
       TRANSCRIBE_BEAM_SIZE: "1"
       TRANSCRIBE_MAX_CONCURRENT: "1"

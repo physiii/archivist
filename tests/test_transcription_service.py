@@ -158,14 +158,27 @@ def test_get_status_not_loaded():
     assert status["model"] == transcription_service.TRANSCRIBE_MODEL
 
 
-def test_resolve_local_model_name_maps_turbo():
+def test_resolve_local_model_name_maps_turbo(monkeypatch):
+    monkeypatch.setattr(transcription_service, "LOCAL_TRANSCRIBE_MODEL", "")
     assert transcription_service._resolve_local_model_name("turbo") == "large-v3"
     assert transcription_service._resolve_local_model_name("large-v3") == "large-v3"
+
+
+def test_resolve_local_model_name_maps_medium_en_aliases(monkeypatch):
+    monkeypatch.setattr(transcription_service, "LOCAL_TRANSCRIBE_MODEL", "")
+    assert transcription_service._resolve_local_model_name("medium-en") == "medium.en"
+    assert transcription_service._resolve_local_model_name("medium_en") == "medium.en"
+    assert transcription_service._resolve_local_model_name("") == "medium.en"
 
 
 def test_resolve_local_model_name_respects_override(monkeypatch):
     monkeypatch.setattr(transcription_service, "LOCAL_TRANSCRIBE_MODEL", "distil-large-v3")
     assert transcription_service._resolve_local_model_name("turbo") == "distil-large-v3"
+
+
+def test_resolve_local_model_name_normalizes_override(monkeypatch):
+    monkeypatch.setattr(transcription_service, "LOCAL_TRANSCRIBE_MODEL", "medium-en")
+    assert transcription_service._resolve_local_model_name("turbo") == "medium.en"
 
 
 def test_transcribe_when_unavailable(monkeypatch):

@@ -25,7 +25,7 @@ logger = logging.getLogger("archivist.transcription")
 
 # ── Configuration ────────────────────────────────────────────────────────
 
-TRANSCRIBE_MODEL = (os.getenv("TRANSCRIBE_MODEL") or "turbo").strip()
+TRANSCRIBE_MODEL = (os.getenv("TRANSCRIBE_MODEL") or "medium.en").strip()
 COMPUTE_TYPE = (os.getenv("TRANSCRIBE_COMPUTE_TYPE") or "float16").strip()
 BEAM_SIZE = max(1, int(os.getenv("TRANSCRIBE_BEAM_SIZE", "1")))
 GPU_INDEX = int(os.getenv("TRANSCRIBE_GPU_ID", "0"))
@@ -142,17 +142,23 @@ def _probe_remote_service(force: bool = False) -> bool:
     return _remote_available
 
 
-def _resolve_local_model_name(requested_model: str) -> str:
-    if LOCAL_TRANSCRIBE_MODEL:
-        return LOCAL_TRANSCRIBE_MODEL
-    normalized = (requested_model or "").strip()
+def _canonical_whisper_model_name(model_name: str) -> str:
+    normalized = (model_name or "").strip()
     if not normalized:
-        return "large-v3"
+        return "medium.en"
     alias_map = {
+        "medium-en": "medium.en",
+        "medium_en": "medium.en",
         "turbo": "large-v3",
         "whisper-1": "large-v3",
     }
     return alias_map.get(normalized, normalized)
+
+
+def _resolve_local_model_name(requested_model: str) -> str:
+    if LOCAL_TRANSCRIBE_MODEL:
+        return _canonical_whisper_model_name(LOCAL_TRANSCRIBE_MODEL)
+    return _canonical_whisper_model_name(requested_model)
 
 
 def _init_local_model():

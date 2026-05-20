@@ -352,7 +352,7 @@ Integrates **faster-whisper** directly into the archivist process.
 
 | Setting | Environment Variable | Default |
 |---------|---------------------|---------|
-| Model | `TRANSCRIBE_MODEL` | `turbo` |
+| Model | `TRANSCRIBE_MODEL` | `medium.en` |
 | Compute type | `TRANSCRIBE_COMPUTE_TYPE` | `float16` (GPU) / `int8` (CPU) |
 | Beam size | `TRANSCRIBE_BEAM_SIZE` | `1` |
 | Max concurrent | `TRANSCRIBE_MAX_CONCURRENT` | `2` |
@@ -488,7 +488,7 @@ The pipeline follows a **graceful degradation** strategy:
 | `MEDIA_STORE_DIR` | `/data/media_store` | Asset index and artifact storage |
 | `MEDIA_PIPELINE_DIR` | `/data/media_pipeline` | Pipeline result cache |
 | `MEDIA_WATCH_INTERVAL_S` | `30` | Watcher scan interval (seconds) |
-| `TRANSCRIBE_MODEL` | `turbo` | Whisper model variant |
+| `TRANSCRIBE_MODEL` | `medium.en` | Whisper model variant |
 | `TRANSCRIBE_COMPUTE_TYPE` | `float16` | Inference precision |
 | `TRANSCRIBE_BEAM_SIZE` | `1` | Beam search width |
 | `TRANSCRIBE_MAX_CONCURRENT` | `2` | Max parallel transcriptions |
