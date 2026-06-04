@@ -133,3 +133,20 @@ ui/dist/
 ui/playwright-report/
 ui/test-results/
 ui/.playwright/
+
+# Claude Code local config
+.claude/
+
+# Development artifacts / screenshots
+*.png
+.artifacts/
+.playwright-mcp/
+.openclaw/
+chat.db
+*.pt
+
+# Debug logs
+media-console-errors.txt
+media-detail-final-console.txt
+media-detail-final-requests-*.txt
+media-requests-*.txt

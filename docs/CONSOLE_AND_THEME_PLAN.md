@@ -54,8 +54,8 @@ Add proper CSS custom properties to `:root` for theming consistency:
 Create `ui/src/pages/ConsolePage.tsx` — a simplified version of Twin's `AgentConsole.tsx` adapted for Archivist (pure CSS, no MUI).
 
 **Features (Chat tab only — Fleet/System/Tests not applicable to Archivist):**
-- SSE streaming chat with OpenClaw
-- Session list (local + OpenClaw sessions)
+- SSE streaming chat with the configured agent executor
+- Session list (local + shared agent sessions)
 - Quick action chips
 - Message bubbles (user, assistant, system, tool)
 - Markdown rendering for assistant messages
@@ -64,7 +64,7 @@ Create `ui/src/pages/ConsolePage.tsx` — a simplified version of Twin's `AgentC
 
 **Key differences from Twin:**
 - No MUI — use CSS classes matching archivist's style
-- Reuse existing `/api/chat` endpoint (already has OpenClaw SSE streaming)
+- Reuse existing `/api/chat` endpoint with agent executor SSE streaming
 - Reuse existing `/api/chat/sessions` endpoint
 - Add a simple markdown renderer (or use `react-markdown` if we add it)
 

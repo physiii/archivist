@@ -349,7 +349,7 @@ def migrate_collection(name: str, *, dry_run: bool, batch_size: int, progress: d
                     field_name=field.name,
                     index_params={
                         "index_type": "SPARSE_INVERTED_INDEX",
-                        "metric_type": "BM25",
+                        "metric_type": "IP",
                         "params": {},
                     },
                 )

@@ -2,7 +2,7 @@ export const consoleBranding = {
   appName: "Archivist Console",
   shellLabel: "Operator Control Surface",
   assistantName: "Archivist",
-  mainAgentId: "archivist-main",
+  mainAgentId: "operator-chat",
   versionLabel: "Archivist Control Plane",
   tabLabels: {
     chat: "Chat",

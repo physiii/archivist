@@ -6,6 +6,7 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import time
+from pathlib import Path
 
 import requests
 
@@ -13,7 +14,13 @@ import requests
 BASE_URL = os.environ.get("VECTORSTORE_BASE_URL", "http://127.0.0.1:5050").rstrip("/")
 
 
-def _deterministic_embedding(text: str, dim: int = 4096) -> list[float]:
+def _fake_embedding_host() -> str:
+    return os.environ.get("VECTORSTORE_FAKE_EMBEDDING_HOST") or (
+        "127.0.0.1" if Path("/.dockerenv").exists() else "host.docker.internal"
+    )
+
+
+def _deterministic_embedding(text: str, dim: int = 2560) -> list[float]:
     h = hashlib.sha256(text.encode("utf-8")).digest()
     seed = int.from_bytes(h[:8], "big", signed=False)
     rng = random.Random(seed)
@@ -88,12 +95,13 @@ def _post(path: str, payload: dict, timeout: float = 90):
 def test_movietime_upsert_and_filtered_search():
     embed = FakeEmbeddingServer()
     port = embed.start()
+    embedding_host = _fake_embedding_host()
     collection = f"movietime_test_{uuid.uuid4().hex[:10]}"
     try:
         upsert_payload = {
             "collection": collection,
             "delete_first": True,
-            "embedding_host": "host.docker.internal",
+            "embedding_host": embedding_host,
             "embedding_port": port,
             "records": [
                 {
@@ -143,7 +151,7 @@ def test_movietime_upsert_and_filtered_search():
                     "query": "robot wilderness family animation",
                     "limit": 10,
                     "mode": "dense",
-                    "embedding_host": "host.docker.internal",
+                    "embedding_host": embedding_host,
                     "embedding_port": port,
                     "filters": {"kind": "movie", "tagsAll": ["genre:animation"]},
                     "tagBoosts": {"genre:animation": 0.5},

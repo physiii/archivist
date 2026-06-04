@@ -36,6 +36,19 @@ MAX_KEYFRAMES_PER_ASSET = max(1, int(os.getenv("MEDIA_MAX_KEYFRAMES_PER_ASSET", 
 LARGE_VIDEO_KEYFRAME_INTERVAL_S = max(1.0, float(os.getenv("MEDIA_LARGE_VIDEO_KEYFRAME_INTERVAL_S", "300")))
 LARGE_VIDEO_MAX_KEYFRAMES = max(1, int(os.getenv("MEDIA_LARGE_VIDEO_MAX_KEYFRAMES", "16")))
 
+# Batch video decode (scene detection, keyframes) runs at low CPU/IO priority so
+# it yields to real-time RTSP transcription. Computed once at import.
+import shutil as _shutil
+def _lowpri_prefix() -> list[str]:
+    pre: list[str] = []
+    if os.getenv("MEDIA_BATCH_LOWPRI", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        if _shutil.which("nice"):
+            pre += ["nice", "-n", "19"]
+        if _shutil.which("ionice"):
+            pre += ["ionice", "-c", "3"]
+    return pre
+LOWPRI_PREFIX = _lowpri_prefix()
+
 # ── Video Filtering ─────────────────────────────────────────────────────
 
 
@@ -72,7 +85,7 @@ def detect_scene_changes(asset: MediaAsset, threshold: float = 0.3) -> list[Scen
         # -f null - discards the output; showinfo prints pts_time for each selected frame.
         result = subprocess.run(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "info", "-i", asset.path,
+                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "info", "-i", asset.path,
                 "-an", "-sn", "-dn",
                 "-vf", ",".join(vf_filters),
                 "-vsync", "vfr",
@@ -153,7 +166,7 @@ def extract_keyframes(asset: MediaAsset, output_dir: str, max_frames: int = 100,
         for idx, ts in enumerate(timestamps, start=1):
             frame_path = os.path.join(output_dir, f"keyframe_{idx:04d}.jpg")
             cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", f"{ts:.3f}",
                 "-i", asset.path,
                 "-an", "-sn", "-dn",
@@ -190,7 +203,7 @@ def extract_keyframes(asset: MediaAsset, output_dir: str, max_frames: int = 100,
     try:
         result = subprocess.run(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", asset.path,
+                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", asset.path,
                 "-an", "-sn", "-dn",
                 "-vf", ",".join(vf_filters),
                 "-frames:v", str(max_frames),
@@ -331,7 +344,7 @@ def detect_speech_segments(asset: MediaAsset, transcript_segments: Optional[list
     try:
         result = subprocess.run(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "info", "-i", asset.path,
+                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "info", "-i", asset.path,
                 "-vn", "-sn", "-dn",
                 "-map", "0:a:0?",
                 "-af", "silencedetect=noise=-30dB:d=0.5",

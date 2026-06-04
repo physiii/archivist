@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Box, Button, Card, CardContent, Collapse, Grid, LinearProgress,
   MenuItem, Select, Stack, Typography,
@@ -163,7 +163,9 @@ export default function TestsPanel() {
         setActiveProfileId(res.profile_id)
         setNarrative(null)
       }
-    } catch {}
+    } catch {
+      // Keep the last visible report if an archived report fails to load.
+    }
   }, [])
 
   const runTests = async () => {
@@ -180,7 +182,7 @@ export default function TestsPanel() {
     } catch (e) { setActionError(String(e)) }
   }
 
-  const generateSummary = async () => {
+  const generateSummary = useCallback(async () => {
     setNarrativeLoading(true)
     setNarrative(null)
     try {
@@ -188,21 +190,33 @@ export default function TestsPanel() {
       if (res.ok) setNarrative(res.summary)
     } catch (e) { setNarrative(`Error: ${e}`) }
     setNarrativeLoading(false)
-  }
+  }, [])
 
   const handleHistorySelect = (file: string) => {
     setSelectedFile(file)
     if (file) void loadFileReport(file)
   }
 
-  if (latest && !activeReport) loadLatest()
+  useEffect(() => {
+    if (!latest || activeReport) return
+    let cancelled = false
+    queueMicrotask(() => {
+      if (!cancelled) loadLatest()
+    })
+    return () => { cancelled = true }
+  }, [activeReport, latest, loadLatest])
 
   const prevReportRef = useRef<string | null>(null)
   const currentRunId = activeReport?.summary?.run_id ?? null
-  if (currentRunId && currentRunId !== prevReportRef.current && !narrative && !narrativeLoading) {
+  useEffect(() => {
+    if (!currentRunId || currentRunId === prevReportRef.current || narrative || narrativeLoading) return
     prevReportRef.current = currentRunId
-    void generateSummary()
-  }
+    let cancelled = false
+    queueMicrotask(() => {
+      if (!cancelled) void generateSummary()
+    })
+    return () => { cancelled = true }
+  }, [currentRunId, generateSummary, narrative, narrativeLoading])
 
   const rpt = activeReport
   const cats = rpt ? (Object.entries(rpt.category_breakdown ?? {}) as [string, CategoryInfo][]) : []

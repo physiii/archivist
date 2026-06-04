@@ -509,7 +509,7 @@ export default function AgentFleetPanel({ embedded = false }: AgentFleetProps) {
   const [chatError, setChatError] = useState<string | null>(null)
 
   const lanes = useMemo(() => normalizeFleetLanes(fleet), [fleet])
-  const tickets = automations?.tickets ?? []
+  const tickets = useMemo(() => automations?.tickets ?? [], [automations])
   const experiments = automations?.experiments
   const repairRuns = automations?.repair_runs ?? []
 

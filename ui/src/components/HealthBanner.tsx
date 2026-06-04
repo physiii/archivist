@@ -9,6 +9,24 @@ interface HealthComponent {
   current?: number;
   latest?: string;
   last_imported_at?: string;
+  model?: string;
+  endpoint?: string;
+  vector_dim?: number;
+  expected_dim?: number;
+  latency_ms?: number;
+  http_status?: number;
+  device?: string;
+  device_index?: number | null;
+  local_model?: string;
+  compute_type?: string;
+  gpu_available?: boolean;
+  gpu_device_count?: number;
+  gpu_device_names?: string[];
+  nvidia_visible_devices?: string;
+  available?: boolean;
+  severity?: string;
+  sources?: Record<string, { status: string; last_event_age_s?: number | null; error?: string | null }>;
+  channels?: Record<string, boolean>;
 }
 
 interface HealthResponse {
@@ -40,12 +58,38 @@ function formatWarning(name: string, component: HealthComponent): string | null 
     case "milvus":
       return `Milvus: ${component.error ?? "unreachable"}`;
 
+    case "embeddings":
+      if (component.status === "ok") return null;
+      return `EMBEDDINGS DOWN: ${component.error ?? "local-default smoke test failed"} Dense search, hybrid search, indexing, media recall, and agent retrieval are degraded.`;
+
+    case "transcription":
+      if (component.status === "ok") return null;
+      if (component.status === "cpu_fallback") {
+        const model = component.local_model || component.model || "whisper";
+        const visible = component.nvidia_visible_devices ?? "?";
+        return `TRANSCRIPTION ON CPU: ${model} fell back to CPU (NVIDIA_VISIBLE_DEVICES=${visible}, cuda_devices=${component.gpu_device_count ?? 0}). Realtime transcription will be orders of magnitude slower. Fix GPU wiring immediately.`;
+      }
+      return `TRANSCRIPTION DOWN: ${component.error ?? "whisper model failed to load"} No audio will be transcribed.`;
+
     case "backups":
       if (component.status === "stale") {
         return `Last backup is ${component.hours_since ?? "?"}h old`;
       }
       if (component.status === "no_data") return "No backups found";
       return `Backup error: ${component.error ?? "unknown"}`;
+
+    case "source_ingest": {
+      if (component.status === "ok") return null;
+      const bad: string[] = [];
+      for (const [id, info] of Object.entries(component.sources ?? {})) {
+        if (info.status === "down" || info.status === "stale" || info.status === "unknown") {
+          const age = info.last_event_age_s != null ? ` (${Math.round(info.last_event_age_s)}s silent)` : "";
+          bad.push(`${id}:${info.status}${age}`);
+        }
+      }
+      if (bad.length === 0) return null;
+      return `Camera/mic ingest degraded: ${bad.join(", ")}`;
+    }
 
     default:
       return `${name}: ${component.status}`;

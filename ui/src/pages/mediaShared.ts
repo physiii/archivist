@@ -27,6 +27,14 @@ export function relativeTime(timestampSeconds: number): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+export function formatAgeSec(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds)) return "—";
+  if (seconds < 60) return `${Math.round(seconds)}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
 export function clip(text: string, limit: number) {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }

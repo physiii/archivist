@@ -409,7 +409,7 @@ Terraform Teams IAM PRs open and waiting. Okta/ARTI access lost.
 | Content rating conversion (R → PG) | Andy + Sharif + Victor | Scope after Prism spike |
 | Nova Sonic workflow "attractor" | Andy | Orchestrator sets path attractiveness params |
 | Mermaid charts with perf data | Andy | Enrich state machine viz with timing |
-| OpenClaw self-repair for call center | Andy + Garrett | Evaluate for dev-line integration |
+| Agent self-repair for call center | Andy + Garrett | Evaluate for dev-line integration |
 | Vulnerability/penetration testing | Andy | Add adversarial scenarios to E2E |
 | Classical fast paths | Andy | Encoding models for deterministic routes |
 | Agent-to-agent architecture | Andy | E2E pattern demonstrates; formalize |

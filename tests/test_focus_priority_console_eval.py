@@ -27,16 +27,18 @@ def _load_module(name: str, relative_path: str):
     return module
 
 
-def _load_main_with_stubs(module_name: str):
+def _load_main_with_stubs(module_name: str, monkeypatch):
+    monkeypatch.setenv("ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS", "0")
     load_stub = types.ModuleType("load")
     load_stub.load_to_vectorstore = lambda *a, **k: None
     load_stub.load_text_to_vectorstore = lambda *a, **k: {"ok": True}
     load_stub.clear_vectorstore_collection = lambda *a, **k: {"ok": True}
-    sys.modules["load"] = load_stub
+    monkeypatch.setitem(sys.modules, "load", load_stub)
 
     search_stub = types.ModuleType("search")
+    search_stub.CollectionLoadError = RuntimeError
     search_stub.search_vectorstore = lambda *a, **k: []
-    sys.modules["search"] = search_stub
+    monkeypatch.setitem(sys.modules, "search", search_stub)
 
     backups_stub = types.ModuleType("backups_service")
     backups_stub.BACKUP_ROOT = "/tmp"
@@ -44,6 +46,7 @@ def _load_main_with_stubs(module_name: str):
     backups_stub.delete_backup_target = lambda *a, **k: None
     backups_stub.get_backup_overview = lambda *a, **k: {"status": {"running": False}}
     backups_stub.get_run_logs = lambda *a, **k: []
+    backups_stub.list_backup_files = lambda *a, **k: []
     backups_stub.list_backup_targets = lambda *a, **k: []
     backups_stub.start_backup = lambda *a, **k: None
     backups_stub.start_scheduler_best_effort = lambda *a, **k: None
@@ -51,7 +54,7 @@ def _load_main_with_stubs(module_name: str):
     backups_stub.stop_backup = lambda *a, **k: None
     backups_stub.update_backup_target = lambda *a, **k: None
     backups_stub.update_schedule = lambda *a, **k: None
-    sys.modules["backups_service"] = backups_stub
+    monkeypatch.setitem(sys.modules, "backups_service", backups_stub)
 
     indexing_stub = types.ModuleType("indexing_service")
     indexing_stub.GOOGLE_ARCHIVE_CONTENT_VERSION = "google_archive_v1"
@@ -72,12 +75,12 @@ def _load_main_with_stubs(module_name: str):
     indexing_stub.start_target_indexing = lambda *a, **k: None
     indexing_stub.stop_indexing = lambda *a, **k: None
     indexing_stub.update_indexing_target = lambda *a, **k: None
-    sys.modules["indexing_service"] = indexing_stub
+    monkeypatch.setitem(sys.modules, "indexing_service", indexing_stub)
 
     movietime_stub = types.ModuleType("movietime_items")
     movietime_stub.search_movietime_items = lambda *a, **k: []
     movietime_stub.upsert_movietime_items = lambda *a, **k: {"ok": True}
-    sys.modules["movietime_items"] = movietime_stub
+    monkeypatch.setitem(sys.modules, "movietime_items", movietime_stub)
 
     chat_store_stub = types.ModuleType("chat_store")
     chat_store_stub.add_message = lambda *a, **k: None
@@ -87,33 +90,37 @@ def _load_main_with_stubs(module_name: str):
     chat_store_stub.init_db = lambda *a, **k: None
     chat_store_stub.list_sessions = lambda *a, **k: []
     chat_store_stub.update_session_title = lambda *a, **k: None
-    sys.modules["chat_store"] = chat_store_stub
+    monkeypatch.setitem(sys.modules, "chat_store", chat_store_stub)
 
     transcription_stub = types.ModuleType("transcription_service")
     transcription_stub.init_transcription_model = lambda *a, **k: None
     transcription_stub.transcribe_audio = lambda *a, **k: {"segments": []}
-    sys.modules["transcription_service"] = transcription_stub
+    monkeypatch.setitem(sys.modules, "transcription_service", transcription_stub)
 
     agent_stub = types.ModuleType("agent_integration")
     agent_stub.build_agent_system_message = lambda *a, **k: ""
-    agent_stub.console_agent_id = lambda: "archivist-main"
-    agent_stub.decode_session_ref = lambda *a, **k: ("archivist-main", "main:web:test@archivist-main")
-    agent_stub.default_web_session_key = lambda *a, **k: "main:web:test@archivist-main"
-    agent_stub.encode_session_ref = lambda *a, **k: "agent:archivist-main:main:web:test@archivist-main"
-    agent_stub.gateway_session_key = lambda *a, **k: "agent:archivist-main:main:web:test@archivist-main"
+    agent_stub.console_agent_id = lambda: "operator-chat"
+    agent_stub.decode_session_ref = lambda *a, **k: ("operator-chat", "main:web:test@operator-chat")
+    agent_stub.default_web_session_key = lambda *a, **k: "main:web:test@operator-chat"
+    agent_stub.encode_session_ref = lambda *a, **k: "agent:operator-chat:main:web:test@operator-chat"
+    agent_stub.agent_session_key = lambda *a, **k: "agent:operator-chat:main:web:test@operator-chat"
+    agent_stub.agents_repo_root = lambda: REPO_ROOT
     agent_stub.host_workspace = lambda: str(REPO_ROOT)
     agent_stub.inspect_agent_runtime = lambda *a, **k: {"available": False, "registered_agents": []}
-    agent_stub.load_openclaw_config = lambda *a, **k: ({}, None)
-    agent_stub.load_openclaw_messages_from_transcript = lambda *a, **k: []
-    agent_stub.load_openclaw_sessions_for_agents = lambda *a, **k: []
+    agent_stub.load_agent_messages_from_transcript = lambda *a, **k: []
+    agent_stub.load_agent_sessions_for_agents = lambda *a, **k: []
+    agent_stub.load_mcp_resources_for_status = lambda *a, **k: []
+    agent_stub.load_mcp_tools_for_status = lambda *a, **k: []
+    agent_stub.load_shared_skills = lambda *a, **k: []
     agent_stub.load_team_agents = lambda *a, **k: []
     agent_stub.registered_agent_ids = lambda *a, **k: []
-    agent_stub.resolve_gateway_token = lambda: ""
-    agent_stub.resolve_gateway_url = lambda: "http://localhost"
-    agent_stub.resolve_openclaw_session_file = lambda *a, **k: None
+    agent_stub.resolve_agent_chat_model = lambda *a, **k: "agents/operator-chat"
+    agent_stub.resolve_agent_executor_token = lambda: ""
+    agent_stub.resolve_agent_executor_url = lambda: "http://localhost"
+    agent_stub.resolve_agent_session_file = lambda *a, **k: None
     agent_stub.session_kind = lambda *a, **k: "chat"
     agent_stub.visible_agent_ids = lambda *a, **k: []
-    sys.modules["agent_integration"] = agent_stub
+    monkeypatch.setitem(sys.modules, "agent_integration", agent_stub)
 
     return _load_module(module_name, "main.py")
 
@@ -177,7 +184,7 @@ def focus_main(monkeypatch, tmp_path):
     monkeypatch.setenv("ARCHIVIST_TEST_REPORTS_DIR", str(tmp_path / "test-reports"))
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
 
-    main = _load_main_with_stubs(f"archivist_focus_eval_{uuid4().hex}")
+    main = _load_main_with_stubs(f"archivist_focus_eval_{uuid4().hex}", monkeypatch)
     monkeypatch.setattr(threading.Thread, "start", _REAL_THREAD_START)
     snapshot_lane = _base_lane("personal")
 
@@ -233,8 +240,8 @@ def _seed_manual_priorities(main, *, work=None, personal=None) -> None:
     )
 
 
-def test_focus_priority_eval_adds_personal_note_when_gateway_is_unavailable(focus_main, monkeypatch):
-    monkeypatch.setattr(focus_main, "_focus_call_gateway_json", lambda **kwargs: None)
+def test_focus_priority_eval_adds_personal_note_when_executor_is_unavailable(focus_main, monkeypatch):
+    monkeypatch.setattr(focus_main, "_focus_call_executor_json", lambda **kwargs: None)
     client = focus_main.app.test_client()
 
     response = client.post(
@@ -280,7 +287,7 @@ def test_focus_priority_eval_removes_resolved_personal_item(focus_main, monkeypa
     )
     monkeypatch.setattr(
         focus_main,
-        "_focus_call_gateway_json",
+        "_focus_call_executor_json",
         lambda **kwargs: {
             "items": [
                 {
@@ -336,7 +343,7 @@ def test_focus_priority_eval_modifies_and_reorders_personal_items(focus_main, mo
     )
     monkeypatch.setattr(
         focus_main,
-        "_focus_call_gateway_json",
+        "_focus_call_executor_json",
         lambda **kwargs: {
             "items": [
                 {
@@ -396,7 +403,7 @@ def test_focus_priority_eval_can_clear_personal_manual_focus_when_everything_is_
             ),
         ],
     )
-    monkeypatch.setattr(focus_main, "_focus_call_gateway_json", lambda **kwargs: {"items": []})
+    monkeypatch.setattr(focus_main, "_focus_call_executor_json", lambda **kwargs: {"items": []})
     client = focus_main.app.test_client()
 
     response = client.post(
@@ -433,7 +440,7 @@ def test_focus_priority_eval_can_add_new_item_via_model_revision(focus_main, mon
     )
     monkeypatch.setattr(
         focus_main,
-        "_focus_call_gateway_json",
+        "_focus_call_executor_json",
         lambda **kwargs: {
             "items": [
                 {
@@ -492,7 +499,7 @@ def test_focus_priority_eval_falls_back_to_append_when_model_output_is_malformed
     )
     monkeypatch.setattr(
         focus_main,
-        "_focus_call_gateway_json",
+        "_focus_call_executor_json",
         lambda **kwargs: {
             "items": [
                 {},
@@ -517,14 +524,14 @@ def test_focus_priority_eval_falls_back_to_append_when_model_output_is_malformed
     assert payload["entries"][1]["id"] == "bank"
 
 
-def test_focus_priority_performance_slow_gateway_falls_back_without_locking_the_route(focus_main, monkeypatch):
-    monkeypatch.setattr(focus_main, "_FOCUS_MANUAL_PRIORITY_GATEWAY_TIMEOUT_S", 0.12)
+def test_focus_priority_performance_slow_executor_falls_back_without_locking_the_route(focus_main, monkeypatch):
+    monkeypatch.setattr(focus_main, "_FOCUS_MANUAL_PRIORITY_EXECUTOR_TIMEOUT_S", 0.12)
 
-    def slow_gateway(**kwargs):
+    def slow_executor(**kwargs):
         time.sleep(1.0)
         return {"items": []}
 
-    monkeypatch.setattr(focus_main, "_focus_call_gateway_json", slow_gateway)
+    monkeypatch.setattr(focus_main, "_focus_call_executor_json", slow_executor)
     client = focus_main.app.test_client()
 
     started = time.perf_counter()
@@ -581,7 +588,7 @@ def test_focus_priority_eval_query_overview_surfaces_personal_manual_focus_first
 
 
 def test_focus_priority_eval_business_lane_can_add_and_query_manual_focus(focus_main, monkeypatch):
-    monkeypatch.setattr(focus_main, "_focus_call_gateway_json", lambda **kwargs: None)
+    monkeypatch.setattr(focus_main, "_focus_call_executor_json", lambda **kwargs: None)
     client = focus_main.app.test_client()
 
     post_response = client.post(
@@ -705,21 +712,21 @@ def test_focus_priority_agent_fleet_surfaces_verifier_and_health_findings(focus_
         "load_team_agents",
         lambda: [
             {
-                "agent_id": "archivist-verifier",
+                "agent_id": "verification-worker",
                 "name": "Archivist Verifier",
                 "summary": "Validation gate for Archivist builds, tests, and runtime checks.",
             },
             {
-                "agent_id": "archivist-health",
+                "agent_id": "runtime-health-monitor",
                 "name": "Archivist Health",
-                "summary": "Runtime health monitor for gateway, backups, indexing, and media services.",
+                "summary": "Runtime health monitor for executor, backups, indexing, and media services.",
             },
         ],
     )
     monkeypatch.setattr(
         focus_main,
         "_agent_runtime_snapshot",
-        lambda: {"available": True, "registered_agents": ["archivist-verifier", "archivist-health"]},
+        lambda: {"available": True, "registered_agents": ["verification-worker", "runtime-health-monitor"]},
     )
     report = focus_main._build_test_report_from_results(
         profile_id="focus-priorities",
@@ -727,7 +734,7 @@ def test_focus_priority_agent_fleet_surfaces_verifier_and_health_findings(focus_
         timestamp_iso="2026-04-23T19:43:00+00:00",
         results=[
             {
-                "name": "tests/test_focus_priority_console_eval.py::test_focus_priority_eval_adds_personal_note_when_gateway_is_unavailable",
+                "name": "tests/test_focus_priority_console_eval.py::test_focus_priority_eval_adds_personal_note_when_executor_is_unavailable",
                 "status": "failed",
                 "duration_s": 0.21,
                 "timestamp": "2026-04-23T19:43:00+00:00",
@@ -741,7 +748,7 @@ def test_focus_priority_agent_fleet_surfaces_verifier_and_health_findings(focus_
         ],
         failure_analysis={
             "manual priority regression": [
-                "tests/test_focus_priority_console_eval.py::test_focus_priority_eval_adds_personal_note_when_gateway_is_unavailable",
+                "tests/test_focus_priority_console_eval.py::test_focus_priority_eval_adds_personal_note_when_executor_is_unavailable",
                 "tests/test_focus_priority_console_eval.py::test_focus_priority_performance_tests_run_route_returns_before_worker_finishes",
             ]
         },
@@ -753,8 +760,8 @@ def test_focus_priority_agent_fleet_surfaces_verifier_and_health_findings(focus_
     assert response.status_code == 200
     payload = response.get_json()
 
-    verifier = next(agent for agent in payload["agents"] if agent["id"] == "archivist-verifier")
-    health = next(agent for agent in payload["agents"] if agent["id"] == "archivist-health")
+    verifier = next(agent for agent in payload["agents"] if agent["id"] == "verification-worker")
+    health = next(agent for agent in payload["agents"] if agent["id"] == "runtime-health-monitor")
     assert any(finding["ticket_id"] == "focus-priorities-failing" for finding in verifier["findings"])
     assert any(finding["ticket_id"] == "focus-priorities-performance" for finding in health["findings"])
 
@@ -790,7 +797,7 @@ def test_focus_priority_agent_fleet_respects_manifest_visibility_sort_and_lanes(
                 "ui": {"show": True, "sort_key": 20, "badge": "specialist"},
             },
             {
-                "agent_id": "archivist-main",
+                "agent_id": "operator-chat",
                 "name": "Archivist Main",
                 "summary": "Operator",
                 "role": "operator",
@@ -804,7 +811,7 @@ def test_focus_priority_agent_fleet_respects_manifest_visibility_sort_and_lanes(
         "_agent_runtime_snapshot",
         lambda: {
             "available": True,
-            "registered_agents": ["archivist-main", "archivist-repair", "priority-specialist"],
+            "registered_agents": ["operator-chat", "archivist-repair", "priority-specialist"],
         },
     )
     monkeypatch.setattr(
@@ -823,7 +830,7 @@ def test_focus_priority_agent_fleet_respects_manifest_visibility_sort_and_lanes(
     system_lane = next(lane for lane in payload["lanes"] if lane["id"] == "system")
     specialist_lane = next(lane for lane in payload["lanes"] if lane["id"] == "specialist")
 
-    assert [agent["id"] for agent in system_lane["agents"]] == ["archivist-main", "archivist-repair"]
+    assert [agent["id"] for agent in system_lane["agents"]] == ["operator-chat", "archivist-repair"]
     assert [agent["id"] for agent in specialist_lane["agents"]] == ["priority-specialist"]
     assert all(agent["id"] != "hidden-agent" for agent in payload["agents"])
     assert system_lane["agents"][0]["group_label"] == "operator"
@@ -832,21 +839,21 @@ def test_focus_priority_agent_fleet_respects_manifest_visibility_sort_and_lanes(
 
 
 def test_agent_chat_sessions_capture_console_surface_and_scope(focus_main, monkeypatch):
-    class FakeGatewayResponse:
+    class FakeExecutorResponse:
         status_code = 200
 
         def iter_lines(self, decode_unicode=True):
             yield 'data: {"choices":[{"delta":{"content":"Ready to help."}}]}'
             yield "data: [DONE]"
 
-    monkeypatch.setattr(focus_main, "resolve_gateway_token", lambda: "test-token")
-    monkeypatch.setattr(focus_main, "resolve_gateway_url", lambda: "http://gateway.test")
+    monkeypatch.setattr(focus_main, "resolve_agent_executor_token", lambda: "test-token")
+    monkeypatch.setattr(focus_main, "resolve_agent_executor_url", lambda: "http://executor.test")
     monkeypatch.setattr(
         focus_main,
         "build_agent_system_message",
         lambda agent_id, screen_context: f"system::{agent_id}::{screen_context}",
     )
-    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FakeGatewayResponse())
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FakeExecutorResponse())
     client = focus_main.app.test_client()
 
     response = client.post(
@@ -868,14 +875,14 @@ def test_agent_chat_sessions_capture_console_surface_and_scope(focus_main, monke
     sessions = client.get("/api/agent/sessions").get_json()
     session = next(row for row in sessions if row["surface"] == "console")
     assert session["historyScope"] == "main-chat"
-    assert session["agentId"] == "archivist-main"
+    assert session["agentId"] == "operator-chat"
     assert session["messageCount"] == 2
 
     detail = client.get(f"/api/agent/sessions/{quote(session['id'], safe='')}")
     assert detail.status_code == 200
     payload = detail.get_json()
-    assert payload["agentId"] == "archivist-main"
-    assert payload["sessionKey"] == "main:web:test@archivist-main"
+    assert payload["agentId"] == "operator-chat"
+    assert payload["sessionKey"] == "main:web:test@operator-chat"
     assert payload["surface"] == "console"
     assert payload["historyScope"] == "main-chat"
     assert [message["role"] for message in payload["messages"]] == ["user", "assistant"]
@@ -952,3 +959,17 @@ def test_focus_priority_console_runner_profile_persists_report_and_summary(focus
 
     summary = client.post("/api/tests/summarize", json={"profile": "focus-priorities"}).get_json()["summary"]
     assert "2/2 passed" in summary
+
+
+def test_focus_recording_lane_summary_reads_migrated_nas_layout(focus_main, tmp_path):
+    root = tmp_path / "recording"
+    (root / "2026" / "05" / "06" / "front_door").mkdir(parents=True)
+    (root / "2026" / "05" / "06" / "office").mkdir(parents=True)
+    (root / "2026-05-05" / "13" / "office").mkdir(parents=True)
+
+    summary = focus_main._focus_recording_lane_summary(root)
+    by_name = {item["name"]: item for item in summary}
+
+    assert by_name["office"]["count"] == 2
+    assert by_name["front_door"]["count"] == 1
+    assert by_name["office"]["latest_path"].endswith("2026/05/06/office")

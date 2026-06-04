@@ -607,8 +607,12 @@ export default function JournalPage() {
     let cancelled = false;
     const cached = readCachedJournal(monthParam);
     if (cached) {
-      setOverview(cached);
-      setError(null);
+      queueMicrotask(() => {
+        if (!cancelled) {
+          setOverview(cached);
+          setError(null);
+        }
+      });
     }
     async function load() {
       try {
@@ -646,8 +650,8 @@ export default function JournalPage() {
     };
   }, []);
 
-  const journalSources = overview?.sources?.length ? overview.sources : [];
-  const journalDays = overview?.days || [];
+  const journalSources = useMemo(() => overview?.sources?.length ? overview.sources : [], [overview]);
+  const journalDays = useMemo(() => overview?.days || [], [overview]);
   const sourceMap = useMemo(() => new Map(journalSources.map((s) => [s.key, s])), [journalSources]);
 
   const filteredDays = useMemo(() => {
@@ -676,19 +680,28 @@ export default function JournalPage() {
   }, [calendarMonth]);
 
   useEffect(() => {
+    let cancelled = false;
     const today = dateKey(new Date());
     const monthPrefix = monthParamForDate(calendarMonth);
-    setFocusedDate((current) => {
-      if (current && current.startsWith(monthPrefix)) return current;
-      if (today.startsWith(monthPrefix)) return today;
-      return filteredDays[filteredDays.length - 1]?.date ?? dateKey(endOfMonth(calendarMonth));
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setFocusedDate((current) => {
+        if (current && current.startsWith(monthPrefix)) return current;
+        if (today.startsWith(monthPrefix)) return today;
+        return filteredDays[filteredDays.length - 1]?.date ?? dateKey(endOfMonth(calendarMonth));
+      });
     });
+    return () => { cancelled = true; };
   }, [calendarMonth, filteredDays]);
 
   useEffect(() => {
     if (!openedDayId) return;
     if (journalDays.some((day) => day.id === openedDayId)) return;
-    setOpenedDayId("");
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setOpenedDayId("");
+    });
+    return () => { cancelled = true; };
   }, [journalDays, openedDayId]);
 
   /* Calendar cells */

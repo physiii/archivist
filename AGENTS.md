@@ -3,7 +3,8 @@
 ## Workspace
 
 - Primary workspace: `/home/andy/archivist`
-- Agent identity docs: `openclaw-team/agents/<agent-id>/`
+- Shared agent knowledge base: `/media/mass/agents`
+- Agent docs: `/media/mass/agents/agents/<agent-id>/` and `/media/mass/agents/agents/roles/<role-id>.md`
 - UI: `ui/src/`
 - API: `main.py`
 - Media pipeline: `media/`
@@ -12,11 +13,11 @@
 ## Startup
 
 1. Treat `/home/andy/archivist` as the authoritative workspace root.
-2. Read `IDENTITY.md`, `SOUL.md`, and the matching files under `openclaw-team/agents/<agent-id>/`.
+2. Read `IDENTITY.md`, `SOUL.md`, and the relevant shared agent docs under `/media/mass/agents/agents/`.
 3. Use repo-relative evidence when discussing behavior or proposing fixes.
 
 ## Working rules
 
-- Keep chat, fleet, system, and settings flows aligned with the actual OpenClaw runtime.
-- Prefer repo-root OpenClaw workspaces so agents can inspect and modify the real codebase.
-- Verify container and gateway behavior after changes; unit tests alone are not enough.
+- Keep chat, fleet, system, and settings flows aligned with `/media/mass/agents` as the source of truth.
+- Prefer repo-root workspaces so agents can inspect and modify the real codebase.
+- Verify container and runtime behavior after changes; unit tests alone are not enough.

@@ -21,7 +21,7 @@ interface ChatSession {
   message_count: number;
 }
 
-interface OpenClawSession {
+interface AgentSession {
   session_key: string;
   kind: string;
   title: string;
@@ -70,12 +70,12 @@ export default function ChatBox() {
   /* History panel */
   const [showHistory, setShowHistory] = useState(false);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [ocSessions, setOcSessions] = useState<OpenClawSession[]>([]);
-  const [viewingOc, setViewingOc] = useState<string | null>(null);
+  const [agentSessions, setAgentSessions] = useState<AgentSession[]>([]);
+  const [viewingAgentSession, setViewingAgentSession] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const sessionKey = `main:web:${sessionId}@archivist-main`;
+  const sessionKey = `main:web:${sessionId}@operator-chat`;
 
   /* ── Auto-scroll ──────────────────────────────────────────────── */
   useEffect(() => {
@@ -116,7 +116,7 @@ export default function ChatBox() {
       if (!res.ok) return;
       const data = await res.json();
       setSessions(data.sessions ?? []);
-      setOcSessions(data.oc_sessions ?? []);
+      setAgentSessions(data.agent_sessions ?? []);
     } catch { /* silent */ }
   }, [base]);
 
@@ -124,7 +124,7 @@ export default function ChatBox() {
     const sid = makeSid();
     setSessionId(sid);
     setMessages([]);
-    setViewingOc(null);
+    setViewingAgentSession(null);
     setShowHistory(false);
   }, []);
 
@@ -162,16 +162,16 @@ export default function ChatBox() {
       // Extract sid from session key format "main:web:<sid>@<agent-id>"
       const match = s.session_key.match(/^main:web:(.+)@[^@]+$/);
       if (match) setSessionId(match[1]);
-      setViewingOc(null);
+      setViewingAgentSession(null);
       loadSessionMessages(s.session_key);
       setShowHistory(false);
     },
     [loadSessionMessages],
   );
 
-  const selectOcSession = useCallback(
-    (s: OpenClawSession) => {
-      setViewingOc(s.session_key);
+  const selectAgentSession = useCallback(
+    (s: AgentSession) => {
+      setViewingAgentSession(s.session_key);
       loadSessionMessages(s.session_key);
       setShowHistory(false);
     },
@@ -281,7 +281,7 @@ export default function ChatBox() {
     );
   }
 
-  const isReadOnly = !!viewingOc;
+  const isReadOnly = !!viewingAgentSession;
 
   /* ── Render ──────────────────────────────────────────────────── */
   return (
@@ -346,14 +346,14 @@ export default function ChatBox() {
               <div className="chat-empty" style={{ marginTop: 32 }}>No saved sessions yet.</div>
             )}
 
-            {ocSessions.length > 0 && (
+            {agentSessions.length > 0 && (
               <>
-                <div className="chat-oc-section-header">OpenClaw Sessions</div>
-                {ocSessions.map((s) => (
+                <div className="chat-oc-section-header">Agent Sessions</div>
+                {agentSessions.map((s) => (
                   <div
                     key={s.session_key}
-                    className={`chat-session-item ${viewingOc === s.session_key ? "active" : ""}`}
-                    onClick={() => selectOcSession(s)}
+                    className={`chat-session-item ${viewingAgentSession === s.session_key ? "active" : ""}`}
+                    onClick={() => selectAgentSession(s)}
                   >
                     <div className="chat-session-info">
                       <span className="chat-session-title">{s.title || "Untitled"}</span>
@@ -390,7 +390,7 @@ export default function ChatBox() {
             <input
               type="text"
               className="chat-input"
-              placeholder={isReadOnly ? "Read-only \u2014 viewing OpenClaw session" : "Ask anything..."}
+              placeholder={isReadOnly ? "Read-only \u2014 viewing Agent session" : "Ask anything..."}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}

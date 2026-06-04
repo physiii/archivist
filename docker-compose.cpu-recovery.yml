@@ -1,0 +1,12 @@
+services:
+  archivist:
+    gpus: []
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ""
+      TRANSCRIBE_REQUIRE_CUDA: "false"
+      ENABLE_TTS_STREAMING: "true"
+      TWIN_TTS_BACKEND: external
+      TWIN_ALLOW_LEGACY_FALLBACK_TTS: "false"
+      TWIN_TTS_PREWARM: "true"
+      TWIN_TTS_HELPER_BOOT_TIMEOUT_S: "600"
+      TWIN_TTS_HELPER_RESPONSE_TIMEOUT_S: "420"

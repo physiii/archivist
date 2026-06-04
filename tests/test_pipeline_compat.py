@@ -51,7 +51,7 @@ class TestPipelineCompatStatus:
         assert status["stale"] == 1
         assert status["current"] == 0
 
-    def test_no_stamp_counted_as_broken(self, tmp_path, monkeypatch):
+    def test_legacy_output_without_stamp_counted_as_stale(self, tmp_path, monkeypatch):
         from media.pipeline import pipeline_compat_status
         monkeypatch.setattr("media.pipeline.PIPELINE_STORE_DIR", tmp_path)
 
@@ -59,7 +59,22 @@ class TestPipelineCompatStatus:
         (tmp_path / "abc123.json").write_text(json.dumps(result), encoding="utf-8")
 
         status = pipeline_compat_status()
-        assert status["broken"] == 1
+        assert status["stale"] == 1
+        assert status["broken"] == 0
+
+    def test_non_pipeline_json_is_ignored(self, tmp_path, monkeypatch):
+        from media.pipeline import pipeline_compat_status
+        monkeypatch.setattr("media.pipeline.PIPELINE_STORE_DIR", tmp_path)
+
+        (tmp_path / "embedding_migration.json").write_text(
+            json.dumps({"done": ["a"], "in_progress": []}),
+            encoding="utf-8",
+        )
+
+        status = pipeline_compat_status()
+        assert status["ignored"] == 1
+        assert status["broken"] == 0
+        assert status["total"] == 0
 
 
 class TestPipelineCompatMigration:
@@ -85,7 +100,7 @@ class TestPipelineCompatMigration:
         }
         (tmp_path / "abc123.json").write_text(json.dumps(result), encoding="utf-8")
 
-        summary = migrate_pipeline_compat_version()
+        summary = migrate_pipeline_compat_version(verify_sources=True)
         assert summary["migrated"] == 1
         assert summary["dry_run"] is False
 
@@ -110,7 +125,7 @@ class TestPipelineCompatMigration:
         }
         (tmp_path / "abc123.json").write_text(json.dumps(result), encoding="utf-8")
 
-        summary = migrate_pipeline_compat_version(dry_run=True)
+        summary = migrate_pipeline_compat_version(dry_run=True, verify_sources=True)
         assert summary["migrated"] == 1
         assert summary["dry_run"] is True
 
@@ -135,7 +150,7 @@ class TestPipelineCompatMigration:
         }
         (tmp_path / "abc123.json").write_text(json.dumps(result), encoding="utf-8")
 
-        summary = migrate_pipeline_compat_version()
+        summary = migrate_pipeline_compat_version(verify_sources=True)
         assert summary["skipped_changed"] == 1
         assert summary["migrated"] == 0
 
@@ -153,7 +168,7 @@ class TestPipelineCompatMigration:
         }
         (tmp_path / "abc123.json").write_text(json.dumps(result), encoding="utf-8")
 
-        summary = migrate_pipeline_compat_version()
+        summary = migrate_pipeline_compat_version(verify_sources=True)
         assert summary["skipped_changed"] == 1
 
     def test_migrate_skips_already_current(self, tmp_path, monkeypatch):
@@ -182,6 +197,46 @@ class TestPipelineCompatMigration:
 
         summary = migrate_pipeline_compat_version()
         assert summary["skipped_invalid"] == 1
+
+    def test_migrate_stamps_legacy_results_without_source_stat(self, tmp_path, monkeypatch):
+        from media.pipeline import migrate_pipeline_compat_version, MEDIA_PIPELINE_COMPAT_VERSION
+        monkeypatch.setattr("media.pipeline.PIPELINE_STORE_DIR", tmp_path)
+
+        result = {
+            "asset": {
+                "path": "/slow-or-offline/media.mkv",
+                "filename": "media.mkv",
+                "file_hash": "abc123",
+            },
+            "document": {"text": "content", "format": "chronological"},
+            "transcript": {"text": "hello"},
+        }
+        (tmp_path / "legacy.json").write_text(json.dumps(result), encoding="utf-8")
+
+        summary = migrate_pipeline_compat_version()
+        assert summary["migrated"] == 1
+        assert summary["verify_sources"] is False
+
+        updated = json.loads((tmp_path / "legacy.json").read_text(encoding="utf-8"))
+        stamp = updated["archivist_pipeline"]
+        assert stamp["pipeline_compat_version"] == MEDIA_PIPELINE_COMPAT_VERSION
+        assert stamp["source_path"] == "/slow-or-offline/media.mkv"
+        assert stamp["legacy_result"] is True
+        assert updated["document"]["archivist_pipeline"] == stamp
+
+    def test_migrate_ignores_non_pipeline_json(self, tmp_path, monkeypatch):
+        from media.pipeline import migrate_pipeline_compat_version
+        monkeypatch.setattr("media.pipeline.PIPELINE_STORE_DIR", tmp_path)
+
+        (tmp_path / "embedding_migration.json").write_text(
+            json.dumps({"done": ["a"], "in_progress": []}),
+            encoding="utf-8",
+        )
+
+        summary = migrate_pipeline_compat_version()
+        assert summary["ignored"] == 1
+        assert summary["skipped_invalid"] == 0
+        assert summary["errors"] == 0
 
 
 class TestPipelineResultIsCurrent:

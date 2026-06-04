@@ -4,16 +4,16 @@
 
 Make Archivist media processing reliable for long audio/video files by:
 
-- using the existing Whisper service that is already running in `transcribeserver-transcribe-1`
-- keeping a local `faster-whisper` fallback available inside Archivist
+- running the Whisper transcription path inside Archivist
+- keeping an optional remote fallback available only when explicitly configured
 - producing a single consolidated artifact JSON per media asset instead of dozens of per-artifact files
 - embedding portable results back into media files, especially MKV, so transcripts and artifact bundles travel with the source file
 - verifying the full path end to end against `/media/mass/recording/screens/office/obs/2025-01-08_15-58-11.mkv`
 
 ## Current Problems
 
-1. Archivist starts an in-process transcription model, but the container image does not install `faster-whisper`.
-2. A separate production transcription service already exists, but Archivist does not use it.
+1. Archivist must be the production transcription service so other apps can point at `/api/transcribe`.
+2. Older apps and docs referenced the standalone TranscribeServer on port `8123`; active callers should now target Archivist.
 3. The media pipeline reads the entire source media file into memory before transcription, which is wrong for large MKV recordings.
 4. Artifact persistence is fragmented across many JSON files, while the UI and inspection workflow need a single canonical bundle.
 5. The current artifact set is incomplete:
@@ -46,9 +46,9 @@ The API should expose the canonical pipeline JSON as the source of truth.
 
 ### 1. Transcription
 
-- Add remote-first transcription support in `transcription_service.py`.
-- Default Archivist to the existing service at `http://host.docker.internal:8123`.
-- Keep local `faster-whisper` support as fallback when remote is unavailable.
+- Default `transcription_service.py` to local-first faster-whisper inside Archivist.
+- Keep remote transcription support as an explicit fallback for emergencies.
+- Preserve TranscribeServer-compatible request and response shapes for existing clients.
 - Add a media-file transcription helper that extracts audio from the source file first instead of reading the whole video into memory.
 
 ### 2. Dependencies and Runtime
@@ -117,6 +117,5 @@ ffprobe -v error -show_streams -show_format /media/mass/recording/screens/office
 
 ## Notes
 
-- The running transcription service is already healthy and reachable on host port `8123`.
-- The repair should prefer that production path rather than duplicating GPU model residency inside Archivist.
-- Local `faster-whisper` remains useful as a fallback and for `/api/transcribe` compatibility if the external service is unavailable.
+- Archivist is the production transcription endpoint at `/api/transcribe`, with `POST /` retained for legacy TranscribeServer-style clients.
+- Apps that previously targeted port `8123` should target Archivist instead.

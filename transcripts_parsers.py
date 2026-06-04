@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -190,6 +191,44 @@ def parse_txt_file(path: Path) -> list[Cue]:
     return [Cue(start_ms=0, end_ms=approx_duration_ms, text=cleaned)]
 
 
+_SOURCE_LOG_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{1,6})\s+"
+    r"(?:\[[^\]]+\]\s+)*\[Source\]\s*(?P<text>.*)$"
+)
+
+
+def _parse_log_timestamp_ms(raw: str) -> int | None:
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def parse_log_file(path: Path) -> list[Cue]:
+    rows: list[tuple[int, str]] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = _SOURCE_LOG_RE.match(line.strip())
+            if not match:
+                continue
+            start_ms = _parse_log_timestamp_ms(match.group("ts"))
+            text = _clean_text(match.group("text"))
+            if start_ms is None or not text:
+                continue
+            rows.append((start_ms, text))
+    if not rows:
+        return []
+
+    rows.sort(key=lambda item: item[0])
+    cues: list[Cue] = []
+    for idx, (start_ms, text) in enumerate(rows):
+        next_start = rows[idx + 1][0] if idx + 1 < len(rows) else start_ms + 1500
+        end_ms = next_start if next_start > start_ms else start_ms + 1500
+        cues.append(Cue(start_ms=start_ms, end_ms=end_ms, text=text))
+    return cues
+
+
 def parse_transcript(path: str | Path) -> tuple[list[Cue], str | None]:
     file_path = Path(path)
     ext = file_path.suffix.lower()
@@ -208,6 +247,9 @@ def parse_transcript(path: str | Path) -> tuple[list[Cue], str | None]:
         if ext == ".txt":
             cues = parse_txt_file(file_path)
             return cues, None if cues else "No readable TXT transcript content found"
+        if ext == ".log":
+            cues = parse_log_file(file_path)
+            return cues, None if cues else "No [Source] transcript lines found in log"
         return [], f"Unsupported transcript extension: {ext}"
     except Exception as exc:
         return [], f"Failed to parse transcript: {exc}"

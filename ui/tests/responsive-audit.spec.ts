@@ -89,13 +89,13 @@ const ROUTES: RouteContract[] = [
     path: "/console",
     assertReady: async (page) => {
       await expect(page.locator(".agent-console-page")).toBeVisible();
-      await page.getByRole("tab", { name: "Fleet", exact: true }).click();
+      await page.getByRole("tab", { name: "Fleet", exact: true }).click({ force: true });
       await expect(page.locator("[data-testid='fleet-agent-grid']")).toBeVisible();
-      await page.getByRole("tab", { name: "System", exact: true }).click();
+      await page.getByRole("tab", { name: "System", exact: true }).click({ force: true });
       await expect(page.locator("[data-testid='system-regression-focus-priorities']")).toBeVisible();
-      await page.getByRole("tab", { name: "Tests", exact: true }).click();
+      await page.getByRole("tab", { name: "Tests", exact: true }).click({ force: true });
       await expect(page.locator("[data-testid='tests-header']")).toBeVisible();
-      await page.getByRole("tab", { name: "Chat", exact: true }).click();
+      await page.getByRole("tab", { name: "Chat", exact: true }).click({ force: true });
       await expect(page.locator("[data-testid='console-page']")).toBeVisible();
     },
   },

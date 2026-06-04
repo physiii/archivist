@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 
 import SearchAdvanced from "../components/SearchAdvanced";
 import { WorkspaceEmpty, WorkspacePage, WorkspacePanel } from "../components/Workspace";
@@ -39,9 +39,49 @@ function formatDistance(distance: number) {
   return Number.isFinite(distance) ? distance.toFixed(4) : "—";
 }
 
+function ResultDetails({ result }: { result: SearchResult }) {
+  const tags = parseStoredTags(result.tags);
+  return (
+    <div className="record-row-expanded">
+      <dl className="detail-list detail-list--inline">
+        <div>
+          <dt>Row id</dt>
+          <dd className="mono">#{String(result.id)}</dd>
+        </div>
+        <div>
+          <dt>Distance</dt>
+          <dd>{formatDistance(result.distance)}</dd>
+        </div>
+        <div>
+          <dt>Indexed</dt>
+          <dd>{result.creation_date || "Unknown"}</dd>
+        </div>
+        <div>
+          <dt>Path</dt>
+          <dd className="mono" title={getResultPath(result)}>
+            {getResultPath(result) || "Unavailable"}
+          </dd>
+        </div>
+      </dl>
+      {tags.length > 0 ? (
+        <div className="workspace-chip-row">
+          {tags.map((tag) => (
+            <span key={`${resultKey(result)}:${tag}`} className="workspace-chip">
+              {tag}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <pre className="detail-preview compact">{(result.text ?? "").trim() || "No row text available."}</pre>
+    </div>
+  );
+}
+
 export default function CollectionDetailPage() {
   const { name = "" } = useParams();
+  const location = useLocation();
   const decodedName = decodeURIComponent(name);
+  const initialQuery = new URLSearchParams(location.search).get("q") ?? "";
   const [detail, setDetail] = useState<CollectionDetail | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [previewPoints, setPreviewPoints] = useState<EmbeddingsPreviewPoint[]>([]);
@@ -52,12 +92,13 @@ export default function CollectionDetailPage() {
   const [previewQueryError, setPreviewQueryError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialQuery);
   const [previewLimit, setPreviewLimit] = useState(1200);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [working, setWorking] = useState(false);
   const metaRequestSeqRef = useRef(0);
   const previewRequestSeqRef = useRef(0);
+  const linkedSearchRef = useRef<string | null>(null);
   const [searchOptions, setSearchOptions] = useState<SearchAdvancedOptions>(DEFAULT_OPTIONS);
 
   async function refreshMeta() {
@@ -71,8 +112,7 @@ export default function CollectionDetailPage() {
       if (requestSeq !== metaRequestSeqRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to load collection.");
     } finally {
-      if (requestSeq !== metaRequestSeqRef.current) return;
-      setLoading(false);
+      if (requestSeq === metaRequestSeqRef.current) setLoading(false);
     }
   }
 
@@ -95,24 +135,24 @@ export default function CollectionDetailPage() {
       if (requestSeq !== previewRequestSeqRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to load embeddings preview.");
     } finally {
-      if (requestSeq !== previewRequestSeqRef.current) return;
-      setPreviewLoading(false);
+      if (requestSeq === previewRequestSeqRef.current) setPreviewLoading(false);
     }
   }
 
-  async function runSearch() {
-    if (!query.trim()) return;
+  async function runSearch(queryOverride?: string, options?: { autoExpandFirst?: boolean }) {
+    const searchText = (queryOverride ?? query).trim();
+    if (!searchText) return;
     setWorking(true);
     try {
       const payload = await searchCollection(name, {
-        query: query.trim(),
+        query: searchText,
         ...searchOptions,
         path: "",
       });
       const nextResults = payload.results ?? [];
       setSearchResults(nextResults);
-      setSelectedResultKey(nextResults[0] ? resultKey(nextResults[0]) : null);
-      await loadPreview(query.trim());
+      setSelectedResultKey(options?.autoExpandFirst && nextResults[0] ? resultKey(nextResults[0]) : null);
+      await loadPreview(searchText);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Collection search failed.");
@@ -124,7 +164,21 @@ export default function CollectionDetailPage() {
   useEffect(() => {
     void refreshMeta();
     void loadPreview();
+    // Initial collection load is keyed by route; query/limit changes refresh only from explicit user actions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name]);
+
+  useEffect(() => {
+    const linkedQuery = new URLSearchParams(location.search).get("q")?.trim() ?? "";
+    if (!linkedQuery) return;
+    const linkedSearchKey = `${name}:${linkedQuery}`;
+    if (linkedSearchRef.current === linkedSearchKey) return;
+    linkedSearchRef.current = linkedSearchKey;
+    setQuery(linkedQuery);
+    void runSearch(linkedQuery, { autoExpandFirst: true });
+    // Linked searches are keyed to URL changes; local option edits should not replay the deep link.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name, location.search]);
 
   const selectedResult = useMemo(
     () => searchResults.find((result) => resultKey(result) === selectedResultKey) ?? null,
@@ -151,7 +205,7 @@ export default function CollectionDetailPage() {
 
       <WorkspacePanel
         title="Search inside this collection"
-        description="Use the same search controls as the global view, then keep the chosen result pinned while you inspect the embedding space."
+        description="Use the same search controls as the global view. Click any result to open its metadata and full text inline."
       >
         <div className="search-composer">
           <textarea
@@ -177,86 +231,49 @@ export default function CollectionDetailPage() {
         <SearchAdvanced value={searchOptions} onChange={setSearchOptions} />
       </WorkspacePanel>
 
-      <div className="workspace-grid workspace-grid--two">
-        <WorkspacePanel
-          title="Search results"
-          description="The result list is dense by design so you can move through a large response set without losing context."
-        >
-          {searchResults.length === 0 ? (
-            <WorkspaceEmpty title="No results yet" description="Run a collection search to populate the result list." />
-          ) : (
-            <div className="record-list" role="list" aria-label="Collection search results">
-              {searchResults.map((result) => (
-                <button
-                  key={resultKey(result)}
-                  type="button"
-                  className={`record-row ${selectedResultKey === resultKey(result) ? "active" : ""}`}
-                  onClick={() => {
-                    setSelectedResultKey(resultKey(result));
-                    setSelectedPointId(result.id);
-                  }}
-                >
-                  <div className="record-row-head">
-                    <div className="record-row-title-group">
-                      <strong className="record-row-title mono">#{String(result.id)}</strong>
-                      <span className="workspace-chip">{formatDistance(result.distance)}</span>
+      <WorkspacePanel
+        title="Search results"
+        description="Results expand in place so the list stays dense and readable."
+      >
+        {searchResults.length === 0 ? (
+          <WorkspaceEmpty title="No results yet" description="Run a collection search to populate the result list." />
+        ) : (
+          <div className="record-list" role="list" aria-label="Collection search results">
+            {searchResults.map((result) => {
+              const key = resultKey(result);
+              const isSelected = selectedResultKey === key;
+              return (
+                <article key={key} className={`record-row ${isSelected ? "active" : ""}`}>
+                  <button
+                    type="button"
+                    className="record-row-click"
+                    onClick={() => {
+                      setSelectedResultKey(isSelected ? null : key);
+                      setSelectedPointId(isSelected ? null : result.id);
+                    }}
+                    aria-expanded={isSelected}
+                  >
+                    <div className="record-row-head">
+                      <div className="record-row-title-group">
+                        <strong className="record-row-title mono">#{String(result.id)}</strong>
+                        <span className="workspace-chip">{formatDistance(result.distance)}</span>
+                      </div>
+                      {result.creation_date ? <span className="record-row-meta">{result.creation_date}</span> : null}
                     </div>
-                    {result.creation_date ? <span className="record-row-meta">{result.creation_date}</span> : null}
-                  </div>
-                  {getResultPath(result) ? (
-                    <span className="record-row-subtitle mono" title={getResultPath(result)}>
-                      {getResultPath(result)}
-                    </span>
-                  ) : null}
-                  <span className="record-row-preview">{(result.text ?? "").trim() || "No text preview available."}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </WorkspacePanel>
-
-        <WorkspacePanel
-          title="Result inspector"
-          description="Selected rows stay expanded on the right with tags and source metadata."
-        >
-          {selectedResult ? (
-            <>
-              <dl className="detail-list">
-                <div>
-                  <dt>Row id</dt>
-                  <dd className="mono">#{String(selectedResult.id)}</dd>
-                </div>
-                <div>
-                  <dt>Distance</dt>
-                  <dd>{formatDistance(selectedResult.distance)}</dd>
-                </div>
-                <div>
-                  <dt>Indexed</dt>
-                  <dd>{selectedResult.creation_date || "Unknown"}</dd>
-                </div>
-                <div>
-                  <dt>Path</dt>
-                  <dd className="mono" title={getResultPath(selectedResult)}>
-                    {getResultPath(selectedResult) || "Unavailable"}
-                  </dd>
-                </div>
-              </dl>
-              {parseStoredTags(selectedResult.tags).length > 0 ? (
-                <div className="workspace-chip-row">
-                  {parseStoredTags(selectedResult.tags).map((tag) => (
-                    <span key={`${resultKey(selectedResult)}:${tag}`} className="workspace-chip">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-              <pre className="detail-preview">{(selectedResult.text ?? "").trim() || "No row text available."}</pre>
-            </>
-          ) : (
-            <WorkspaceEmpty title="No result selected" description="Click any search result to keep it pinned in the inspector." />
-          )}
-        </WorkspacePanel>
-      </div>
+                    {getResultPath(result) ? (
+                      <span className="record-row-subtitle mono" title={getResultPath(result)}>
+                        {getResultPath(result)}
+                      </span>
+                    ) : null}
+                    <span className="record-row-preview">{(result.text ?? "").trim() || "No text preview available."}</span>
+                  </button>
+                  {isSelected ? <ResultDetails result={result} /> : null}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </WorkspacePanel>
 
       <div className="workspace-grid workspace-grid--wide-aside">
         <WorkspacePanel

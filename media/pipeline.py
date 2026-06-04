@@ -63,11 +63,43 @@ from media.text_cleanup import (
 
 logger = logging.getLogger("archivist.media.pipeline")
 
+import shutil as _shutil
+import threading as _threading
+
+# Batch media (e.g. movie-library) processing is low priority: it must never
+# starve real-time RTSP transcription for CPU, IO, or whisper workers. Cap how
+# many media files process at once...
+MEDIA_MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MEDIA_MAX_CONCURRENT_JOBS", "2")))
+_MEDIA_JOB_SEM = _threading.Semaphore(MEDIA_MAX_CONCURRENT_JOBS)
+
+# ...and run the heavy ffmpeg decoders at low CPU/IO priority so the OS hands
+# CPU/disk to the live pipeline first. Prefix is computed once at import.
+def _lowpri_prefix() -> list[str]:
+    pre: list[str] = []
+    if os.getenv("MEDIA_BATCH_LOWPRI", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        if _shutil.which("nice"):
+            pre += ["nice", "-n", "19"]
+        if _shutil.which("ionice"):
+            pre += ["ionice", "-c", "3"]
+    return pre
+
+LOWPRI_PREFIX = _lowpri_prefix()
+
 PIPELINE_STORE_DIR = Path(os.getenv("MEDIA_PIPELINE_DIR", "/data/media_pipeline"))
 MEDIA_PIPELINE_COMPAT_VERSION = os.getenv("MEDIA_PIPELINE_COMPAT_VERSION", "2026-04-11.1").strip() or "2026-04-11.1"
-OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789").rstrip("/")
-OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
-OPENCLAW_CHAT_MODEL = os.getenv("OPENCLAW_CHAT_MODEL", "").strip()
+AGENT_EXECUTOR_URL = (
+    os.getenv("ARCHIVIST_AGENT_EXECUTOR_URL")
+    or os.getenv("ARCHIVIST_AGENT_CHAT_URL")
+    or os.getenv("AGENT_EXECUTOR_URL")
+    or ""
+).strip().rstrip("/")
+AGENT_EXECUTOR_TOKEN = (
+    os.getenv("ARCHIVIST_AGENT_EXECUTOR_TOKEN")
+    or os.getenv("ARCHIVIST_AGENT_CHAT_TOKEN")
+    or os.getenv("AGENT_EXECUTOR_TOKEN")
+    or ""
+).strip()
+AGENT_CHAT_MODEL = (os.getenv("ARCHIVIST_AGENT_CHAT_MODEL") or os.getenv("AGENT_CHAT_MODEL") or "").strip()
 SUBJECT_MAX_WORDS = max(8, int(os.getenv("MEDIA_SUBJECT_MAX_WORDS", "24")))
 SUBJECT_MAX_CONTEXT_ARTIFACTS = max(6, int(os.getenv("MEDIA_SUBJECT_MAX_CONTEXT_ARTIFACTS", "12")))
 SUBJECT_MAX_PREVIEW_CHARS = max(80, int(os.getenv("MEDIA_SUBJECT_MAX_PREVIEW_CHARS", "220")))
@@ -107,18 +139,18 @@ def _repo_root_path() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _openclaw_media_agent_id() -> str:
-    for env_name in ("ARCHIVIST_OPENCLAW_MEDIA_AGENT_ID", "ARCHIVIST_OPENCLAW_CONSOLE_AGENT_ID"):
+def _media_agent_id() -> str:
+    for env_name in ("ARCHIVIST_MEDIA_AGENT_ID", "ARCHIVIST_AGENT_CONSOLE_AGENT_ID", "ARCHIVIST_CONSOLE_AGENT_ID"):
         value = os.getenv(env_name, "").strip()
         if value:
             return value
-    return "archivist-main"
+    return "operator-chat"
 
 
-def _openclaw_media_model() -> str:
-    if OPENCLAW_CHAT_MODEL and not OPENCLAW_CHAT_MODEL.endswith("/default"):
-        return OPENCLAW_CHAT_MODEL
-    return f"openclaw/{_openclaw_media_agent_id()}"
+def _media_agent_model() -> str:
+    if AGENT_CHAT_MODEL and not AGENT_CHAT_MODEL.endswith("/default"):
+        return AGENT_CHAT_MODEL
+    return f"agents/{_media_agent_id()}"
 
 
 def _candidate_repo_roots() -> list[Path]:
@@ -440,6 +472,58 @@ def _build_pipeline_stamp(
         "requested_output_format": _expected_output_format_label(output_format),
         "document_format": document_format,
         "generated_at": float(generated_at or time.time()),
+    }
+
+
+def _result_has_pipeline_output(data: dict) -> bool:
+    return bool(data.get("document") or data.get("transcript"))
+
+
+def _looks_like_pipeline_result(data: dict) -> bool:
+    return any(
+        key in data
+        for key in (
+            "archivist_pipeline",
+            "media_id",
+            "asset",
+            "document",
+            "transcript",
+            "layers",
+            "artifacts",
+            "job_id",
+            "error",
+        )
+    )
+
+
+def _legacy_pipeline_stamp_from_result(data: dict, result_file: Path) -> dict[str, object]:
+    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+    source_path = str(asset.get("path") or "").strip()
+    source_size = asset.get("file_size_bytes") or asset.get("size_bytes") or asset.get("bytes") or 0
+    try:
+        source_size_int = int(source_size or 0)
+    except (TypeError, ValueError):
+        source_size_int = 0
+    try:
+        generated_at = float(result_file.stat().st_mtime)
+    except OSError:
+        generated_at = time.time()
+    document = data.get("document") if isinstance(data.get("document"), dict) else {}
+    return {
+        "pipeline_version": MEDIA_PIPELINE_VERSION,
+        "pipeline_compat_version": MEDIA_PIPELINE_COMPAT_VERSION,
+        "repo_commit": REPO_COMMIT_HASH,
+        "repo_commit_suffix": REPO_VERSION_TAG or MEDIA_PIPELINE_VERSION,
+        "source_path": source_path,
+        "source_file_hash": str(asset.get("file_hash") or "").strip(),
+        "source_size_bytes": source_size_int,
+        "source_mtime_ns": None,
+        "source_recorded_at": str(asset.get("recorded_at") or "").strip() or infer_recorded_at_from_path(source_path) or None,
+        "source_recorded_day": str(asset.get("recorded_day") or "").strip() or infer_recorded_day_from_path(source_path) or None,
+        "requested_output_format": None,
+        "document_format": str(document.get("format") or "").strip() or None,
+        "generated_at": generated_at,
+        "legacy_result": True,
     }
 
 
@@ -770,34 +854,13 @@ def _subject_line_is_unusable(text: str) -> bool:
     return any(re.search(pattern, clean, re.IGNORECASE) for pattern in SUBJECT_INVALID_PATTERNS)
 
 
-def _resolve_openclaw_gateway_token() -> str:
-    if OPENCLAW_GATEWAY_TOKEN:
-        return OPENCLAW_GATEWAY_TOKEN
-    if os.getenv("PYTEST_CURRENT_TEST"):
-        return ""
-    explicit = (os.getenv("OPENCLAW_CONFIG_PATH") or "").strip()
-    state_dir = (os.getenv("OPENCLAW_STATE_DIR") or "").strip()
-    config_paths = [
-        Path(explicit).expanduser() if explicit else None,
-        (Path(state_dir).expanduser() / "openclaw.json") if state_dir else None,
-        _repo_root_path() / ".openclaw" / "openclaw.json",
-        Path("/host/.openclaw/openclaw.json"),
-        Path.home() / ".openclaw" / "openclaw.json",
-    ]
-    for path in config_paths:
-        try:
-            if path is None or not path.exists():
-                continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            token = str((((payload.get("gateway") or {}).get("auth") or {}).get("token")) or "").strip()
-            if token:
-                return token
-        except Exception:
-            continue
+def _resolve_agent_executor_token() -> str:
+    if AGENT_EXECUTOR_TOKEN:
+        return AGENT_EXECUTOR_TOKEN
     return ""
 
 
-def _call_openclaw_gateway(
+def _call_agent_executor(
     *,
     asset: MediaAsset,
     system_prompt: str,
@@ -805,20 +868,20 @@ def _call_openclaw_gateway(
     purpose: str,
     timeout: int = 120,
 ) -> tuple[str, Optional[str]]:
-    token = _resolve_openclaw_gateway_token()
-    if not token:
-        return "", "gateway_unconfigured"
+    token = _resolve_agent_executor_token()
+    if not token or not AGENT_EXECUTOR_URL:
+        return "", "executor_unconfigured"
 
     try:
         import requests
 
-        agent_id = _openclaw_media_agent_id()
+        agent_id = _media_agent_id()
         session_key = f"agent:{agent_id}:{purpose}:{asset.media_id}"
 
         response = requests.post(
-            f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
+            f"{AGENT_EXECUTOR_URL}/v1/chat/completions",
             json={
-                "model": _openclaw_media_model(),
+                "model": _media_agent_model(),
                 "stream": False,
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -829,8 +892,8 @@ def _call_openclaw_gateway(
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                "x-openclaw-agent-id": agent_id,
-                "x-openclaw-session-key": session_key,
+                "x-agent-id": agent_id,
+                "x-agent-session-key": session_key,
             },
             timeout=timeout,
         )
@@ -1032,11 +1095,11 @@ def _generate_subject_line(
         "error": None,
     }
 
-    if not _resolve_openclaw_gateway_token():
-        return _normalize_subject_line(fallback, fallback), details | {"reason": "gateway_unconfigured"}
+    if not _resolve_agent_executor_token() or not AGENT_EXECUTOR_URL:
+        return _normalize_subject_line(fallback, fallback), details | {"reason": "executor_unconfigured"}
 
     try:
-        content, error = _call_openclaw_gateway(
+        content, error = _call_agent_executor(
             asset=asset,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -1046,24 +1109,24 @@ def _generate_subject_line(
         if error:
             raise RuntimeError(error)
         subject_line = _normalize_subject_line(content, fallback)
-        return subject_line, details | {"generator": "openclaw", "model": _openclaw_media_model()}
+        return subject_line, details | {"generator": "agent-executor", "model": _media_agent_model()}
     except Exception as exc:
         logger.warning("Subject line inference failed for %s: %s", asset.filename, exc)
         return _normalize_subject_line(fallback, fallback), details | {
-            "reason": "gateway_error",
+            "reason": "executor_error",
             "error": str(exc),
-            "model": _openclaw_media_model(),
+            "model": _media_agent_model(),
         }
 
 
-def _compose_document_via_openclaw(
+def _compose_document_via_agent_executor(
     asset: MediaAsset,
     memory: ContextualMemory,
     recaps: list[LocalRecap],
     events: list,
     output_format: OutputFormat,
 ) -> Optional[ComposedDocument]:
-    if not _resolve_openclaw_gateway_token():
+    if not _resolve_agent_executor_token() or not AGENT_EXECUTOR_URL:
         return None
 
     system_prompt, user_prompt = build_compose_prompt(memory, recaps, events, output_format)
@@ -1076,7 +1139,7 @@ def _compose_document_via_openclaw(
         "Do not invent participants, decisions, or follow-up work.\n"
         "Avoid filler, hedging, and repetitive phrasing.\n"
     )
-    content, error = _call_openclaw_gateway(
+    content, error = _call_agent_executor(
         asset=asset,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -1128,6 +1191,29 @@ def _backfill_memory_from_document(memory: ContextualMemory, document: Optional[
 
 
 def process_media_file(
+    path: str,
+    output_format: Optional[OutputFormat] = None,
+    recap_window_s: float = 60.0,
+    metadata: Optional[dict] = None,
+    force_reprocess: bool = False,
+) -> dict:
+    """Bounded entry point for media processing.
+
+    Acquires a global semaphore so at most MEDIA_MAX_CONCURRENT_JOBS files
+    process concurrently — keeps batch (movie-library) work from starving
+    real-time RTSP transcription. Waiting callers block here cheaply.
+    """
+    with _MEDIA_JOB_SEM:
+        return _process_media_file_impl(
+            path,
+            output_format=output_format,
+            recap_window_s=recap_window_s,
+            metadata=metadata,
+            force_reprocess=force_reprocess,
+        )
+
+
+def _process_media_file_impl(
     path: str,
     output_format: Optional[OutputFormat] = None,
     recap_window_s: float = 60.0,
@@ -1260,7 +1346,7 @@ def process_media_file(
             output_format = select_output_format(memory, all_events)
 
         document = compose_document(memory, recaps, all_events, output_format=output_format)
-        llm_document = _compose_document_via_openclaw(asset, memory, recaps, all_events, output_format)
+        llm_document = _compose_document_via_agent_executor(asset, memory, recaps, all_events, output_format)
         if llm_document is not None:
             document = llm_document
             memory = _backfill_memory_from_document(memory, document)
@@ -1327,7 +1413,7 @@ def process_media_file(
             start_s=0.0,
             end_s=asset.duration_s,
             content=subject_line,
-            confidence=1.0 if subject_details.get("generator") == "openclaw" else 0.7,
+            confidence=1.0 if subject_details.get("generator") == "agent-executor" else 0.7,
             metadata={
                 "layer": "L7",
                 "generator": subject_details.get("generator"),
@@ -1996,7 +2082,7 @@ def _inject_metadata_into_file(
     tmp_path = src.with_name(f"{src.stem}.archivist_tmp{src.suffix}")
     try:
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(src),
         ]
         existing_archivist_subtitles, existing_archivist_attachments = _find_archivist_embedded_streams(src)
@@ -2639,20 +2725,41 @@ def _save_pipeline_result(media_id: str, result: dict):
 # Compat-version migration and status
 # ---------------------------------------------------------------------------
 
+_pipeline_compat_cache: dict = {}
+_pipeline_compat_cache_ts: float = 0.0
+_pipeline_compat_cache_dir: str = ""
+_PIPELINE_COMPAT_CACHE_TTL = 300.0  # 5 minutes — this changes slowly
+
+
 def pipeline_compat_status() -> dict:
-    """Return counts of current, stale, and broken pipeline results."""
-    current = stale = broken = 0
+    """Return counts of current, stale, and broken pipeline results (cached 5min)."""
+    import time as _time
+    global _pipeline_compat_cache, _pipeline_compat_cache_ts, _pipeline_compat_cache_dir
+    store_dir = str(PIPELINE_STORE_DIR)
+    if (
+        _pipeline_compat_cache
+        and _pipeline_compat_cache_dir == store_dir
+        and (_time.time() - _pipeline_compat_cache_ts) < _PIPELINE_COMPAT_CACHE_TTL
+    ):
+        return _pipeline_compat_cache.copy()
+    current = stale = broken = ignored = 0
     if not PIPELINE_STORE_DIR.is_dir():
-        return {"current": 0, "stale": 0, "broken": 0, "total": 0, "compat_version": MEDIA_PIPELINE_COMPAT_VERSION}
+        return {"current": 0, "stale": 0, "broken": 0, "ignored": 0, "total": 0, "compat_version": MEDIA_PIPELINE_COMPAT_VERSION}
     for result_file in PIPELINE_STORE_DIR.glob("*.json"):
         try:
             data = json.loads(result_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             broken += 1
             continue
+        if not _looks_like_pipeline_result(data):
+            ignored += 1
+            continue
         stamp = data.get("archivist_pipeline")
         if not isinstance(stamp, dict):
-            broken += 1
+            if _result_has_pipeline_output(data):
+                stale += 1
+            else:
+                broken += 1
             continue
         stamped_cv = str(stamp.get("pipeline_compat_version") or "").strip()
         if stamped_cv == MEDIA_PIPELINE_COMPAT_VERSION:
@@ -2661,24 +2768,46 @@ def pipeline_compat_status() -> dict:
             stale += 1
         else:
             broken += 1
-    return {"current": current, "stale": stale, "broken": broken, "total": current + stale + broken, "compat_version": MEDIA_PIPELINE_COMPAT_VERSION}
+    result = {
+        "current": current,
+        "stale": stale,
+        "broken": broken,
+        "ignored": ignored,
+        "total": current + stale + broken,
+        "compat_version": MEDIA_PIPELINE_COMPAT_VERSION,
+    }
+    _pipeline_compat_cache.clear()
+    _pipeline_compat_cache.update(result)
+    _pipeline_compat_cache_ts = _time.time()
+    _pipeline_compat_cache_dir = store_dir
+    return result
 
 
-def migrate_pipeline_compat_version(*, dry_run: bool = False) -> dict:
+def migrate_pipeline_compat_version(*, dry_run: bool = False, verify_sources: bool = False) -> dict:
     """Stamp existing valid pipeline results with the current compat version.
 
-    Only updates results that have valid data (document or transcript) and
-    whose source file still exists with a matching hash.  Results where the
-    source has changed on disk are skipped so they get reprocessed instead.
+    Only updates results that have valid data (document or transcript).
+    Source mtime verification is optional because network/media mounts can
+    block the health endpoint; per-asset freshness still runs before reuse.
     """
     migrated = 0
     skipped_invalid = 0
     skipped_changed = 0
     skipped_current = 0
+    ignored = 0
     errors = 0
 
     if not PIPELINE_STORE_DIR.is_dir():
-        return {"migrated": 0, "skipped_invalid": 0, "skipped_changed": 0, "skipped_current": 0, "errors": 0, "dry_run": dry_run}
+        return {
+            "migrated": 0,
+            "skipped_invalid": 0,
+            "skipped_changed": 0,
+            "skipped_current": 0,
+            "ignored": 0,
+            "errors": 0,
+            "dry_run": dry_run,
+            "verify_sources": verify_sources,
+        }
 
     for result_file in PIPELINE_STORE_DIR.glob("*.json"):
         try:
@@ -2687,25 +2816,34 @@ def migrate_pipeline_compat_version(*, dry_run: bool = False) -> dict:
             errors += 1
             continue
 
-        stamp = data.get("archivist_pipeline")
-        if not isinstance(stamp, dict):
-            skipped_invalid += 1
+        if not _looks_like_pipeline_result(data):
+            ignored += 1
             continue
+
+        stamp = data.get("archivist_pipeline")
+        created_legacy_stamp = False
+        if not isinstance(stamp, dict):
+            if not _result_has_pipeline_output(data):
+                skipped_invalid += 1
+                continue
+            stamp = _legacy_pipeline_stamp_from_result(data, result_file)
+            data["archivist_pipeline"] = stamp
+            created_legacy_stamp = True
 
         # Already current
         stamped_cv = str(stamp.get("pipeline_compat_version") or "").strip()
-        if stamped_cv == MEDIA_PIPELINE_COMPAT_VERSION:
+        if stamped_cv == MEDIA_PIPELINE_COMPAT_VERSION and not created_legacy_stamp:
             skipped_current += 1
             continue
 
         # Must have produced real output
-        if not (data.get("document") or data.get("transcript")):
+        if not _result_has_pipeline_output(data):
             skipped_invalid += 1
             continue
 
         # Verify source file still matches
         source_path = str(stamp.get("source_path") or "").strip()
-        if source_path:
+        if verify_sources and source_path:
             current_mtime = _current_source_mtime_ns(source_path)
             stamped_mtime = stamp.get("source_mtime_ns")
             if current_mtime is None:
@@ -2718,6 +2856,8 @@ def migrate_pipeline_compat_version(*, dry_run: bool = False) -> dict:
 
         if not dry_run:
             stamp["pipeline_compat_version"] = MEDIA_PIPELINE_COMPAT_VERSION
+            if isinstance(data.get("document"), dict):
+                data["document"]["archivist_pipeline"] = stamp
             try:
                 result_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except OSError:
@@ -2730,8 +2870,10 @@ def migrate_pipeline_compat_version(*, dry_run: bool = False) -> dict:
         "skipped_invalid": skipped_invalid,
         "skipped_changed": skipped_changed,
         "skipped_current": skipped_current,
+        "ignored": ignored,
         "errors": errors,
         "dry_run": dry_run,
+        "verify_sources": verify_sources,
         "compat_version": MEDIA_PIPELINE_COMPAT_VERSION,
     }
 

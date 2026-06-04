@@ -156,6 +156,16 @@ def test_get_status_not_loaded():
     assert status["available"] is False
     assert status["device"] == "not_loaded"
     assert status["model"] == transcription_service.TRANSCRIBE_MODEL
+    assert status["gpu"]["requested_device_index"] == transcription_service.GPU_INDEX
+
+
+def test_resolve_cuda_device_index_uses_container_local_zero_for_single_visible_gpu(monkeypatch):
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "1")
+    resolved = transcription_service._resolve_cuda_device_index(
+        1,
+        {"available": True, "device_count": 1},
+    )
+    assert resolved == 0
 
 
 def test_resolve_local_model_name_maps_turbo(monkeypatch):
@@ -181,6 +191,18 @@ def test_resolve_local_model_name_normalizes_override(monkeypatch):
     assert transcription_service._resolve_local_model_name("turbo") == "medium.en"
 
 
+def test_local_first_does_not_probe_remote_without_url(monkeypatch):
+    monkeypatch.setattr(transcription_service, "TRANSCRIBE_PROVIDER", "local_first")
+    monkeypatch.setattr(transcription_service, "TRANSCRIBE_API_URL", "")
+    assert transcription_service._provider_allows_remote() is False
+
+
+def test_remote_first_allows_remote_when_url_configured(monkeypatch):
+    monkeypatch.setattr(transcription_service, "TRANSCRIBE_PROVIDER", "remote_first")
+    monkeypatch.setattr(transcription_service, "TRANSCRIBE_API_URL", "http://transcribe.example")
+    assert transcription_service._provider_allows_remote() is True
+
+
 def test_transcribe_when_unavailable(monkeypatch):
     """Should raise RuntimeError when service is not initialized."""
     transcription_service._model = None
@@ -195,6 +217,71 @@ def test_transcribe_when_unavailable(monkeypatch):
     monkeypatch.setattr(transcription_service, "_select_backend", raise_unavailable)
     with pytest.raises(RuntimeError, match="not available"):
         transcription_service.transcribe_audio_bytes(b"fake audio data")
+
+
+def test_recoverable_cuda_segment_failure_switches_to_cpu(monkeypatch):
+    class Info:
+        language = "en"
+        language_probability = 0.99
+
+    class Segment:
+        text = "turn off the air conditioner"
+
+    class FailingCudaModel:
+        def transcribe(self, audio, **kwargs):
+            def segments():
+                raise RuntimeError("CUDA failed with error unspecified launch failure")
+                yield
+
+            return segments(), Info()
+
+    class CpuModel:
+        def transcribe(self, audio, **kwargs):
+            return [Segment()], Info()
+
+    transcription_service._model = FailingCudaModel()
+    monkeypatch.setattr(
+        transcription_service,
+        "_reload_local_model_on_cpu",
+        lambda exc: setattr(transcription_service, "_model", CpuModel()),
+    )
+
+    transcription, meta, segments = transcription_service._transcribe_audio_internal(
+        np.zeros(16000, dtype=np.float32),
+        pipeline="raw_pcm",
+        extra={},
+    )
+
+    assert transcription == "turn off the air conditioner"
+    assert meta["lang"] == "en"
+    assert len(segments) == 1
+
+
+def test_recoverable_cuda_segment_failure_refuses_cpu_when_cuda_required(monkeypatch):
+    class Info:
+        language = "en"
+        language_probability = 0.99
+
+    class FailingCudaModel:
+        def transcribe(self, audio, **kwargs):
+            def segments():
+                raise RuntimeError("CUDA failed with error unspecified launch failure")
+                yield
+
+            return segments(), Info()
+
+    transcription_service._model = FailingCudaModel()
+    monkeypatch.setattr(transcription_service, "REQUIRE_CUDA", True)
+
+    with pytest.raises(RuntimeError, match="refusing CPU fallback"):
+        transcription_service._transcribe_audio_internal(
+            np.zeros(16000, dtype=np.float32),
+            pipeline="raw_pcm",
+            extra={},
+        )
+
+    assert transcription_service._local_available is False
+    assert transcription_service._local_device == "error"
 
 
 # ── Response builder tests ──────────────────────────────────────────────
@@ -213,12 +300,17 @@ def test_build_response_detailed():
         "pipeline": "wav_direct",
         "ffmpeg": False,
         "process_time": 0.5,
+        "vad_filter": False,
     }
     response = transcription_service.build_transcribe_response("Hello", meta, [], detailed=True)
     assert response["transcription"] == "Hello"
     assert response["language"] == "en"
     assert response["audio_seconds"] == 5.0
+    assert response["vad_filter"] is False
     assert "timing" in response
+    assert response["timing"]["read"] == 0.0
+    assert response["timing"]["wait"] == 0.0
+    assert response["timing"]["process"] == 0.5
     assert "segments" in response
 
 

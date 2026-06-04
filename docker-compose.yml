@@ -1,6 +1,16 @@
 name: archivist
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: archivist-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    volumes:
+      - archivist_redis-data:/data
+    ports:
+      - "6379:6379"
+
   archivist:
     build:
       context: .
@@ -8,36 +18,97 @@ services:
     image: archivist:latest
     container_name: archivist
     init: true
+    depends_on:
+      - redis
     environment:
-      ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS: "false"
+      REDIS_URL: redis://redis:6379/0
+      ARCHIVIST_SOURCES_CONFIG: /app/config/sources.yml
+      ARCHIVIST_ALERT_EMAIL: ${ARCHIVIST_ALERT_EMAIL:-physiphile@gmail.com}
+      ARCHIVIST_SMTP_USER: ${ARCHIVIST_SMTP_USER:-}
+      ARCHIVIST_SMTP_PASSWORD: ${ARCHIVIST_SMTP_PASSWORD:-}
+      HA_WEBHOOK_URL: ${HA_WEBHOOK_URL:-}
+      HA_WEBHOOK_TOKEN: ${HA_WEBHOOK_TOKEN:-}
+      HEALTH_SOURCE_STALE_S: ${HEALTH_SOURCE_STALE_S:-600}
+      RTSP_RECONNECT_MIN_S: "2"
+      RTSP_RECONNECT_MAX_S: "60"
+      STREAMING_VAD_AGGRESSIVENESS: "2"
+      STREAMING_MIN_UTTERANCE_MS: "400"
+      STREAMING_MAX_UTTERANCE_MS: "15000"
+      STREAMING_HANGOVER_MS: "400"
+      STREAMING_KEEPALIVE_SECS: "300"
+      CLIP_MODEL_NAME: ${CLIP_MODEL_NAME:-ViT-B-32}
+      CLIP_MODEL_PRETRAINED: ${CLIP_MODEL_PRETRAINED:-laion2b_s34b_b79k}
+      CLIP_EMBED_INTERVAL_S: "5"
+      CLIP_MAX_CONCURRENT: "1"
+      CLIP_GPU_ID: "0"
+      RETENTION_ENABLED: ${RETENTION_ENABLED:-true}
+      RETENTION_DRY_RUN: ${RETENTION_DRY_RUN:-true}
+      RETENTION_SCAN_INTERVAL_S: ${RETENTION_SCAN_INTERVAL_S:-3600}
+      ARCHIVIST_NAS_SEGMENTS_ROOT: ${ARCHIVIST_NAS_SEGMENTS_ROOT:-/media/mass/recording}
+      ARCHIVE_ENABLED: ${ARCHIVE_ENABLED:-true}
+      ARCHIVE_SCAN_INTERVAL_S: ${ARCHIVE_SCAN_INTERVAL_S:-300}
+      ARCHIVE_MAX_MOVES_PER_PASS: ${ARCHIVE_MAX_MOVES_PER_PASS:-2000}
+      ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS: ${ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS:-true}
       ARCHIVIST_HOST_WORKSPACE: /home/andy/archivist
+      ARCHIVIST_AGENTS_ROOT: /media/mass/agents
+      ARCHIVIST_AGENT_CONSOLE_AGENT_ID: operator-chat
       ARCHIVIST_GOOGLE_SERVICES: gmail,calendar,drive,chat
-      ARCHIVIST_OPENCLAW_CONSOLE_AGENT_ID: archivist-main
-      ARCHIVIST_OPENCLAW_VISIBLE_AGENT_IDS: archivist-main,archivist-health,archivist-repair,archivist-observer,archivist-verifier
       ARCHIVIST_WORK_NOTES_ROOT: /home/andy/vnotes
       ARCHIVIST_FOCUS_SYNC_TIME: "05:30"
       ARCHIVIST_FOCUS_SYNC_TIMEZONE: America/Chicago
       ARCHIVIST_FOCUS_MAX_AGE_HOURS: "6"
-      OPENCLAW_STATE_DIR: /host/.openclaw
-      OPENCLAW_CONFIG_PATH: /host/.openclaw/openclaw.json
-      OPENCLAW_GATEWAY_URL: http://host.docker.internal:18789
+      ARCHIVIST_AGENT_EXECUTOR_URL: ${ARCHIVIST_AGENT_EXECUTOR_URL:-}
+      ARCHIVIST_AGENT_EXECUTOR_TOKEN: ${ARCHIVIST_AGENT_EXECUTOR_TOKEN:-}
       MILVUS_HOST: host.docker.internal
       MILVUS_CONNECT_TIMEOUT: "3"
       MILVUS_LOAD_TIMEOUT: "60"
+      VECTORSTORE_RELEASE_AFTER_SEARCH: "false"
+      VECTORSTORE_RELEASE_AFTER_PREVIEW: "false"
+      VECTORSTORE_INDEX_TYPE: ${VECTORSTORE_INDEX_TYPE:-IVF_SQ8}
+      VECTORSTORE_NLIST: ${VECTORSTORE_NLIST:-4096}
+      VECTORSTORE_NPROBE: ${VECTORSTORE_NPROBE:-24}
+      VECTORSTORE_PRELOAD_COLLECTIONS: ${VECTORSTORE_PRELOAD_COLLECTIONS:-documents_transcripts}
+      GLOBAL_SEARCH_COLLECTION_LOAD_TIMEOUT: ${GLOBAL_SEARCH_COLLECTION_LOAD_TIMEOUT:-2}
       EMBEDDING_HOST: host.docker.internal
       EMBEDDING_PORT: "8000"
-      TRANSCRIBE_PROVIDER: remote_only
-      TRANSCRIBE_API_URL: http://host.docker.internal:8123
+      LOCAL_EMBEDDING_DIM: "2560"
+      LOCAL_EMBEDDING_MODEL: "local-default"
+      NVIDIA_VISIBLE_DEVICES: ${ARCHIVIST_NVIDIA_VISIBLE_DEVICES:-0}
+      NVIDIA_DRIVER_CAPABILITIES: ${ARCHIVIST_NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      TRANSCRIBE_PROVIDER: local_first
+      TRANSCRIBE_API_URL: ""
       TRANSCRIBE_API_TIMEOUT_S: "1800"
       TRANSCRIBE_MODEL: medium.en
       TRANSCRIBE_LOCAL_MODEL: medium.en
-      TRANSCRIBE_COMPUTE_TYPE: int8
+      TRANSCRIBE_GPU_ID: "0"
+      TRANSCRIBE_COMPUTE_TYPE: ${TRANSCRIBE_COMPUTE_TYPE:-float16}
+      TRANSCRIBE_REQUIRE_CUDA: ${TRANSCRIBE_REQUIRE_CUDA:-true}
       TRANSCRIBE_BEAM_SIZE: "1"
-      TRANSCRIBE_MAX_CONCURRENT: "1"
+      TRANSCRIBE_TEMPERATURE: "0.0"
+      TRANSCRIBE_CONDITION_ON_PREVIOUS_TEXT: "false"
+      TRANSCRIBE_MAX_CONCURRENT: "0"
+      TRANSCRIBE_NUM_WORKERS: "4"
+      TRANSCRIBE_PRELOAD_LOCAL: "false"
+      ENABLE_TTS_STREAMING: "true"
+      TTS_WS_PORT: "5051"
+      TTS_MODEL_NAME: "tts_models/multilingual/multi-dataset/xtts_v2"
+      TTS_DEVICE_TYPE: ${TTS_DEVICE_TYPE:-cuda}
+      TTS_VOICE_NAME: "Ana Florence"
+      TTS_VOICE_LANGUAGE: "en"
+      TTS_STREAM_SAMPLE_RATE: "24000"
+      TTS_STREAM_CHUNK_SIZE: "35"
+      TTS_PYTHON_PATH: "/home/andy/venvs/tts-env/bin/python"
+      TWIN_TTS_BACKEND: ${TWIN_TTS_BACKEND:-external}
+      TWIN_ALLOW_LEGACY_FALLBACK_TTS: ${TWIN_ALLOW_LEGACY_FALLBACK_TTS:-false}
+      TWIN_TTS_PREWARM: ${TWIN_TTS_PREWARM:-true}
+      TWIN_TTS_HELPER_BOOT_TIMEOUT_S: ${TWIN_TTS_HELPER_BOOT_TIMEOUT_S:-600}
+      TWIN_TTS_HELPER_RESPONSE_TIMEOUT_S: ${TWIN_TTS_HELPER_RESPONSE_TIMEOUT_S:-420}
       MEDIA_WATCH_IDLE_ONLY: "true"
       MEDIA_WATCH_AUTO_RESTORE: "false"
       MEDIA_WATCH_MAX_LOAD_PER_CPU: "0.70"
       MEDIA_WATCH_DEFER_LOG_INTERVAL_S: "300"
+      MEDIA_MAX_CONCURRENT_JOBS: "2"
+      MEDIA_BATCH_LOWPRI: "1"
       MEDIA_SCENE_MAX_WIDTH: "960"
       MEDIA_SCENE_SAMPLE_FPS: "1"
       MEDIA_SCENE_ANALYSIS_MAX_PIXELS: "12000000"
@@ -59,34 +130,43 @@ services:
       INDEXING_PATH_ALIASES: /media/mass=/media/mass;/home/andy/nas_mass=/home/andy/nas_mass
       INDEXING_SCAN_TIMEOUT_SECONDS: "900"
       INDEXING_FILE_DISCOVERY_TIMEOUT_SECONDS: "900"
-      ARCHIVIST_GIT_REPO_DIRS: /home/andy/archivist:/home/andy/openclaw:/home/andy/MovieTime:/home/andy/MusicTime:/home/andy/collectivefs:/home/andy/custodian:/home/andy/radio-mapper:/home/andy/autoresearch:/home/andy/embed:/home/andy/TranscribeServer:/home/andy/needl:/home/andy/versant:/home/andy/zcoord:/home/andy/vnotes:/home/andy/pyfi-website
+      ARCHIVIST_GIT_REPO_DIRS: /home/andy/archivist:/media/mass/agents:/home/andy/MovieTime:/home/andy/MusicTime:/home/andy/collectivefs:/home/andy/custodian:/home/andy/radio-mapper:/home/andy/autoresearch:/home/andy/embed:/home/andy/needl:/home/andy/versant:/home/andy/zcoord:/home/andy/vnotes:/home/andy/pyfi-website
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    labels:
+      com.custodian.app.url: "http://192.168.1.40:5050/#"
     ports:
       - "5050:5050"
+      - "5051:5051"
     networks:
       default:
         aliases:
           - vectorstore
     volumes:
       - /home/andy:/home/andy:ro
-      - vectorstore_vectorstore-backups:/backups
+      - /media/mass/Backup/vectorstore-backups:/backups
       - vectorstore_vectorstore-indexing:/indexing
       - vectorstore_milvus-data:/data/milvus:ro
       - vectorstore_etcd-data:/data/etcd:ro
       - vectorstore_minio-data:/data/minio:ro
       - archivist_media-store:/data/media_store
       - archivist_media-pipeline:/data/media_pipeline
+      - archivist_model-cache:/root/.cache/huggingface
+      - /home/andy/.local/share/tts:/root/.local/share/tts:ro
       - /media/mass:/media/mass
       - /home/andy/nas_mass:/home/andy/nas_mass
-      - /home/andy/archivist/.openclaw:/host/archivist/.openclaw
-      - /home/andy/.openclaw:/host/.openclaw:ro
+      - /home/andy/archivist/config:/app/config:ro
       - /home/andy/.config/archivist:/root/.config/archivist
       - /home/andy/.ssh:/root/.ssh:ro
+    gpus:
+      - driver: nvidia
+        device_ids:
+          - "${ARCHIVIST_GPU_ID:-0}"
+        capabilities: [gpu]
     command:
       - gunicorn
       - -w
-      - "2"
+      - "1"
       - --threads
       - "16"
       - --timeout
@@ -95,6 +175,15 @@ services:
       - 0.0.0.0:5050
       - main:app
     restart: unless-stopped
+    healthcheck:
+      # Reports UNHEALTHY when CUDA/transcription is broken (the failure mode that
+      # silently wedged transcription). Recovery is handled by gpu_watchdog, which
+      # restarts the container on a sustained healthy->lost CUDA transition.
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 240s
 
 volumes:
   vectorstore_vectorstore-backups:
@@ -109,3 +198,5 @@ volumes:
     external: true
   archivist_media-store:
   archivist_media-pipeline:
+  archivist_model-cache:
+  archivist_redis-data:

@@ -280,7 +280,8 @@ def load_to_vectorstore(args):
     logging.info(f"Operation completed in {end_time - start_time}.")
 
 def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
-                             line_by_line=False, chunk_size=1000, overlap=0, ip_address="localhost", embedding_host="localhost", embedding_port=None):
+                             line_by_line=False, chunk_size=1000, overlap=0, ip_address="localhost", embedding_host="localhost", embedding_port=None,
+                             flush=False):
     logging.info(f"Starting load_text_to_vectorstore: collection={collection_name}, model={embedding_model}, ip={ip_address}")
     alias = _get_milvus_connection(ip_address)
 
@@ -479,11 +480,18 @@ def load_text_to_vectorstore(text, collection_name=None, embedding_model=None,
             # Milvus flush asynchronously. Searches will still work; newly inserted rows
             # may take a short time to become visible, which is acceptable for background sync.
             flush_on_insert = os.getenv("VECTORSTORE_FLUSH_ON_INSERT", "").lower() in {"1", "true", "yes"}
-            if flush_on_insert and not line_by_line:
+            # `flush=True` (interactive single inserts) forces a flush so the data is durable and
+            # immediately searchable; the bulk/streaming path keeps the async default for throughput.
+            if flush or (flush_on_insert and not line_by_line):
                 logging.info("Flushing inserted data...")
                 try:
                     collection.flush(timeout=30)
                     logging.info("Data flushed successfully.")
+                    # Load so the freshly-flushed segment is queryable right away.
+                    try:
+                        collection.load(timeout=30)
+                    except MilvusException as load_error:
+                        logging.warning("Post-insert load did not complete in time: %s", load_error)
                 except MilvusException as flush_error:
                     logging.warning(
                         "Flush did not complete within timeout (%s). Milvus will continue flushing in the background.",

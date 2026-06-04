@@ -1,12 +1,13 @@
 """Transcription service for Archivist.
 
-Uses the existing external TranscribeServer as the primary backend and keeps
-local faster-whisper support available as a fallback and compatibility layer
-for Archivist's own `/api/transcribe` endpoint.
+Runs faster-whisper inside Archivist as the primary backend and keeps an
+optional remote backend available only when explicitly configured. The public
+response shape is compatible with the legacy TranscribeServer API.
 """
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import os
@@ -25,25 +26,47 @@ logger = logging.getLogger("archivist.transcription")
 
 # ── Configuration ────────────────────────────────────────────────────────
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 TRANSCRIBE_MODEL = (os.getenv("TRANSCRIBE_MODEL") or "medium.en").strip()
 COMPUTE_TYPE = (os.getenv("TRANSCRIBE_COMPUTE_TYPE") or "float16").strip()
-BEAM_SIZE = max(1, int(os.getenv("TRANSCRIBE_BEAM_SIZE", "1")))
-GPU_INDEX = int(os.getenv("TRANSCRIBE_GPU_ID", "0"))
-MAX_CONCURRENT = max(1, int(os.getenv("TRANSCRIBE_MAX_CONCURRENT", "1")))
+BEAM_SIZE = max(1, _env_int("TRANSCRIBE_BEAM_SIZE", 1))
+TEMPERATURE = float(os.getenv("TRANSCRIBE_TEMPERATURE", "0.0"))
+CONDITION_ON_PREVIOUS_TEXT = (os.getenv("TRANSCRIBE_CONDITION_ON_PREVIOUS_TEXT") or "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+GPU_INDEX = max(0, _env_int("TRANSCRIBE_GPU_ID", 0))
+# 0 (or unset) = unbounded: let concurrency be limited by the real producers
+# (one worker thread per source + media/API callers) and GPU capacity, not an
+# arbitrary number. Set a positive value only as a safety valve if the GPU OOMs.
+MAX_CONCURRENT = _env_int("TRANSCRIBE_MAX_CONCURRENT", 0)
+# ctranslate2 serializes inference through num_workers (default 1). This is the
+# real parallelism lever — it lets that many transcriptions run concurrently on
+# the GPU. Removing MAX_CONCURRENT alone does nothing without this.
+NUM_WORKERS = max(1, _env_int("TRANSCRIBE_NUM_WORKERS", 4))
 TARGET_PEAK = float(os.getenv("TRANSCRIBE_TARGET_PEAK", "0.10"))
 MAX_GAIN = float(os.getenv("TRANSCRIBE_MAX_GAIN", "15.0"))
 FALLBACK_NO_SPEECH_THRESHOLD = float(os.getenv("TRANSCRIBE_FALLBACK_NO_SPEECH_THRESHOLD", "0.30"))
-TRANSCRIBE_PROVIDER = (os.getenv("TRANSCRIBE_PROVIDER") or "remote_first").strip().lower()
-TRANSCRIBE_API_URL = (os.getenv("TRANSCRIBE_API_URL") or "http://host.docker.internal:8123").strip().rstrip("/")
+TRANSCRIBE_PROVIDER = (os.getenv("TRANSCRIBE_PROVIDER") or "local_first").strip().lower()
+TRANSCRIBE_API_URL = (os.getenv("TRANSCRIBE_API_URL") or "").strip().rstrip("/")
 TRANSCRIBE_API_TIMEOUT_S = max(30, int(os.getenv("TRANSCRIBE_API_TIMEOUT_S", "1800")))
 PRELOAD_LOCAL_MODEL = (os.getenv("TRANSCRIBE_PRELOAD_LOCAL") or "false").strip().lower() in ("1", "true", "yes", "on")
 LOCAL_TRANSCRIBE_MODEL = (os.getenv("TRANSCRIBE_LOCAL_MODEL") or "").strip()
+REQUIRE_CUDA = (os.getenv("TRANSCRIBE_REQUIRE_CUDA") or "false").strip().lower() in ("1", "true", "yes", "on")
 
 # ── Module state ─────────────────────────────────────────────────────────
 
 _model = None
 _model_lock = threading.Lock()
-_transcribe_lock = threading.Semaphore(MAX_CONCURRENT)
+_transcribe_lock = threading.Semaphore(MAX_CONCURRENT) if MAX_CONCURRENT > 0 else contextlib.nullcontext()
 _available = False
 _init_error: str | None = None
 _local_available = False
@@ -52,6 +75,9 @@ _remote_available = False
 _remote_error: str | None = None
 _local_attempted = False
 _remote_attempted = False
+_local_device = "not_loaded"
+_local_device_index: int | None = None
+_local_compute_type: str | None = None
 
 
 def is_available() -> bool:
@@ -61,9 +87,12 @@ def is_available() -> bool:
 def get_status() -> dict:
     device = "not_loaded"
     if _local_available:
-        device = "cuda" if _has_cuda() else "cpu"
+        device = _local_device or "unknown"
     elif _remote_available:
         device = "remote"
+    cuda_status = _cuda_runtime_status(
+        _local_device_index if _local_device == "cuda" else GPU_INDEX
+    )
     return {
         "available": _available,
         "provider": TRANSCRIBE_PROVIDER,
@@ -71,8 +100,19 @@ def get_status() -> dict:
         "model": TRANSCRIBE_MODEL,
         "local_model": _resolve_local_model_name(TRANSCRIBE_MODEL),
         "compute_type": COMPUTE_TYPE,
+        "local_compute_type": _local_compute_type,
         "beam_size": BEAM_SIZE,
+        "temperature": TEMPERATURE,
+        "condition_on_previous_text": CONDITION_ON_PREVIOUS_TEXT,
         "device": device,
+        "device_index": _local_device_index,
+        "gpu": {
+            "requested_device_index": GPU_INDEX,
+            "resolved_device_index": _local_device_index,
+            "nvidia_visible_devices": os.getenv("NVIDIA_VISIBLE_DEVICES"),
+            "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
+            **cuda_status,
+        },
         "backends": {
             "remote": {
                 "available": _remote_available,
@@ -88,11 +128,78 @@ def get_status() -> dict:
 
 
 def _has_cuda() -> bool:
+    status = _cuda_runtime_status()
+    return bool(status.get("available")) and int(status.get("device_count") or 0) > 0
+
+
+def _cuda_runtime_status(selected_index: int | None = None) -> dict:
+    status = {
+        "available": False,
+        "device_count": 0,
+        "selected_device_index": selected_index,
+        "selected_device_name": None,
+        "device_names": [],
+        "error": None,
+    }
     try:
         import torch
-        return torch.cuda.is_available()
-    except ImportError:
-        return False
+    except Exception as exc:
+        status["error"] = f"{type(exc).__name__}: {exc}"
+        return status
+
+    try:
+        available = bool(torch.cuda.is_available())
+        status["available"] = available
+        if not available:
+            return status
+        count = int(torch.cuda.device_count())
+        status["device_count"] = count
+        names = []
+        for idx in range(count):
+            try:
+                names.append(torch.cuda.get_device_name(idx))
+            except Exception:
+                names.append(f"cuda:{idx}")
+        status["device_names"] = names
+        if selected_index is not None and 0 <= selected_index < count:
+            status["selected_device_name"] = names[selected_index]
+    except Exception as exc:
+        status["available"] = False
+        status["error"] = f"{type(exc).__name__}: {exc}"
+    return status
+
+
+def _resolve_cuda_device_index(requested_index: int, cuda_status: dict) -> int:
+    count = int(cuda_status.get("device_count") or 0)
+    if count <= 0:
+        return 0
+    if 0 <= requested_index < count:
+        return requested_index
+    if count == 1:
+        logger.warning(
+            "TRANSCRIBE_GPU_ID=%d is outside the visible CUDA range; using cuda:0 "
+            "inside the container. NVIDIA_VISIBLE_DEVICES=%s",
+            requested_index,
+            os.getenv("NVIDIA_VISIBLE_DEVICES"),
+        )
+        return 0
+    raise RuntimeError(f"TRANSCRIBE_GPU_ID={requested_index} but only {count} CUDA devices are visible")
+
+
+def _is_recoverable_cuda_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "out of memory",
+            "unspecified launch failure",
+            "launch failure",
+            "illegal memory access",
+            "device-side assert",
+            "cublas",
+            "cudnn",
+        )
+    )
 
 
 def _refresh_availability():
@@ -110,7 +217,7 @@ def _refresh_availability():
 
 
 def _provider_allows_remote() -> bool:
-    return TRANSCRIBE_PROVIDER in {"remote_only", "remote_first", "local_first"}
+    return TRANSCRIBE_PROVIDER in {"remote_only", "remote_first", "local_first"} and bool(TRANSCRIBE_API_URL)
 
 
 def _provider_allows_local() -> bool:
@@ -124,7 +231,7 @@ def _probe_remote_service(force: bool = False) -> bool:
     _remote_attempted = True
     if not _provider_allows_remote():
         _remote_available = False
-        _remote_error = "disabled by provider"
+        _remote_error = "disabled by provider or missing TRANSCRIBE_API_URL"
         _refresh_availability()
         return False
     try:
@@ -163,7 +270,7 @@ def _resolve_local_model_name(requested_model: str) -> str:
 
 def _init_local_model():
     """Load the local faster-whisper model when local fallback is needed."""
-    global _model, _local_available, _local_error, _local_attempted
+    global _model, _local_available, _local_error, _local_attempted, _local_device, _local_device_index, _local_compute_type
     with _model_lock:
         if _model is not None:
             _local_available = True
@@ -190,15 +297,54 @@ def _init_local_model():
         compute = "int8"
         device_index = 0
 
-        if _has_cuda():
+        cuda_status = _cuda_runtime_status(GPU_INDEX)
+        if cuda_status.get("available") and int(cuda_status.get("device_count") or 0) > 0:
             import torch
-            torch.cuda.set_device(GPU_INDEX)
-            device = "cuda"
-            compute = COMPUTE_TYPE
-            device_index = GPU_INDEX
-            logger.info("Loading Whisper model '%s' on cuda:%d (compute=%s)", local_model, GPU_INDEX, compute)
+            try:
+                device_index = _resolve_cuda_device_index(GPU_INDEX, cuda_status)
+                torch.cuda.set_device(device_index)
+                device = "cuda"
+                compute = COMPUTE_TYPE
+                logger.info(
+                    "Loading Whisper model '%s' on cuda:%d (compute=%s, visible=%s)",
+                    local_model,
+                    device_index,
+                    compute,
+                    os.getenv("NVIDIA_VISIBLE_DEVICES"),
+                )
+            except Exception as exc:
+                if REQUIRE_CUDA:
+                    _local_available = False
+                    _local_error = f"TRANSCRIBE_REQUIRE_CUDA=true but CUDA was visible yet unusable: {exc}"
+                    _local_device = "error"
+                    _local_device_index = None
+                    _local_compute_type = None
+                    logger.error("Whisper CUDA unusable and REQUIRE_CUDA=true; refusing CPU fallback: %s", exc)
+                    _refresh_availability()
+                    return
+                logger.warning("CUDA was visible but unusable for Whisper; loading CPU int8 instead: %s", exc)
         else:
-            logger.info("CUDA not available, loading Whisper model '%s' on CPU (compute=int8)", local_model)
+            if REQUIRE_CUDA:
+                err = (
+                    f"TRANSCRIBE_REQUIRE_CUDA=true but no CUDA devices visible "
+                    f"(NVIDIA_VISIBLE_DEVICES={os.getenv('NVIDIA_VISIBLE_DEVICES')!r}, "
+                    f"error={cuda_status.get('error')!r}). Whisper refuses CPU fallback."
+                )
+                _local_available = False
+                _local_error = err
+                _local_device = "error"
+                _local_device_index = None
+                _local_compute_type = None
+                logger.error(err)
+                _refresh_availability()
+                return
+            logger.warning(
+                "CUDA not available for Whisper, loading '%s' on CPU (compute=int8; visible=%s; error=%s). "
+                "Set TRANSCRIBE_REQUIRE_CUDA=true to forbid this fallback.",
+                local_model,
+                os.getenv("NVIDIA_VISIBLE_DEVICES"),
+                cuda_status.get("error"),
+            )
 
         if local_model != TRANSCRIBE_MODEL:
             logger.info(
@@ -208,19 +354,89 @@ def _init_local_model():
             )
 
         try:
-            _model = WhisperModel(
-                local_model,
-                device=device,
-                device_index=device_index,
-                compute_type=compute,
-            )
+            try:
+                _model = WhisperModel(
+                    local_model,
+                    device=device,
+                    device_index=device_index,
+                    compute_type=compute,
+                    num_workers=NUM_WORKERS,
+                )
+            except Exception as exc:
+                if device != "cuda" or not _is_recoverable_cuda_error(exc):
+                    raise
+                if REQUIRE_CUDA:
+                    raise RuntimeError(
+                        f"TRANSCRIBE_REQUIRE_CUDA=true and Whisper CUDA load failed; refusing CPU fallback: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Recoverable CUDA error while loading Whisper model; switching to CPU int8: %s",
+                    exc,
+                )
+                device = "cpu"
+                compute = "int8"
+                device_index = 0
+                _model = WhisperModel(
+                    local_model,
+                    device=device,
+                    device_index=device_index,
+                    compute_type=compute,
+                    num_workers=NUM_WORKERS,
+                )
             _local_available = True
             _local_error = None
-            logger.info("Local transcription model loaded successfully")
+            _local_device = device
+            _local_device_index = device_index if device == "cuda" else None
+            _local_compute_type = compute
+            logger.info(
+                "Local transcription model loaded successfully on %s%s (compute=%s)",
+                device,
+                f":{device_index}" if device == "cuda" else "",
+                compute,
+            )
         except Exception as exc:
             _local_available = False
             _local_error = str(exc)
+            _local_device = "error"
+            _local_device_index = None
+            _local_compute_type = None
             logger.error("Failed to load local transcription model: %s", exc)
+        _refresh_availability()
+
+
+def _reload_local_model_on_cpu(exc: Exception):
+    global _model, _local_available, _local_error, _local_device, _local_device_index, _local_compute_type
+    if REQUIRE_CUDA:
+        _local_available = False
+        _local_error = (
+            "TRANSCRIBE_REQUIRE_CUDA=true and Whisper CUDA inference failed; "
+            f"refusing CPU fallback: {exc}"
+        )
+        _local_device = "error"
+        _local_device_index = None
+        _local_compute_type = None
+        _refresh_availability()
+        raise RuntimeError(_local_error) from exc
+
+    from faster_whisper import WhisperModel
+
+    local_model = _resolve_local_model_name(TRANSCRIBE_MODEL)
+    with _model_lock:
+        logger.warning(
+            "Recoverable CUDA error during Whisper inference; switching transcription service to CPU int8: %s",
+            exc,
+        )
+        _model = WhisperModel(
+            local_model,
+            device="cpu",
+            device_index=0,
+            compute_type="int8",
+        )
+        _local_available = True
+        _local_error = None
+        _local_device = "cpu"
+        _local_device_index = None
+        _local_compute_type = "int8"
         _refresh_availability()
 
 
@@ -381,6 +597,8 @@ def _transcribe_audio_internal(
         "language": "en",
         "beam_size": BEAM_SIZE,
         "vad_filter": bool(vad_filter),
+        "temperature": TEMPERATURE,
+        "condition_on_previous_text": CONDITION_ON_PREVIOUS_TEXT,
     }
     if initial_prompt:
         kwargs["initial_prompt"] = initial_prompt
@@ -389,15 +607,47 @@ def _transcribe_audio_internal(
     if word_timestamps:
         kwargs["word_timestamps"] = True
 
-    segments, info = _model.transcribe(audio, **kwargs)
-    segments_list = list(segments)
+    try:
+        segments, info = _model.transcribe(audio, **kwargs)
+        segments_list = list(segments)
+    except Exception as exc:
+        if not _is_recoverable_cuda_error(exc):
+            raise
+        _reload_local_model_on_cpu(exc)
+        segments, info = _model.transcribe(audio, **kwargs)
+        segments_list = list(segments)
     transcription = " ".join(seg.text for seg in segments_list).strip()
     audio_seconds = len(audio) / 16000.0 if len(audio) else 0.0
+    no_speech_probs = []
+    avg_logprobs = []
+    compression_ratios = []
+    for seg in segments_list:
+        try:
+            if getattr(seg, "no_speech_prob", None) is not None:
+                no_speech_probs.append(float(getattr(seg, "no_speech_prob")))
+        except Exception:
+            pass
+        try:
+            if getattr(seg, "avg_logprob", None) is not None:
+                avg_logprobs.append(float(getattr(seg, "avg_logprob")))
+        except Exception:
+            pass
+        try:
+            if getattr(seg, "compression_ratio", None) is not None:
+                compression_ratios.append(float(getattr(seg, "compression_ratio")))
+        except Exception:
+            pass
     meta = {
         "pipeline": pipeline,
         "lang": info.language,
         "lang_p": info.language_probability,
         "audio_seconds": audio_seconds,
+        "model_device": _local_device,
+        "model_device_index": _local_device_index,
+        "model_compute_type": _local_compute_type,
+        "max_no_speech_prob": max(no_speech_probs) if no_speech_probs else None,
+        "avg_logprob": (sum(avg_logprobs) / len(avg_logprobs)) if avg_logprobs else None,
+        "max_compression_ratio": max(compression_ratios) if compression_ratios else None,
         **extra,
     }
     return transcription, meta, segments_list
@@ -447,7 +697,7 @@ def _transcribe_audio_bytes_local(
         if "audio/raw" in ctype or ("application/octet-stream" in ctype and fname.endswith(".raw")):
             audio = np.frombuffer(data, dtype=np.float32).astype(np.float32)
             audio_proc, proc_stats = _maybe_normalize_for_asr(audio)
-            extra = {**meta_extra, "ffmpeg": False, "audio_stats": proc_stats}
+            extra = {**meta_extra, "ffmpeg": False, "audio_stats": proc_stats, "vad_filter": bool(vad_filter)}
             if allow_fallback:
                 transcription, meta, segments = _try_with_vad_fallback(
                     audio_proc, "raw_pcm", extra, initial_prompt, no_speech_threshold, vad_filter, word_timestamps, proc_stats
@@ -468,7 +718,14 @@ def _transcribe_audio_bytes_local(
 
             if audio is not None and sr == 16000:
                 audio_proc, proc_stats = _maybe_normalize_for_asr(audio)
-                extra = {**meta_extra, "channels": nch, "chosen_channel": chosen_ch, "ffmpeg": False, "audio_stats": proc_stats}
+                extra = {
+                    **meta_extra,
+                    "channels": nch,
+                    "chosen_channel": chosen_ch,
+                    "ffmpeg": False,
+                    "audio_stats": proc_stats,
+                    "vad_filter": bool(vad_filter),
+                }
                 if allow_fallback:
                     transcription, meta, segments = _try_with_vad_fallback(
                         audio_proc, "wav_direct", extra, initial_prompt, no_speech_threshold, vad_filter, word_timestamps, proc_stats
@@ -482,7 +739,7 @@ def _transcribe_audio_bytes_local(
             else:
                 audio = _run_ffmpeg_resample(data)
                 audio_proc, proc_stats = _maybe_normalize_for_asr(audio)
-                extra = {**meta_extra, "ffmpeg": True, "audio_stats": proc_stats}
+                extra = {**meta_extra, "ffmpeg": True, "audio_stats": proc_stats, "vad_filter": bool(vad_filter)}
                 if allow_fallback:
                     transcription, meta, segments = _try_with_vad_fallback(
                         audio_proc, "wav_ffmpeg", extra, initial_prompt, no_speech_threshold, vad_filter, word_timestamps, proc_stats
@@ -497,7 +754,7 @@ def _transcribe_audio_bytes_local(
         # Other formats (mp3, m4a, etc.) - ffmpeg resample
         audio = _run_ffmpeg_resample(data)
         audio_proc, proc_stats = _maybe_normalize_for_asr(audio)
-        extra = {**meta_extra, "ffmpeg": True, "audio_stats": proc_stats}
+        extra = {**meta_extra, "ffmpeg": True, "audio_stats": proc_stats, "vad_filter": bool(vad_filter)}
         if allow_fallback:
             transcription, meta, segments = _try_with_vad_fallback(
                 audio_proc, "other_ffmpeg", extra, initial_prompt, no_speech_threshold, vad_filter, word_timestamps, proc_stats
@@ -542,6 +799,9 @@ def _parse_remote_response(payload: dict) -> Tuple[str, dict, list]:
             "ffmpeg": payload.get("ffmpeg_used", False),
             "fallback": payload.get("fallback_used", False),
             "audio_stats": payload.get("audio_stats"),
+            "max_no_speech_prob": payload.get("max_no_speech_prob", payload.get("no_speech_prob")),
+            "avg_logprob": payload.get("avg_logprob"),
+            "max_compression_ratio": payload.get("max_compression_ratio"),
             "process_time": payload.get("timing", {}).get("total", 0.0),
             "provider": "remote",
             "remote_url": TRANSCRIBE_API_URL,
@@ -819,8 +1079,14 @@ def build_transcribe_response(transcription: str, meta: dict, segments: list, de
         "vad_filter": meta.get("vad_filter", True),
         "fallback_used": bool(meta.get("fallback", False)),
         "audio_stats": meta.get("audio_stats"),
+        "max_no_speech_prob": meta.get("max_no_speech_prob"),
+        "avg_logprob": meta.get("avg_logprob"),
+        "max_compression_ratio": meta.get("max_compression_ratio"),
         "timing": {
             "total": meta.get("process_time", 0.0),
+            "read": meta.get("read_time", 0.0),
+            "wait": meta.get("wait_time", 0.0),
+            "process": meta.get("process_time", 0.0),
             "model": meta.get("process_time", 0.0),
         },
     }

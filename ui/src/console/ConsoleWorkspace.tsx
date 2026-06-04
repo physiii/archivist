@@ -31,15 +31,32 @@ import {
   subscribeAgentSessionsChanged,
 } from './lib/agentSessions'
 import AgentFleetPanel from './panels/FleetPanel'
-import SystemPanel from './panels/SystemPanel'
+import SystemPanel, { type SystemPanelStatus } from './panels/SystemPanel'
 import TestsPanel from './panels/TestsPanel'
 import { consoleBranding } from './config/branding'
 import { consoleEndpoints } from './config/endpoints'
 
 type ChatMessage = AgentChatMessage
+type ApiMessage = {
+  role?: unknown
+  text?: unknown
+  ts?: unknown
+  toolName?: string
+}
+type AgentSessionResponse = {
+  id: string
+  messages?: ApiMessage[]
+}
+type SsePayload = {
+  id?: string
+  input?: unknown
+  message?: string
+  name?: string
+  text?: string
+}
 
-function mapApiMessages(sessionId: string, rawMessages: any[]): ChatMessage[] {
-  return (rawMessages || []).map((message: any, index: number) => ({
+function mapApiMessages(sessionId: string, rawMessages: ApiMessage[]): ChatMessage[] {
+  return (rawMessages || []).map((message, index) => ({
     id: `${sessionId}-${index}`,
     role: message?.role === 'user' || message?.role === 'assistant' || message?.role === 'system' || message?.role === 'tool'
       ? message.role
@@ -50,7 +67,7 @@ function mapApiMessages(sessionId: string, rawMessages: any[]): ChatMessage[] {
   }))
 }
 
-export default function ConsoleWorkspace({ status }: { status?: any }) {
+export default function ConsoleWorkspace({ status }: { status?: SystemPanelStatus }) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
@@ -74,7 +91,9 @@ export default function ConsoleWorkspace({ status }: { status?: any }) {
     try {
       const rows = await getJson<SessionSummary[]>(consoleEndpoints.agentSessions)
       setSessions(rows || [])
-    } catch {}
+    } catch {
+      // Session history is optional; chat can still run without it.
+    }
   }, [])
 
   useEffect(() => {
@@ -92,21 +111,24 @@ export default function ConsoleWorkspace({ status }: { status?: any }) {
 
   async function loadSession(id: string) {
     try {
-      const r = await getJson<any>(consoleEndpoints.agentSession(id))
+      const r = await getJson<AgentSessionResponse>(consoleEndpoints.agentSession(id))
       setSessionId(r.id)
       setMessages(mapApiMessages(r.id, r.messages || []))
       setShowSessions(false)
-    } catch {}
+    } catch {
+      // Keep the current conversation visible if a stored session cannot load.
+    }
   }
 
-  function handleSSEEvent(event: string, data: any, appendText: (t: string) => void) {
+  function handleSSEEvent(event: string, data: SsePayload, appendText: (t: string) => void) {
     switch (event) {
       case 'text': if (data.text) appendText(data.text); break
       case 'result': break
       case 'system':
         if (data.text) {
+          const text = data.text
           setMessages(prev => [...prev, {
-            id: `sys-${Date.now()}`, role: 'system', text: data.text, ts: Date.now(),
+            id: `sys-${Date.now()}`, role: 'system', text, ts: Date.now(),
           }])
         }
         break
@@ -158,7 +180,7 @@ export default function ConsoleWorkspace({ status }: { status?: any }) {
           if (line.startsWith('event: ')) currentEvent = line.slice(7).trim()
           else if (line.startsWith('data: ')) {
             try {
-              const data = JSON.parse(line.slice(6))
+              const data = JSON.parse(line.slice(6)) as SsePayload
               handleSSEEvent(currentEvent, data, (t) => { fullText += t; setStreamingText(fullText) })
               if (currentEvent === 'session_start' && data.id) setSessionId(data.id)
               if (currentEvent === 'tool_use' && data.name) {
@@ -168,16 +190,20 @@ export default function ConsoleWorkspace({ status }: { status?: any }) {
                   ts: Date.now(), toolName: data.name,
                 }])
               }
-            } catch {}
+            } catch {
+              // Ignore malformed SSE fragments and keep consuming the stream.
+            }
           }
         }
       }
       if (fullText.trim()) {
         setMessages(prev => [...prev, { id: `a-${Date.now()}`, role: 'assistant', text: fullText.trim(), ts: Date.now() }])
       }
-    } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        setMessages(prev => [...prev, { id: `err-${Date.now()}`, role: 'system', text: `Error: ${err.message}`, ts: Date.now() }])
+    } catch (err) {
+      const errorName = err instanceof Error ? err.name : ''
+      if (errorName !== 'AbortError') {
+        const message = err instanceof Error ? err.message : String(err)
+        setMessages(prev => [...prev, { id: `err-${Date.now()}`, role: 'system', text: `Error: ${message}`, ts: Date.now() }])
       }
     } finally {
       setStreaming(false)
@@ -455,7 +481,7 @@ export default function ConsoleWorkspace({ status }: { status?: any }) {
 
       {activeTab === 2 && (
         <Box sx={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-          <SystemPanel status={status} />
+          <SystemPanel status={status ?? null} />
         </Box>
       )}
 

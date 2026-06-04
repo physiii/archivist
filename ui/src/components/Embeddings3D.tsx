@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
@@ -199,6 +199,7 @@ export default function Embeddings3D({
   const tooltipRef = useRef<HTMLDivElement | null>(null);
   const onSelectPointRef = useRef<Props["onSelectPoint"]>(onSelectPoint);
   const selectedRef = useRef<SelectedItem>(null);
+  const pointSizeRef = useRef(0.035);
   const [selected, setSelected] = useState<SelectedItem>(null);
   const [view, setView] = useState<"default" | "top" | "side" | "front">("default");
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -248,8 +249,15 @@ export default function Embeddings3D({
   }, [selected]);
 
   useEffect(() => {
+    let cancelled = false;
+    const syncSelected = (next: SetStateAction<SelectedItem>) => {
+      queueMicrotask(() => {
+        if (!cancelled) setSelected(next);
+      });
+    };
+
     if (externalSelection) {
-      setSelected({
+      syncSelected({
         kind: "point",
         point: {
           id: externalSelection.id,
@@ -268,25 +276,29 @@ export default function Embeddings3D({
       } else if (selectedMarkerRef.current) {
         selectedMarkerRef.current.visible = false;
       }
-      return;
-    }
-    if (selectedPointId === null || selectedPointId === undefined) {
-      setSelected((prev) => (prev?.kind === "point" ? null : prev));
+    } else if (selectedPointId === null || selectedPointId === undefined) {
+      syncSelected((prev) => (prev?.kind === "point" ? null : prev));
       if (selectedMarkerRef.current) selectedMarkerRef.current.visible = false;
-      return;
+    } else {
+      const matched = projected.find((entry) => String(entry.source.id) === String(selectedPointId));
+      if (matched) {
+        syncSelected({ kind: "point", point: matched.source });
+        if (selectedMarkerRef.current) {
+          selectedMarkerRef.current.visible = true;
+          selectedMarkerRef.current.position.set(matched.x, matched.y, matched.z);
+          const markerMat = selectedMarkerRef.current.material as THREE.MeshBasicMaterial;
+          markerMat.color.copy(matched.color);
+        }
+      }
     }
-    const matched = projected.find((entry) => String(entry.source.id) === String(selectedPointId));
-    if (!matched) return;
-    setSelected({ kind: "point", point: matched.source });
-    if (selectedMarkerRef.current) {
-      selectedMarkerRef.current.visible = true;
-      selectedMarkerRef.current.position.set(matched.x, matched.y, matched.z);
-      const markerMat = selectedMarkerRef.current.material as THREE.MeshBasicMaterial;
-      markerMat.color.copy(matched.color);
-    }
+
+    return () => {
+      cancelled = true;
+    };
   }, [externalSelection, projected, selectedPointId]);
 
   useEffect(() => {
+    pointSizeRef.current = pointSize;
     const cloud = cloudRef.current;
     if (!cloud) return;
     const material = cloud.material as THREE.PointsMaterial;
@@ -436,7 +448,7 @@ export default function Embeddings3D({
         }
       }
 
-      const pixelThreshold = Math.max(10, pointSize * 260);
+      const pixelThreshold = Math.max(10, pointSizeRef.current * 260);
       const thresholdSq = pixelThreshold * pixelThreshold;
       let pickedIndex = -1;
       let pickedDistanceSq = Number.POSITIVE_INFINITY;

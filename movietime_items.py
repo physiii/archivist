@@ -540,7 +540,7 @@ def search_movietime_items(
             sparse_req = AnnSearchRequest(
                 data=[clean_query],
                 anns_field="sparse",
-                param={"metric_type": "BM25", "params": {}},
+                param={"metric_type": "IP", "params": {}},
                 limit=topk,
                 expr=expr,
             )
@@ -562,7 +562,7 @@ def search_movietime_items(
             if use_bm25:
                 search_data = [clean_query]
                 anns_field = "sparse"
-                params = {"metric_type": "BM25", "params": {}}
+                params = {"metric_type": "IP", "params": {}}
             else:
                 query_vec = embed_text_to_vector(
                     [clean_query],

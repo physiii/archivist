@@ -1,7 +1,7 @@
 # main.py
 from flask import Flask, request, jsonify, send_from_directory, Response
 from load import load_to_vectorstore, load_text_to_vectorstore, clear_vectorstore_collection
-from search import search_vectorstore
+from search import CollectionLoadError, search_vectorstore
 import argparse
 import base64
 import copy
@@ -30,7 +30,7 @@ from uuid import uuid4
 import os
 import sys
 from werkzeug.exceptions import HTTPException
-from utils import LOCAL_EMBEDDING_MODEL, embed_text_to_vector, validate_embeddings
+from utils import LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_DIM, embed_text_to_vector, validate_embeddings
 from xml.etree import ElementTree as ET
 
 from backups_service import (
@@ -39,6 +39,7 @@ from backups_service import (
     delete_backup_target,
     get_backup_overview,
     get_run_logs,
+    list_backup_files,
     list_backup_targets,
     start_backup,
     start_scheduler_best_effort,
@@ -47,6 +48,8 @@ from backups_service import (
     update_backup_target,
     update_schedule,
 )
+from business_profile import business_matches_text, business_terms_label
+from embedding_health import check_embedding_service
 from indexing_service import (
     GOOGLE_ARCHIVE_CONTENT_VERSION,
     add_indexing_target,
@@ -72,24 +75,30 @@ from chat_store import (
     list_sessions,
     update_session_title,
 )
+import notifications
 import transcription_service
+import tts_service
 from agent_integration import (
+    agent_session_key,
+    agents_repo_root,
     build_agent_system_message,
     console_agent_id,
     decode_session_ref,
     default_web_session_key,
     encode_session_ref,
-    gateway_session_key,
     host_workspace,
     inspect_agent_runtime,
-    load_openclaw_config,
-    load_openclaw_messages_from_transcript,
-    load_openclaw_sessions_for_agents,
+    load_agent_messages_from_transcript,
+    load_agent_sessions_for_agents,
+    load_mcp_resources_for_status,
+    load_mcp_tools_for_status,
+    load_shared_skills,
     load_team_agents,
     registered_agent_ids,
-    resolve_gateway_token,
-    resolve_gateway_url,
-    resolve_openclaw_session_file,
+    resolve_agent_chat_model,
+    resolve_agent_executor_token,
+    resolve_agent_executor_url,
+    resolve_agent_session_file,
     session_kind,
     visible_agent_ids,
 )
@@ -112,6 +121,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 _WEB_BACKGROUND_TASKS_ENABLED = _env_flag("ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS", default=True)
+try:
+    GLOBAL_SEARCH_COLLECTION_LOAD_TIMEOUT = max(1.0, float(os.getenv("GLOBAL_SEARCH_COLLECTION_LOAD_TIMEOUT", "5")))
+except (TypeError, ValueError):
+    GLOBAL_SEARCH_COLLECTION_LOAD_TIMEOUT = 5.0
 
 if _WEB_BACKGROUND_TASKS_ENABLED:
     # Start backup/indexing schedulers once (best-effort; use file locks).
@@ -160,16 +173,69 @@ _STATUS_CACHE_LOCK = threading.Lock()
 _STATUS_CACHE: dict[str, tuple[float, dict]] = {}
 
 
+_STATUS_CACHE_REFRESHING: set = set()
+
+
 def _cached_status_payload(key: str, ttl_seconds: float, builder):
     now = time.time()
     with _STATUS_CACHE_LOCK:
         cached = _STATUS_CACHE.get(key)
         if cached and (now - cached[0]) <= ttl_seconds:
             return copy.deepcopy(cached[1])
+    # If we have stale data, return it immediately and refresh in background
+    if cached and key not in _STATUS_CACHE_REFRESHING:
+        _STATUS_CACHE_REFRESHING.add(key)
+        def _refresh():
+            try:
+                payload = builder()
+                with _STATUS_CACHE_LOCK:
+                    _STATUS_CACHE[key] = (time.time(), copy.deepcopy(payload))
+            finally:
+                _STATUS_CACHE_REFRESHING.discard(key)
+        threading.Thread(target=_refresh, daemon=True).start()
+        return copy.deepcopy(cached[1])
+    # No cached data at all — must block
     payload = builder()
     with _STATUS_CACHE_LOCK:
         _STATUS_CACHE[key] = (time.time(), copy.deepcopy(payload))
+    _STATUS_CACHE_REFRESHING.discard(key)
     return payload
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    """Fast liveness + CUDA/transcription check for the container healthcheck.
+
+    Deliberately avoids the heavy subsystem probes in /health (Milvus, embeddings,
+    Google) so the docker healthcheck reflects THIS container's GPU/transcription
+    health and server liveness — not external-dependency latency. Returns 200 when
+    healthy, 503 when CUDA is lost or transcription has fallen back to CPU.
+    """
+    out: dict = {"status": "ok"}
+    try:
+        import gpu_watchdog
+        gs = gpu_watchdog.status()
+        out["gpu"] = gs.get("state", "unknown")
+        if gs.get("state") == "lost":
+            out["status"] = "unhealthy"
+            out["gpu_error"] = gs.get("last_error")
+    except Exception as exc:
+        out["gpu"] = "error"
+        out["gpu_probe_error"] = str(exc)[:200]
+    try:
+        t = transcription_service.get_status()
+        dev = str(t.get("device") or "")
+        out["transcription_device"] = dev or None
+        out["transcription_available"] = bool(t.get("available"))
+        # Only fail on a confirmed CPU fallback (available but not on CUDA); a
+        # not-yet-loaded model at idle startup must NOT mark the container down.
+        if bool(t.get("available")) and dev and dev != "cuda":
+            out["status"] = "unhealthy"
+            out["transcription"] = "cpu_fallback"
+    except Exception as exc:
+        out["transcription"] = "error"
+        out["transcription_error"] = str(exc)[:200]
+    return jsonify(out), (200 if out["status"] == "ok" else 503)
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -185,6 +251,28 @@ def health_check():
         except Exception as exc:
             components["milvus"] = {"status": "error", "error": str(exc)[:200]}
             overall = "degraded"
+
+        try:
+            embedding_status = _cached_status_payload(
+                "embedding_service",
+                30,
+                lambda: check_embedding_service(
+                    host=EMBEDDING_HOST,
+                    port=EMBEDDING_PORT,
+                    model=LOCAL_EMBEDDING_MODEL,
+                ),
+            )
+            components["embeddings"] = embedding_status
+            if embedding_status.get("status") != "ok":
+                overall = "unhealthy"
+        except Exception as exc:
+            components["embeddings"] = {
+                "status": "error",
+                "severity": "error",
+                "model": LOCAL_EMBEDDING_MODEL,
+                "error": str(exc)[:200],
+            }
+            overall = "unhealthy"
 
         try:
             summary = _google_archive_summary()
@@ -209,7 +297,15 @@ def health_check():
             compat = pipeline_compat_status()
             stale_count = compat.get("stale", 0)
             broken_count = compat.get("broken", 0)
-            if stale_count > 0:
+            if broken_count > 0:
+                components["media_pipeline"] = {
+                    "status": "broken",
+                    "severity": "warning",
+                    "stale": stale_count,
+                    "broken": broken_count,
+                    "current": compat.get("current", 0),
+                }
+            elif stale_count > 0:
                 components["media_pipeline"] = {
                     "status": "stale",
                     "severity": "warning",
@@ -223,8 +319,46 @@ def health_check():
             components["media_pipeline"] = {"status": "error", "severity": "warning", "error": str(exc)[:200]}
 
         try:
-            backup_overview = get_backup_overview()
-            backup_files = backup_overview.get("backup_files", [])
+            t_status = transcription_service.get_status()
+            t_device = str(t_status.get("device") or "not_loaded")
+            t_available = bool(t_status.get("available"))
+            gpu = t_status.get("gpu") or {}
+            entry: dict = {
+                "device": t_device,
+                "device_index": t_status.get("device_index"),
+                "model": t_status.get("model"),
+                "local_model": t_status.get("local_model"),
+                "compute_type": t_status.get("local_compute_type") or t_status.get("compute_type"),
+                "provider": t_status.get("provider"),
+                "available": t_available,
+                "gpu_available": bool(gpu.get("available")),
+                "gpu_device_count": gpu.get("device_count"),
+                "gpu_device_names": gpu.get("device_names"),
+                "nvidia_visible_devices": gpu.get("nvidia_visible_devices"),
+                "error": t_status.get("error") or (t_status.get("backends", {}).get("local", {}).get("error")),
+            }
+            if not t_available:
+                entry["status"] = "error"
+                entry["severity"] = "error"
+                overall = "unhealthy"
+            elif t_device != "cuda":
+                entry["status"] = "cpu_fallback"
+                entry["severity"] = "error"
+                overall = "unhealthy"
+            else:
+                entry["status"] = "ok"
+                entry["severity"] = "ok"
+            components["transcription"] = entry
+        except Exception as exc:
+            components["transcription"] = {
+                "status": "error",
+                "severity": "error",
+                "error": str(exc)[:200],
+            }
+            overall = "unhealthy"
+
+        try:
+            backup_files = list_backup_files()
             if backup_files:
                 latest = backup_files[0]
                 modified = str(latest.get("modified_at") or "").strip()
@@ -245,10 +379,81 @@ def health_check():
         except Exception as exc:
             components["backups"] = {"status": "error", "severity": "warning", "error": str(exc)[:200]}
 
+        try:
+            import health_monitor
+            hs = health_monitor.status()
+            worst = "ok"
+            for info in hs.get("sources", {}).values():
+                if info["status"] == "down":
+                    worst = "error"; break
+                if info["status"] in ("stale", "unknown") and worst != "error":
+                    worst = "warning"
+            components["source_ingest"] = {
+                "status": worst,
+                "severity": worst,
+                "sources": hs.get("sources", {}),
+                "channels": hs.get("channels", {}),
+            }
+            if worst == "error":
+                overall = "unhealthy"
+        except Exception as exc:
+            components["source_ingest"] = {"status": "error", "severity": "warning", "error": str(exc)[:200]}
+
+        try:
+            import gpu_watchdog
+            gs = gpu_watchdog.status()
+            gpu_state = gs.get("state", "unknown")
+            if gpu_state == "lost":
+                components["gpu"] = {
+                    "status": "lost",
+                    "severity": "error",
+                    "error": gs.get("last_error"),
+                    "lost_since_ts": gs.get("lost_since_ts"),
+                    "loss_count": gs.get("loss_count"),
+                    "device_name": gs.get("device_name"),
+                }
+                overall = "unhealthy"
+            elif gpu_state == "ok":
+                components["gpu"] = {
+                    "status": "ok",
+                    "severity": "ok",
+                    "device_name": gs.get("device_name"),
+                }
+            else:
+                components["gpu"] = {"status": "unknown", "severity": "warning"}
+        except Exception as exc:
+            components["gpu"] = {"status": "error", "severity": "warning", "error": str(exc)[:200]}
+
         return {"status": overall, "components": components}
 
-    payload = _cached_status_payload("health", 15, _build_health_payload)
+    payload = _cached_status_payload("health", 60, _build_health_payload)
     return jsonify(payload), 200
+
+
+@app.route("/api/notifications/test", methods=["POST"])
+def api_notifications_test():
+    """Fire a test alert through all configured notification channels."""
+    body = request.get_json(force=True, silent=True) or {}
+    title = str(body.get("title") or "Archivist test alert").strip()
+    message = str(body.get("message") or "This is a test notification from Archivist.").strip()
+    severity = str(body.get("severity") or "info").strip()
+    result = notifications.send_all(title, message, severity)
+    return jsonify({
+        "ok": True,
+        "channels": result,
+        "configured": notifications.channels_configured(),
+    })
+
+
+@app.route("/api/embeddings/health", methods=["GET"])
+def api_embeddings_health():
+    payload = check_embedding_service(
+        host=request.args.get("host") or EMBEDDING_HOST,
+        port=request.args.get("port") or EMBEDDING_PORT,
+        model=request.args.get("model") or LOCAL_EMBEDDING_MODEL,
+    )
+    status_code = 200 if payload.get("status") == "ok" else 503
+    return jsonify(payload), status_code
 
 def _milvus_alias(prefix: str = "api") -> str:
     return f"{prefix}_{uuid4().hex}"
@@ -266,6 +471,52 @@ def _milvus_disconnect(alias: str) -> None:
         connections.disconnect(alias)
     except Exception:
         pass
+
+
+def _start_vectorstore_preload() -> None:
+    raw = os.getenv("VECTORSTORE_PRELOAD_COLLECTIONS", "")
+    requested = [item.strip() for item in raw.split(",") if item.strip()]
+    if not requested:
+        return
+
+    def _worker() -> None:
+        alias = _milvus_alias("preload")
+        try:
+            _milvus_connect(alias)
+            for requested_name in requested:
+                candidates = [requested_name]
+                if requested_name.startswith("documents_"):
+                    logical = requested_name.removeprefix("documents_")
+                    if logical:
+                        candidates.append(logical)
+                else:
+                    candidates.append(f"documents_{requested_name}")
+                raw_name = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if utility.has_collection(candidate, using=alias, timeout=MILVUS_CONNECT_TIMEOUT)
+                    ),
+                    None,
+                )
+                if not raw_name:
+                    app.logger.warning("Vectorstore preload skipped missing collection %s", requested_name)
+                    continue
+                try:
+                    if _milvus_load_state_label(raw_name, alias) == "loaded":
+                        app.logger.info("Vectorstore preload found %s already loaded", raw_name)
+                        continue
+                    coll = Collection(name=raw_name, using=alias)
+                    started = time.time()
+                    coll.load(timeout=MILVUS_LOAD_TIMEOUT)
+                    utility.wait_for_loading_complete(raw_name, using=alias, timeout=MILVUS_LOAD_TIMEOUT)
+                    app.logger.info("Vectorstore preloaded %s in %.1fs", raw_name, time.time() - started)
+                except Exception as exc:
+                    app.logger.warning("Vectorstore preload failed for %s: %s", raw_name, exc)
+        finally:
+            _milvus_disconnect(alias)
+
+    threading.Thread(target=_worker, name="vectorstore-preload", daemon=True).start()
 
 def _logical_collection_name(raw: str) -> str:
     return raw.removeprefix("documents_") if raw.startswith("documents_") else raw
@@ -363,6 +614,15 @@ def _vector_index_metric_from_collection(collection: Collection) -> str | None:
     except Exception:
         pass
     return None
+
+def _milvus_load_state_label(collection_name: str, alias: str) -> str:
+    try:
+        state = utility.load_state(collection_name, using=alias, timeout=1)
+    except Exception:
+        return "unknown"
+    return str(state).split(".")[-1].lower()
+
+_start_vectorstore_preload()
 
 def _vector_norm(values: list[float]) -> float:
     return math.sqrt(sum(v * v for v in values))
@@ -648,6 +908,8 @@ def api_search_collection(name: str):
             **search_options,
         )
         return jsonify({"results": results})
+    except CollectionLoadError as e:
+        return jsonify({"error": "Collection unavailable", "details": str(e)}), 503
     except Exception as e:
         app.logger.exception("Collection search failed for '%s'", name)
         return jsonify({"error": "Search failed", "details": str(e)}), 502
@@ -673,8 +935,21 @@ def api_collection_embeddings_preview(name: str):
 
         coll = Collection(name=raw_name, using=alias)
         # Milvus may unload collections during heavy ingest; ensure it's loaded before query.
-        coll.load()
-        utility.wait_for_loading_complete(raw_name, using=alias, timeout=MILVUS_LOAD_TIMEOUT)
+        if _milvus_load_state_label(raw_name, alias) != "loaded":
+            try:
+                coll.load(timeout=MILVUS_LOAD_TIMEOUT)
+                utility.wait_for_loading_complete(raw_name, using=alias, timeout=MILVUS_LOAD_TIMEOUT)
+            except Exception as exc:
+                state = _milvus_load_state_label(raw_name, alias)
+                return jsonify(
+                    {
+                        "error": "Collection unavailable",
+                        "details": (
+                            f"Collection {raw_name} could not be loaded for embeddings preview "
+                            f"(state={state}). Milvus may be memory constrained: {exc}"
+                        ),
+                    }
+                ), 503
         vector_dim = _vector_dim_from_collection(coll)
         vector_index_metric = _vector_index_metric_from_collection(coll)
         effective_metric_type = metric_type or vector_index_metric or "COSINE"
@@ -888,11 +1163,12 @@ def api_collection_embeddings_preview(name: str):
         if elapsed_ms is not None:
             app.logger.info("Embeddings preview for %s completed in %sms", raw_name, elapsed_ms)
         if coll is not None:
-            try:
-                coll.release()
-                app.logger.info("Released embeddings preview collection %s", raw_name)
-            except Exception as release_error:
-                app.logger.warning("Failed to release embeddings preview collection %s: %s", raw_name, release_error)
+            if _env_flag("VECTORSTORE_RELEASE_AFTER_PREVIEW", default=False):
+                try:
+                    coll.release()
+                    app.logger.info("Released embeddings preview collection %s", raw_name)
+                except Exception as release_error:
+                    app.logger.warning("Failed to release embeddings preview collection %s: %s", raw_name, release_error)
         _milvus_disconnect(alias)
 
 @app.route("/api/search/global", methods=["POST"])
@@ -911,6 +1187,14 @@ def api_search_global():
     embedding_host = payload.get("embedding_host", EMBEDDING_HOST)
     embedding_port = payload.get("embedding_port", EMBEDDING_PORT)
     search_options = _build_search_options(payload)
+    try:
+        collection_load_timeout = max(
+            1.0,
+            float(payload.get("collection_load_timeout", GLOBAL_SEARCH_COLLECTION_LOAD_TIMEOUT)),
+        )
+    except (TypeError, ValueError):
+        collection_load_timeout = GLOBAL_SEARCH_COLLECTION_LOAD_TIMEOUT
+    search_options["load_if_unloaded"] = bool(payload.get("load_unloaded_collections", False))
 
     alias = _milvus_alias("global_search")
     merged = []
@@ -920,6 +1204,23 @@ def api_search_global():
     finally:
         _milvus_disconnect(alias)
 
+    # Embed query ONCE and reuse the vector across all collections
+    precomputed_vector = None
+    mode_norm = str(mode or "dense").strip().lower()
+    if mode_norm in ("dense", "hybrid"):
+        try:
+            model = str(embedding_model or LOCAL_EMBEDDING_MODEL)
+            vectors = embed_text_to_vector(
+                [query], model, is_local=True,
+                ip_address=ip_address, embedding_host=embedding_host, embedding_port=embedding_port,
+            )
+            validated = validate_embeddings(vectors, LOCAL_EMBEDDING_DIM)
+            if validated and validated[0] is not None:
+                precomputed_vector = validated[0]
+        except Exception:
+            app.logger.warning("Global search: failed to pre-compute embedding, will embed per-collection")
+
+    skipped_collections = []
     for raw_name in sorted(collection_names):
         logical_name = _logical_collection_name(raw_name)
         try:
@@ -934,21 +1235,30 @@ def api_search_global():
                 ip_address=ip_address,
                 embedding_host=embedding_host,
                 embedding_port=embedding_port,
+                load_timeout=collection_load_timeout,
+                query_vector=precomputed_vector,
                 **search_options,
             )
             for h in hits:
                 h["collection"] = logical_name
                 h["collection_raw"] = raw_name
                 merged.append(h)
+        except CollectionLoadError as exc:
+            skipped_collections.append({"collection": logical_name, "reason": str(exc)})
+            app.logger.info("Global search skipped collection '%s': %s", logical_name, exc)
         except Exception:
             app.logger.exception("Global search failed for collection '%s'", logical_name)
 
     prefers_lower = _prefers_lower_distance_for_response(mode=mode, metric_type=search_options.get("metric_type"))
     merged.sort(
-        key=lambda item: item.get("distance", float("inf") if prefers_lower else float("-inf")),
+        key=lambda item: (
+            item.get("distance", float("inf"))
+            if prefers_lower
+            else item.get("ranking_score", item.get("distance", float("-inf")))
+        ),
         reverse=not prefers_lower,
     )
-    return jsonify({"results": merged[:limit], "total_candidates": len(merged)})
+    return jsonify({"results": merged[:limit], "total_candidates": len(merged), "skipped_collections": skipped_collections})
 
 @app.route("/api/collections/<name>/insert-text", methods=["POST"])
 def api_insert_text(name: str):
@@ -983,6 +1293,7 @@ def api_insert_text(name: str):
         line_by_line=line_by_line,
         chunk_size=chunk_size,
         overlap=overlap,
+        flush=True,
     )
     if isinstance(result, dict) and result.get("error"):
         return jsonify(result), 500
@@ -1216,6 +1527,8 @@ def api_indexing_target_index(target_id: str):
 def transcribe_endpoint():
     """Transcription endpoint - drop-in replacement for TranscribeServer."""
     if not transcription_service.is_available():
+        transcription_service.init_transcription_model()
+    if not transcription_service.is_available():
         return jsonify({"error": "Transcription service not available", "status": transcription_service.get_status()}), 503
 
     if "file" not in request.files:
@@ -1260,6 +1573,12 @@ def transcribe_status():
 @app.route("/transcribe", methods=["POST"])
 def transcribe_compat_endpoint():
     """Backward-compatible endpoint matching TranscribeServer's POST / contract."""
+    return transcribe_endpoint()
+
+
+@app.route("/", methods=["POST"])
+def transcribe_root_compat_endpoint():
+    """Legacy TranscribeServer clients POST to the service root."""
     return transcribe_endpoint()
 
 
@@ -1564,11 +1883,8 @@ def handle_exception(e: Exception):
     app.logger.error(traceback.format_exc())
     return jsonify({"error": "An unexpected error occurred"}), 500
 
-## ── Chat endpoint (OpenClaw proxy) ──────────────────────────────────
+## ── Chat endpoint (agent executor proxy) ────────────────────────────
 import re as _re
-
-_OPENCLAW_URL = os.environ.get("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789").rstrip("/")
-_OPENCLAW_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
 
 _AGENT_CHAT_SESSIONS: dict[str, list[dict]] = {}
 _AGENT_SESSION_META: dict[str, dict[str, object]] = {}
@@ -1578,12 +1894,12 @@ _SYSTEM_FLAGS: dict[str, bool] = {
     "speech_input_enabled": True,
 }
 try:
-    _FOCUS_MANUAL_PRIORITY_GATEWAY_TIMEOUT_S = max(
+    _FOCUS_MANUAL_PRIORITY_EXECUTOR_TIMEOUT_S = max(
         0.1,
-        float(os.getenv("ARCHIVIST_FOCUS_MANUAL_PRIORITY_GATEWAY_TIMEOUT_S", "2.0")),
+        float(os.getenv("ARCHIVIST_FOCUS_MANUAL_PRIORITY_EXECUTOR_TIMEOUT_S", "2.0")),
     )
 except (TypeError, ValueError):
-    _FOCUS_MANUAL_PRIORITY_GATEWAY_TIMEOUT_S = 2.0
+    _FOCUS_MANUAL_PRIORITY_EXECUTOR_TIMEOUT_S = 2.0
 try:
     _FOCUS_PRIORITY_AUTO_VERIFY_MAX_AGE_MINUTES = max(
         15,
@@ -1603,7 +1919,7 @@ _TEST_PROFILE_SPECS: dict[str, dict[str, object]] = {
         "id": "focus-priorities",
         "label": "Focus Priority Evals",
         "pytest_args": ["tests/test_focus_priority_console_eval.py"],
-        "owner_agents": ["archivist-verifier", "archivist-health"],
+        "owner_agents": ["verification-worker", "runtime-health-monitor"],
         "auto_run": True,
         "stale_after_minutes": _FOCUS_PRIORITY_AUTO_VERIFY_MAX_AGE_MINUTES,
     },
@@ -2076,7 +2392,7 @@ def _build_focus_priority_verification_snapshot(*, auto_schedule: bool) -> dict[
                 "title": "Focus priority evals missing",
                 "status": "open",
                 "severity": "high",
-                "authority": "archivist-verifier",
+                "authority": "verification-worker",
                 "kind": "verification",
                 "issue_code": "focus-priorities-missing",
                 "category": "verification",
@@ -2093,7 +2409,7 @@ def _build_focus_priority_verification_snapshot(*, auto_schedule: bool) -> dict[
                 "title": "Focus priority evals stale",
                 "status": "open",
                 "severity": "high",
-                "authority": "archivist-verifier",
+                "authority": "verification-worker",
                 "kind": "verification",
                 "issue_code": "focus-priorities-stale",
                 "category": "verification",
@@ -2114,7 +2430,7 @@ def _build_focus_priority_verification_snapshot(*, auto_schedule: bool) -> dict[
                 "title": "Focus priority evals failing",
                 "status": "open",
                 "severity": "critical",
-                "authority": "archivist-verifier",
+                "authority": "verification-worker",
                 "kind": "verification",
                 "issue_code": "focus-priorities-failing",
                 "category": "verification",
@@ -2135,7 +2451,7 @@ def _build_focus_priority_verification_snapshot(*, auto_schedule: bool) -> dict[
                 "title": "Focus priority performance regression",
                 "status": "open",
                 "severity": "high",
-                "authority": "archivist-health",
+                "authority": "runtime-health-monitor",
                 "kind": "performance",
                 "issue_code": "focus-priorities-performance",
                 "category": "performance",
@@ -2377,7 +2693,7 @@ def _local_agent_sessions() -> list[dict]:
 
 def _merged_agent_sessions() -> list[dict]:
     sessions_by_id = {session["id"]: session for session in _local_agent_sessions()}
-    for session in load_openclaw_sessions_for_agents(visible_agent_ids()):
+    for session in load_agent_sessions_for_agents(visible_agent_ids()):
         sessions_by_id[session["id"]] = session
     sessions = list(sessions_by_id.values())
     sessions.sort(key=lambda item: item.get("updatedAt", 0), reverse=True)
@@ -2406,29 +2722,27 @@ def _load_agent_session(session_id: str) -> dict | None:
                 for message in local
             ],
         }
-    for session in load_openclaw_sessions_for_agents([agent_id]):
+    for session in load_agent_sessions_for_agents([agent_id]):
         if session.get("id") != session_id:
             continue
-        session_file = resolve_openclaw_session_file(session.get("sessionFile"))
+        session_file = resolve_agent_session_file(session.get("sessionFile"))
         if not session_file:
             return None
         return {
             "id": session_id,
             "agentId": agent_id,
             "sessionKey": session_key,
-            "source": "openclaw",
-            "messages": load_openclaw_messages_from_transcript(session_file),
+            "source": "agents",
+            "messages": load_agent_messages_from_transcript(session_file),
         }
     return None
 
 
 def _agent_runtime_snapshot() -> dict:
-    config, config_path = load_openclaw_config()
     runtime = inspect_agent_runtime()
-    runtime["registered_agents"] = registered_agent_ids(config)
+    runtime["registered_agents"] = registered_agent_ids()
     runtime["visible_agent_ids"] = visible_agent_ids()
     runtime["host_workspace"] = host_workspace()
-    runtime["config_path"] = runtime.get("config_path") or (str(config_path) if config_path else None)
     return runtime
 
 
@@ -2437,11 +2751,12 @@ def _service_probes() -> list[dict]:
     runtime = _agent_runtime_snapshot()
     probes.append(
         {
-            "name": "OpenClaw Gateway",
+            "name": "Agent Knowledge Base",
             "ok": bool(runtime.get("available")),
             "status": 200 if runtime.get("available") else 503,
-            "target": resolve_gateway_url(),
+            "target": str(agents_repo_root()),
             "latency_ms": None,
+            "detail": f"{runtime.get('agents_count', 0)} agents, {runtime.get('skills_count', 0)} skills, {runtime.get('mcp_server_count', 0)} MCP entries",
         }
     )
     try:
@@ -2494,28 +2809,42 @@ def _focus_recording_lane_summary(root: Path = Path("/media/mass/recording"), ma
     if not root.is_dir():
         return []
 
-    date_dirs = sorted(
-        (
-            path
-            for path in root.iterdir()
-            if path.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.name)
-        ),
-        key=lambda path: path.name,
-        reverse=True,
-    )[:max_dates]
+    date_dirs: list[tuple[str, str, Path]] = []
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.name):
+            date_dirs.append((path.name, "frigate_hourly", path))
+            continue
+        if not re.fullmatch(r"\d{4}", path.name):
+            continue
+        for month_dir in path.iterdir():
+            if not month_dir.is_dir() or not re.fullmatch(r"\d{2}", month_dir.name):
+                continue
+            for day_dir in month_dir.iterdir():
+                if not day_dir.is_dir() or not re.fullmatch(r"\d{2}", day_dir.name):
+                    continue
+                date_dirs.append((f"{path.name}-{month_dir.name}-{day_dir.name}", "normalized", day_dir))
+
+    date_dirs = sorted(date_dirs, key=lambda item: item[0], reverse=True)[:max_dates]
     counts: dict[str, int] = {}
     latest_paths: dict[str, str] = {}
 
-    for date_dir in date_dirs:
-        for hour_dir in date_dir.iterdir():
-            if not hour_dir.is_dir():
-                continue
-            for lane_dir in hour_dir.iterdir():
-                if not lane_dir.is_dir():
+    for _date, layout, date_dir in date_dirs:
+        if layout == "normalized":
+            lane_dirs = [path for path in date_dir.iterdir() if path.is_dir()]
+        else:
+            lane_dirs = []
+            for hour_dir in date_dir.iterdir():
+                if not hour_dir.is_dir():
                     continue
-                lane_name = lane_dir.name
-                counts[lane_name] = counts.get(lane_name, 0) + 1
-                latest_paths.setdefault(lane_name, str(lane_dir))
+                lane_dirs.extend(path for path in hour_dir.iterdir() if path.is_dir())
+        for lane_dir in lane_dirs:
+            if not lane_dir.is_dir():
+                continue
+            lane_name = lane_dir.name
+            counts[lane_name] = counts.get(lane_name, 0) + 1
+            latest_paths.setdefault(lane_name, str(lane_dir))
 
     return [
         {
@@ -2620,6 +2949,7 @@ def _parse_focus_md(focus_path: Path | None = None) -> dict:
         "critical_path": [],
         "blockers": [],
         "direct_reports": [],
+        "detail_sections": [],
     }
 
     # Header: week title
@@ -2678,7 +3008,7 @@ def _parse_focus_md(focus_path: Path | None = None) -> dict:
         return rows
 
     result["priorities"] = _parse_md_table(r"## This Week.*?Priority Order\s*\n")
-    result["calendar"] = _parse_md_table(r"## Calendar\s*\n")
+    result["calendar"] = _parse_md_table(r"## Calendar(?:\s+Anchors)?\s*\n")
     result["blockers"] = _parse_md_table(r"## Blockers\s*\n")
 
     # Critical path: numbered bold items
@@ -2716,15 +3046,16 @@ def _parse_focus_md(focus_path: Path | None = None) -> dict:
                 break
         result["direct_reports"].append({"name": name, "focus": focus_area, "this_week": this_week_items})
 
-    # Detail sections: ### N. Title under ## Details
+    # Detail sections: ### N. Title or ### Na. Title under ## Details
     details_match = re.search(r"## Details\s*\n", text)
     result["details"] = {}
     if details_match:
         details_text = text[details_match.end():]
-        detail_pattern = re.compile(r"^### (\d+)\.\s+(.+?)$", re.MULTILINE)
+        detail_pattern = re.compile(r"^### (\d+[a-z]?)\.\s+(.+?)$", re.IGNORECASE | re.MULTILINE)
         detail_matches = list(detail_pattern.finditer(details_text))
         for i, dm in enumerate(detail_matches):
-            num = dm.group(1)
+            num = dm.group(1).lower()
+            title = _strip_md(dm.group(2).strip())
             body_start = dm.end()
             body_end = detail_matches[i + 1].start() if i + 1 < len(detail_matches) else len(details_text)
             # Stop at the next ## section
@@ -2733,6 +3064,7 @@ def _parse_focus_md(focus_path: Path | None = None) -> dict:
                 body_end = body_start + next_h2.start()
             body = details_text[body_start:body_end].strip().rstrip("-").strip()
             result["details"][num] = body
+            result["detail_sections"].append({"num": num, "title": title, "body": body})
 
     # Open Questions: bullet list under ## Open Questions
     oq_match = re.search(r"## Open Questions\s*\n", text)
@@ -2775,6 +3107,53 @@ def _focus_overview_payload(focus_path: Path | None = None) -> dict:
     direct_reports = focus.get("direct_reports", [])
     open_questions = focus.get("open_questions", [])
     product_ideas = focus.get("product_ideas", [])
+    detail_sections = [item for item in (focus.get("detail_sections") or []) if isinstance(item, dict)]
+
+    def _focus_detail_tokens(value: str) -> set[str]:
+        stop_words = {
+            "and",
+            "the",
+            "for",
+            "with",
+            "from",
+            "this",
+            "that",
+            "live",
+            "close",
+            "confirm",
+            "status",
+            "action",
+            "owner",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+            if len(token) > 2 and token not in stop_words
+        }
+
+    def _detail_for_priority(priority: dict) -> str:
+        title = _strip_md(str(priority.get("what") or ""))
+        title_tokens = _focus_detail_tokens(title)
+        if not title_tokens:
+            return ""
+        best_score = 0.0
+        best_body = ""
+        for detail in detail_sections:
+            detail_title = str(detail.get("title") or "")
+            detail_tokens = _focus_detail_tokens(detail_title)
+            if not detail_tokens:
+                continue
+            overlap = title_tokens & detail_tokens
+            if not overlap:
+                continue
+            score = len(overlap) / max(1, min(len(title_tokens), len(detail_tokens)))
+            if score > best_score:
+                best_score = score
+                best_body = str(detail.get("body") or "")
+        if best_score >= 0.35:
+            return best_body
+        num = str(priority.get("#") or "").strip().lower()
+        return str(focus.get("details", {}).get(num) or "")
 
     # Attach detail_md to each priority by matching on the # column
     priority_items = []
@@ -2786,7 +3165,7 @@ def _focus_overview_payload(focus_path: Path | None = None) -> dict:
             "owner": _strip_md(p.get("owner", "")),
             "status": _strip_md(p.get("status", "")),
             "next_action": _strip_md(p.get("next_action", "")),
-            "detail_md": details.get(num, ""),
+            "detail_md": _detail_for_priority(p),
         }
         priority_items.append(item)
 
@@ -2834,7 +3213,8 @@ def _focus_overview_payload(focus_path: Path | None = None) -> dict:
             "items": [{"name": dr.get("name", ""), "focus": dr.get("focus", ""), "this_week": dr.get("this_week", [])} for dr in direct_reports],
         })
 
-    if open_questions:
+    include_backlog_sections = os.getenv("ARCHIVIST_FOCUS_INCLUDE_BACKLOG_SECTIONS", "").strip().lower() in {"1", "true", "yes"}
+    if include_backlog_sections and open_questions:
         sections.append({
             "id": "open_questions",
             "title": f"Open Questions ({len(open_questions)})",
@@ -2842,7 +3222,7 @@ def _focus_overview_payload(focus_path: Path | None = None) -> dict:
             "items": open_questions,
         })
 
-    if product_ideas:
+    if include_backlog_sections and product_ideas:
         sections.append({
             "id": "product_ideas",
             "title": "Product Ideas",
@@ -2909,7 +3289,9 @@ _FOCUS_SYNC_ROOT = Path(os.getenv("ARCHIVIST_FOCUS_STATE_DIR", "~/.config/archiv
 _FOCUS_PERSONAL_SNAPSHOT_FILE = _FOCUS_SYNC_ROOT / "personal_focus.json"
 _FOCUS_MANUAL_PRIORITIES_FILE = _FOCUS_SYNC_ROOT / "manual_priorities.json"
 _FOCUS_SCHEDULE_STATE_FILE = _FOCUS_SYNC_ROOT / ".schedule.json"
-_FOCUS_WORK_NOTES_ROOT = Path(os.getenv("ARCHIVIST_WORK_NOTES_ROOT", "/home/andy/vnotes")).expanduser()
+_DEFAULT_FOCUS_WORK_NOTES_ROOT = Path("/home/andy/vnotes").expanduser()
+_FOCUS_WORK_NOTES_ROOT = Path(os.getenv("ARCHIVIST_WORK_NOTES_ROOT", str(_DEFAULT_FOCUS_WORK_NOTES_ROOT))).expanduser()
+_FOCUS_VERSANT_DOCS_ROOT = Path(os.getenv("ARCHIVIST_VERSANT_DOCS_ROOT", "/media/mass/Documents/versant-home/versant")).expanduser()
 _FOCUS_SYNC_TIME_OF_DAY = str(os.getenv("ARCHIVIST_FOCUS_SYNC_TIME", "05:30")).strip() or "05:30"
 _FOCUS_SYNC_TIMEZONE = str(os.getenv("ARCHIVIST_FOCUS_SYNC_TIMEZONE", os.getenv("TZ", "America/Chicago"))).strip() or "America/Chicago"
 try:
@@ -2924,7 +3306,7 @@ try:
     _FOCUS_MANUAL_PRIORITY_LIMIT = max(1, int(os.getenv("ARCHIVIST_FOCUS_MANUAL_PRIORITY_LIMIT", "8")))
 except (TypeError, ValueError):
     _FOCUS_MANUAL_PRIORITY_LIMIT = 8
-_FOCUS_PROMPT_VERSION = 1
+_FOCUS_PROMPT_VERSION = 6
 _FOCUS_WEEK_DIR_RE = re.compile(r"^WEEK(\d+)$", re.IGNORECASE)
 _FOCUS_WORK_TEXT_PATTERNS = [
     re.compile(
@@ -2939,7 +3321,7 @@ _FOCUS_PERSONAL_TEXT_PATTERNS = [
 ]
 _FOCUS_WORK_ACCOUNT_HINTS = [
     item.strip().lower()
-    for item in str(os.getenv("ARCHIVIST_FOCUS_WORK_ACCOUNT_HINTS", "pyfi.org,versant")).split(",")
+    for item in str(os.getenv("ARCHIVIST_FOCUS_WORK_ACCOUNT_HINTS", "pyfi.org,versant,gigantor,vivonics")).split(",")
     if item.strip()
 ]
 _FOCUS_PERSONAL_SYNC_STATE: dict[str, object] = {
@@ -3140,39 +3522,39 @@ def _focus_manual_priority_context_payload(lane_id: str) -> dict:
     }
 
 
-def _focus_manual_priority_gateway_json(*, lane_id: str, purpose: str, system_prompt: str, user_prompt: str) -> dict | None:
+def _focus_manual_priority_executor_json(*, lane_id: str, purpose: str, system_prompt: str, user_prompt: str) -> dict | None:
     result_holder: dict[str, object] = {"payload": None}
 
     def _worker() -> None:
-        result_holder["payload"] = _focus_call_gateway_json(
+        result_holder["payload"] = _focus_call_executor_json(
             lane_id=lane_id,
             purpose=purpose,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            timeout=max(1, int(math.ceil(_FOCUS_MANUAL_PRIORITY_GATEWAY_TIMEOUT_S))),
+            timeout=max(1, int(math.ceil(_FOCUS_MANUAL_PRIORITY_EXECUTOR_TIMEOUT_S))),
         )
 
     started = time.perf_counter()
     worker = threading.Thread(
         target=_worker,
         daemon=True,
-        name=f"focus-manual-gateway-{lane_id}",
+        name=f"focus-manual-executor-{lane_id}",
     )
     worker.start()
-    worker.join(_FOCUS_MANUAL_PRIORITY_GATEWAY_TIMEOUT_S)
+    worker.join(_FOCUS_MANUAL_PRIORITY_EXECUTOR_TIMEOUT_S)
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
     if worker.is_alive():
         logging.warning(
-            "focus manual priority gateway call timed out lane=%s purpose=%s elapsed_ms=%.1f budget_s=%.2f",
+            "focus manual priority executor call timed out lane=%s purpose=%s elapsed_ms=%.1f budget_s=%.2f",
             lane_id,
             purpose,
             elapsed_ms,
-            _FOCUS_MANUAL_PRIORITY_GATEWAY_TIMEOUT_S,
+            _FOCUS_MANUAL_PRIORITY_EXECUTOR_TIMEOUT_S,
         )
         return None
     payload = result_holder.get("payload")
     logging.info(
-        "focus manual priority gateway call completed lane=%s purpose=%s elapsed_ms=%.1f gateway_used=%s",
+        "focus manual priority executor call completed lane=%s purpose=%s elapsed_ms=%.1f executor_used=%s",
         lane_id,
         purpose,
         elapsed_ms,
@@ -3181,7 +3563,7 @@ def _focus_manual_priority_gateway_json(*, lane_id: str, purpose: str, system_pr
     return payload if isinstance(payload, dict) else None
 
 
-def _focus_structure_manual_priority_entry(lane_id: str, text: str, *, allow_gateway: bool = True) -> dict:
+def _focus_structure_manual_priority_entry(lane_id: str, text: str, *, allow_executor: bool = True) -> dict:
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
     now_utc = datetime.now(timezone.utc)
     entry = {
@@ -3194,9 +3576,9 @@ def _focus_structure_manual_priority_entry(lane_id: str, text: str, *, allow_gat
         "detail_md": clean,
     }
     payload = None
-    if allow_gateway:
+    if allow_executor:
         context_payload = _focus_manual_priority_context_payload(lane_id)
-        payload = _focus_manual_priority_gateway_json(
+        payload = _focus_manual_priority_executor_json(
             lane_id=f"manual-{lane_id}",
             purpose=f"manual-priority-{entry['id'][:12]}",
             system_prompt=(
@@ -3345,12 +3727,12 @@ def _focus_apply_manual_priority_note(lane_id: str, text: str) -> dict:
     existing_entries = list(payload.get(lane_key) or [])
     now_utc = datetime.now(timezone.utc)
     context_payload = _focus_manual_priority_context_payload(lane_key)
-    gateway_payload = _focus_manual_priority_gateway_json(
+    executor_payload = _focus_manual_priority_executor_json(
         lane_id=f"manual-{lane_key}",
         purpose=f"manual-priority-update-{sha256(clean.encode('utf-8')).hexdigest()[:12]}",
         system_prompt=(
             "You revise a lane's manual priority list from a human note. "
-            "The manual list is the editable layer on top of archive-driven focus. "
+            "The manual list sits above the source-derived focus lane. "
             "You may add, remove, rewrite, merge, split, or reorder manual items. "
             "Do not invent facts, deadlines, or names that are not in the note or existing items. "
             "Return only valid JSON."
@@ -3375,7 +3757,7 @@ def _focus_apply_manual_priority_note(lane_id: str, text: str) -> dict:
             "- Use an empty id for any new item.\n"
             "- If the note removes or resolves something, leave it out of the returned items.\n"
             "- If the note reorders priorities, return the items in that order.\n"
-            "- Update only the manual list. The archive-driven lane context is reference-only.\n"
+            "- Update only the manual list. The lane context is reference-only.\n"
             "- If the note is exploratory and does not imply a concrete change, keep the list as-is.\n"
             f"Lane context:\n{json.dumps(context_payload, indent=2)}\n\n"
             f"Current manual priorities:\n{json.dumps(_focus_manual_priority_model_payload(existing_entries), indent=2)}\n\n"
@@ -3384,8 +3766,8 @@ def _focus_apply_manual_priority_note(lane_id: str, text: str) -> dict:
     )
 
     next_entries: list[dict] | None = None
-    if isinstance(gateway_payload, dict) and isinstance(gateway_payload.get("items"), list):
-        raw_items = list(gateway_payload.get("items") or [])
+    if isinstance(executor_payload, dict) and isinstance(executor_payload.get("items"), list):
+        raw_items = list(executor_payload.get("items") or [])
         existing_by_id = {
             str(entry.get("id") or "").strip(): entry
             for entry in existing_entries
@@ -3409,7 +3791,7 @@ def _focus_apply_manual_priority_note(lane_id: str, text: str) -> dict:
 
     if next_entries is None:
         logging.info("focus manual priority note fell back to local entry lane=%s", lane_key)
-        entry = _focus_structure_manual_priority_entry(lane_key, clean, allow_gateway=False)
+        entry = _focus_structure_manual_priority_entry(lane_key, clean, allow_executor=False)
         next_entries = [entry, *existing_entries][: _FOCUS_MANUAL_PRIORITY_LIMIT]
 
     payload[lane_key] = next_entries
@@ -3563,6 +3945,8 @@ def _focus_recent_business_journal_items() -> list[dict]:
             status = f"Recent {day.strftime('%b %-d')}"
         for group in day_payload.get("evidence") or []:
             source = str(group.get("key") or "").strip()
+            if source == "calendar":
+                continue
             for evidence in group.get("items") or []:
                 title = str(evidence.get("title") or "").strip()
                 detail = str(evidence.get("detail") or "").strip()
@@ -3706,10 +4090,50 @@ def _focus_business_archive_sections() -> tuple[list[dict], str]:
     return sections, context
 
 
+def _focus_business_note_roots() -> list[Path]:
+    roots = [_FOCUS_WORK_NOTES_ROOT]
+    extra_raw = str(os.getenv("ARCHIVIST_BUSINESS_FOCUS_ROOTS", "") or "").strip()
+    for raw in re.split(r"[:;]", extra_raw):
+        if raw.strip():
+            roots.append(Path(raw.strip()).expanduser())
+    if _FOCUS_WORK_NOTES_ROOT == _DEFAULT_FOCUS_WORK_NOTES_ROOT:
+        roots.append(_FOCUS_VERSANT_DOCS_ROOT)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def _focus_business_source_label(root: Path, week_dir: Path | None = None) -> str:
+    text = str(root).lower()
+    if "versant-home" in text or root.name.lower() == "versant":
+        if week_dir is not None and week_dir.name:
+            return f"Versant docs · {week_dir.name}"
+        return "Versant docs"
+    if week_dir is not None and week_dir.name:
+        return f"Latest business notes · {week_dir.name}"
+    return "Latest business notes"
+
+
 def _focus_work_bundle() -> dict:
-    root = _FOCUS_WORK_NOTES_ROOT
     candidates: list[tuple[float, int, Path]] = []
-    if root.is_dir():
+    scanned_roots = _focus_business_note_roots()
+    for root in scanned_roots:
+        if not root.is_dir():
+            continue
+        direct_focus = root / "FOCUS.md"
+        if direct_focus.is_file():
+            try:
+                mtime = direct_focus.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            candidates.append((mtime, -1, root))
         for child in root.iterdir():
             if not child.is_dir():
                 continue
@@ -3727,16 +4151,18 @@ def _focus_work_bundle() -> dict:
 
     if candidates:
         _, _, week_dir = sorted(candidates, key=lambda item: (-item[0], -item[1], str(item[2])))[0]
+        root = week_dir.parent if week_dir.name.upper().startswith("WEEK") else week_dir
         focus_path = week_dir / "FOCUS.md"
         schedule_path = week_dir / "SCHEDULE.md"
         journal_path = root / "JOURNAL.md"
         return {
             "available": True,
-            "label": week_dir.name,
+            "label": _focus_business_source_label(root, week_dir),
             "root": str(root),
             "focus_path": focus_path,
             "schedule_path": schedule_path if schedule_path.is_file() else None,
             "journal_path": journal_path if journal_path.is_file() else None,
+            "fallback": False,
         }
 
     fallback_focus = Path(__file__).resolve().parent / "FOCUS.md"
@@ -3744,9 +4170,11 @@ def _focus_work_bundle() -> dict:
         "available": fallback_focus.is_file(),
         "label": "repo",
         "root": str(fallback_focus.parent),
+        "searched_roots": [str(root) for root in scanned_roots],
         "focus_path": fallback_focus if fallback_focus.is_file() else None,
         "schedule_path": None,
         "journal_path": None,
+        "fallback": True,
     }
 
 
@@ -3791,16 +4219,28 @@ def _build_work_focus_lane() -> dict:
     if bundle.get("label") and bundle.get("label") != "repo":
         subtitle = f"{subtitle} · {bundle['label']}" if subtitle else str(bundle["label"])
 
-    fallback_source = str(bundle.get("label") or "") == "repo"
+    fallback_source = bool(bundle.get("fallback")) or str(bundle.get("label") or "") == "repo"
     notes_stale = _focus_business_notes_stale(parsed, fallback_source=fallback_source)
     archive_sections, archive_context = _focus_business_archive_sections()
     notes_sections = list(parsed.get("sections") or [])
     if notes_stale:
         for section in notes_sections:
             if section.get("id") == "priorities":
-                section["title"] = "Priorities (Notes)"
+                section["title"] = "Priorities"
                 break
-    sections = [*archive_sections, *notes_sections] if notes_stale else [*notes_sections, *archive_sections]
+    sections = [*notes_sections, *archive_sections]
+    priority_order = {
+        "manual_priorities": 0,
+        "priorities": 1,
+        "current_business_signals": 2,
+        "critical_path": 3,
+        "calendar": 4,
+        "blockers": 5,
+        "recent_business_meetings": 6,
+        "recent_project_signals": 7,
+        "direct_reports": 8,
+    }
+    sections.sort(key=lambda section: (priority_order.get(str(section.get("id") or ""), 50), str(section.get("title") or "")))
     context_bits = []
     if archive_context and (notes_stale or not notes_sections):
         context_bits.append(archive_context)
@@ -3812,7 +4252,9 @@ def _build_work_focus_lane() -> dict:
     if fallback_source:
         source_warning = f"Business notes root {_FOCUS_WORK_NOTES_ROOT} was not found; showing repo fallback notes plus archive signals."
     elif notes_stale:
-        source_warning = "Business notes appear older than the current focus window; archive signals are shown first."
+        source_warning = "Business notes appear older than the current focus window; archive signals are included for cross-check."
+
+    source_label = "Fallback business notes" if fallback_source else str(bundle.get("label") or "Latest business notes")
 
     return {
         "id": "work",
@@ -3820,7 +4262,7 @@ def _build_work_focus_lane() -> dict:
         "subtitle": subtitle,
         "context": " ".join(context_bits).strip(),
         "available": bool(parsed.get("available")) or bool(archive_sections),
-        "sourceLabel": "Fallback business notes" if fallback_source else "Latest business notes",
+        "sourceLabel": source_label,
         "sourcePath": str(focus_path),
         "generatedAt": latest_source_at,
         "sections": sections,
@@ -3834,7 +4276,7 @@ def _focus_text_is_work_like(value: str | None) -> bool:
     text = str(value or "").strip()
     if not text:
         return False
-    return any(pattern.search(text) for pattern in _FOCUS_WORK_TEXT_PATTERNS)
+    return business_matches_text(text) or any(pattern.search(text) for pattern in _FOCUS_WORK_TEXT_PATTERNS)
 
 
 def _focus_text_is_personal_like(value: str | None) -> bool:
@@ -3958,9 +4400,10 @@ def _focus_parse_json_blob(text: str) -> dict | None:
     return None
 
 
-def _focus_call_gateway_json(*, lane_id: str, purpose: str, system_prompt: str, user_prompt: str, timeout: int = 90) -> dict | None:
-    gateway_token = resolve_gateway_token()
-    if not gateway_token:
+def _focus_call_executor_json(*, lane_id: str, purpose: str, system_prompt: str, user_prompt: str, timeout: int = 90) -> dict | None:
+    executor_token = resolve_agent_executor_token()
+    executor_url = resolve_agent_executor_url()
+    if not executor_token or not executor_url:
         return None
 
     try:
@@ -3968,21 +4411,21 @@ def _focus_call_gateway_json(*, lane_id: str, purpose: str, system_prompt: str, 
 
         agent_id = str(os.getenv("ARCHIVIST_FOCUS_SYNC_AGENT_ID", console_agent_id())).strip() or console_agent_id()
         response = _requests.post(
-            f"{resolve_gateway_url()}/v1/chat/completions",
+            f"{executor_url}/v1/chat/completions",
             json={
-                "model": f"openclaw/{agent_id}",
+                "model": resolve_agent_chat_model(agent_id),
                 "stream": False,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "user": gateway_session_key(agent_id, f"focus:{lane_id}:{purpose}"),
+                "user": agent_session_key(agent_id, f"focus:{lane_id}:{purpose}"),
             },
             headers={
-                "Authorization": f"Bearer {gateway_token}",
+                "Authorization": f"Bearer {executor_token}",
                 "Content-Type": "application/json",
-                "x-openclaw-agent-id": agent_id,
-                "x-openclaw-session-key": gateway_session_key(agent_id, f"focus:{lane_id}:{purpose}"),
+                "x-agent-id": agent_id,
+                "x-agent-session-key": agent_session_key(agent_id, f"focus:{lane_id}:{purpose}"),
             },
             timeout=timeout,
         )
@@ -3991,7 +4434,7 @@ def _focus_call_gateway_json(*, lane_id: str, purpose: str, system_prompt: str, 
         content = str(payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
         return _focus_parse_json_blob(content)
     except Exception:
-        logging.exception("focus sync gateway call failed for %s", lane_id)
+        logging.exception("focus sync executor call failed for %s", lane_id)
         return None
 
 
@@ -4004,6 +4447,122 @@ def _focus_priority_item(num: int, title: str, status: str, next_action: str, de
         "next_action": _focus_trim(next_action, 160),
         "detail_md": detail_md.strip(),
     }
+
+
+_FOCUS_PERSONAL_GENERIC_TITLE_RE = re.compile(
+    r"^(?:planning and coordination|household logistics|family logistics|travel logistics|paperwork and finance|"
+    r"health and appointments|personal logistics|coordination)\s+(?:around|for)\s+",
+    re.IGNORECASE,
+)
+_FOCUS_PERSONAL_GENERIC_EVENTS = {
+    "planning and coordination",
+    "household logistics",
+    "family logistics",
+    "travel logistics",
+    "paperwork and finance",
+    "health and appointments",
+    "personal logistics",
+    "coordination",
+}
+
+
+def _focus_clean_personal_title(value: str) -> str:
+    title = _focus_trim(str(value or "").strip(), 120)
+    title = _FOCUS_PERSONAL_GENERIC_TITLE_RE.sub("", title).strip()
+    if title.lower().startswith("the "):
+        title = title[4:].strip()
+    if title:
+        title = title[0].upper() + title[1:]
+    return title
+
+
+def _focus_scheduled_subject(value: str) -> str:
+    match = re.search(r"\bScheduled:\s*(.+?)(?:\.\s*|$)", str(value or ""), re.IGNORECASE)
+    return _focus_clean_personal_title(match.group(1)) if match else ""
+
+
+def _focus_clean_personal_next_action(value: str, fallback_title: str = "") -> str:
+    clean = str(value or "").strip()
+    scheduled = _focus_scheduled_subject(clean)
+    if scheduled:
+        clean = scheduled
+    clean = re.sub(r"^Scheduled:\s*", "", clean, flags=re.IGNORECASE).strip()
+    clean = clean.rstrip(".")
+    return _focus_trim(clean or fallback_title or "Check the source details.", 160)
+
+
+def _focus_clean_personal_detail(value: str, *, title: str, next_action: str) -> str:
+    lines = []
+    for raw_line in str(value or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^Primary signal is\b", line, re.IGNORECASE):
+            continue
+        if re.match(r"^Most of the visible signal\b", line, re.IGNORECASE):
+            continue
+        if re.match(r"^Personal logistics:\s*", line, re.IGNORECASE):
+            continue
+        lines.append(_focus_clean_personal_next_action(line, title))
+    compact = "\n\n".join(line for line in lines if line)
+    if not compact and next_action:
+        compact = next_action
+    return compact.strip()
+
+
+def _focus_clean_personal_lane(lane: dict) -> dict:
+    cleaned = copy.deepcopy(lane)
+    sections = []
+    for section in list(cleaned.get("sections") or []):
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("id") or "")
+        section_copy = copy.deepcopy(section)
+        if section_copy.get("kind") == "priority_table":
+            items = []
+            for item in list(section_copy.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                item_copy = copy.deepcopy(item)
+                title = _focus_clean_personal_title(str(item_copy.get("title") or ""))
+                next_action = _focus_clean_personal_next_action(str(item_copy.get("next_action") or ""), title)
+                item_copy["title"] = title
+                item_copy["next_action"] = next_action
+                item_copy["detail_md"] = _focus_clean_personal_detail(
+                    str(item_copy.get("detail_md") or ""),
+                    title=title,
+                    next_action=next_action,
+                )
+                items.append(item_copy)
+            section_copy["items"] = items
+        elif section_id == "upcoming" and section_copy.get("kind") == "table":
+            rows = []
+            for row in list(section_copy.get("items") or []):
+                if not isinstance(row, dict):
+                    continue
+                row_copy = copy.deepcopy(row)
+                event = _focus_clean_personal_title(str(row_copy.get("event") or ""))
+                why = _focus_clean_personal_next_action(str(row_copy.get("why") or ""), event)
+                if event.lower() in _FOCUS_PERSONAL_GENERIC_EVENTS:
+                    event = _focus_scheduled_subject(str(row_copy.get("why") or "")) or event
+                row_copy["event"] = event
+                row_copy["why"] = why
+                rows.append(row_copy)
+            section_copy["items"] = rows
+        elif section_id == "watchlist" and section_copy.get("kind") == "list":
+            watchlist_items = []
+            for item in list(section_copy.get("items") or []):
+                clean = _focus_trim(str(item or "").strip(), 160)
+                if not clean:
+                    continue
+                clean = re.sub(r"^Main signal:\s*", "", clean, flags=re.IGNORECASE)
+                clean = re.sub(r"\.\s*Related personal/logistics:\s*", ". ", clean, flags=re.IGNORECASE)
+                clean = re.sub(r"^Related personal/logistics:\s*", "", clean, flags=re.IGNORECASE)
+                watchlist_items.append(clean.strip())
+            section_copy["items"] = watchlist_items
+        sections.append(section_copy)
+    cleaned["sections"] = sections
+    return cleaned
 
 
 def _focus_manual_priority_items(lane_id: str) -> list[dict]:
@@ -4080,7 +4639,7 @@ def _build_personal_focus_fallback_lane(source_context: dict) -> dict:
                 len(priority_items) + 1,
                 title,
                 status,
-                next_action or "Review the supporting signals for this day.",
+                next_action or "Check the source details.",
                 "\n\n".join(bit for bit in detail_bits if bit),
             )
         )
@@ -4108,9 +4667,11 @@ def _build_personal_focus_fallback_lane(source_context: dict) -> dict:
 
     context_lines = []
     if priority_items:
-        context_lines.append(f"Personal focus is being inferred from {len(priority_items)} recent or upcoming personal signals.")
+        context_lines.append(f"{len(priority_items)} personal signal(s) selected.")
     if upcoming_rows:
-        context_lines.append(f"There are {len(upcoming_rows)} upcoming calendar-backed personal items in the next week.")
+        context_lines.append(f"{len(upcoming_rows)} upcoming item(s) in the next week.")
+    if not context_lines:
+        context_lines.append("No current personal evidence in this focus window.")
 
     sections = []
     if priority_items:
@@ -4120,17 +4681,17 @@ def _build_personal_focus_fallback_lane(source_context: dict) -> dict:
     if watchlist:
         sections.append({"id": "watchlist", "title": "Watchlist", "kind": "list", "items": watchlist})
 
-    return {
+    return _focus_clean_personal_lane({
         "id": "personal",
         "title": "Personal",
-        "subtitle": "Archive-driven personal focus",
+        "subtitle": "Personal archive signals",
         "context": " ".join(context_lines).strip(),
-        "available": bool(sections),
+        "available": True,
         "sourceLabel": "Personal archive synthesis",
         "sourcePath": None,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "sections": sections,
-    }
+    })
 
 
 def _normalize_personal_focus_payload(payload: dict, source_context: dict) -> dict:
@@ -4147,7 +4708,7 @@ def _normalize_personal_focus_payload(payload: dict, source_context: dict) -> di
                 index,
                 title,
                 str(item.get("status") or "Active").strip() or "Active",
-                str(item.get("next_action") or "Review the supporting evidence and decide the next move.").strip(),
+                str(item.get("next_action") or "Check the source details.").strip(),
                 str(item.get("detail_md") or item.get("detail") or "").strip(),
                 owner=str(item.get("owner") or "Andy").strip() or "Andy",
             )
@@ -4205,7 +4766,7 @@ def _normalize_personal_focus_payload(payload: dict, source_context: dict) -> di
     lane = {
         "id": "personal",
         "title": "Personal",
-        "subtitle": "Archive-driven personal focus",
+        "subtitle": "Personal archive signals",
         "context": context,
         "available": bool(sections),
         "sourceLabel": "Personal archive synthesis",
@@ -4216,21 +4777,25 @@ def _normalize_personal_focus_payload(payload: dict, source_context: dict) -> di
     }
     if not lane["available"]:
         return _build_personal_focus_fallback_lane(source_context)
-    return lane
+    return _focus_clean_personal_lane(lane)
 
 
 def _build_personal_focus_lane(source_context: dict) -> dict:
+    business_label = business_terms_label()
     system_prompt = (
         "You generate a personal focus dashboard from concrete evidence. "
-        "Return only valid JSON. Use natural language. Prefer obligations, plans, and meaningful themes over mechanisms. "
-        "Ignore business, Versant, coding, GitHub, and engineering unless they clearly create personal obligations."
+        "Return only valid JSON. Be terse, concrete, and action-oriented. "
+        f"Exclude business work for {business_label}, coding, GitHub, and engineering unless it creates a personal obligation. "
+        "Use the actual event or obligation name as the title; do not write generic phrases like planning and coordination around, logistics around, main signal, or scheduled."
     )
     user_prompt = (
         "Create Andy's PERSONAL focus lane from the evidence below.\n"
         "Rules:\n"
         "- Do not repeat work priorities from the work notes lane.\n"
+        f"- Treat {business_label} as Business, not Personal.\n"
         "- Focus on household, family, finance/admin, health, travel, upcoming events, and personally meaningful study/research.\n"
-        "- Keep priorities actionable and concise.\n"
+        "- Keep priorities actionable and concise. No generic filler, summary framing, or motivational phrasing.\n"
+        "- If the evidence is only a calendar event, make the title the event name and put the date/time in status or upcoming.\n"
         "- Return ONLY JSON with this shape:\n"
         "{\n"
         '  "context": string,\n'
@@ -4242,7 +4807,7 @@ def _build_personal_focus_lane(source_context: dict) -> dict:
         "Evidence:\n"
         f"{json.dumps(source_context, indent=2)}"
     )
-    payload = _focus_call_gateway_json(
+    payload = _focus_call_executor_json(
         lane_id="personal",
         purpose=f"personal-{str(source_context.get('fingerprint') or '')[:12]}",
         system_prompt=system_prompt,
@@ -4404,10 +4969,10 @@ def _focus_personal_lane_for_response(source_context: dict) -> dict:
         lane = _build_personal_focus_fallback_lane(source_context)
     lane.setdefault("id", "personal")
     lane.setdefault("title", "Personal")
-    lane.setdefault("subtitle", "Archive-driven personal focus")
+    lane.setdefault("subtitle", "Personal archive signals")
     lane.setdefault("sourceLabel", "Personal archive synthesis")
     lane.setdefault("generatedAt", (snapshot or {}).get("generatedAt"))
-    return lane
+    return _focus_clean_personal_lane(lane)
 
 
 def _focus_overview_response() -> dict:
@@ -4588,9 +5153,11 @@ def media_pipeline_compat_status():
 def media_pipeline_migrate():
     """Stamp existing valid pipeline results with the current compat version."""
     from media.pipeline import migrate_pipeline_compat_version
-    dry_run = request.json.get("dry_run", False) if request.is_json else False
+    payload = request.json if request.is_json else {}
+    dry_run = payload.get("dry_run", False)
+    verify_sources = payload.get("verify_sources", False)
     try:
-        result = migrate_pipeline_compat_version(dry_run=dry_run)
+        result = migrate_pipeline_compat_version(dry_run=dry_run, verify_sources=verify_sources)
         return jsonify(result)
     except Exception as exc:
         logging.exception("pipeline compat migration failed")
@@ -4641,20 +5208,20 @@ def get_chat_sessions():
                     "source": "local",
                 }
             )
-        oc_sessions = [
+        agent_sessions = [
             {
                 "session_key": session["id"],
                 "title": session.get("title") or "Untitled",
                 "created_at": session.get("updatedAt"),
                 "message_count": session.get("messageCount", 0),
-                "source": "openclaw",
+                "source": "agents",
                 "kind": session.get("kind"),
             }
-            for session in load_openclaw_sessions_for_agents(visible_agent_ids())
+            for session in load_agent_sessions_for_agents(visible_agent_ids())
         ]
-        return jsonify({"sessions": sessions, "oc_sessions": oc_sessions})
+        return jsonify({"sessions": sessions, "agent_sessions": agent_sessions})
     except Exception as e:
-        return jsonify({"sessions": [], "oc_sessions": [], "error": str(e)}), 200
+        return jsonify({"sessions": [], "agent_sessions": [], "error": str(e)}), 200
 
 
 @app.route("/api/chat/sessions", methods=["POST"])
@@ -4706,20 +5273,20 @@ def chat_endpoint():
     if not message:
         return jsonify({"reply": "Please provide a message."}), 400
 
-    gateway_token = resolve_gateway_token()
-    gateway_url = resolve_gateway_url()
+    executor_token = resolve_agent_executor_token()
+    executor_url = resolve_agent_executor_url()
     agent_id = console_agent_id()
-    gateway_model = f"openclaw/{agent_id}"
+    executor_model = resolve_agent_chat_model(agent_id)
 
-    if not gateway_token:
-        return jsonify({"reply": "Chat backend not configured. Set OPENCLAW_GATEWAY_TOKEN."}), 500
+    if not executor_token or not executor_url:
+        return jsonify({"reply": "Agent executor is not configured. Set ARCHIVIST_AGENT_EXECUTOR_URL and ARCHIVIST_AGENT_EXECUTOR_TOKEN."}), 500
 
     stream = body.get("stream", True)
     session_id = body.get("session_id")
     session_key = body.get("session_key") or (
         f"main:web:{session_id}@{console_agent_id()}" if session_id else default_web_session_key(console_agent_id())
     )
-    gateway_session_ref = gateway_session_key(agent_id, session_key)
+    executor_session_ref = agent_session_key(agent_id, session_key)
 
     # Persist user message and load history
     if session_id:
@@ -4744,19 +5311,19 @@ def chat_endpoint():
         def generate():
             try:
                 resp = _requests.post(
-                    f"{gateway_url}/v1/chat/completions",
+                    f"{executor_url}/v1/chat/completions",
                     json={
-                        "model": gateway_model,
+                        "model": executor_model,
                         "stream": True,
                         "messages": messages_payload,
-                        "user": gateway_session_ref,
+                        "user": executor_session_ref,
                     },
                     headers={
-                        "Authorization": f"Bearer {gateway_token}",
+                        "Authorization": f"Bearer {executor_token}",
                         "Content-Type": "application/json",
-                        "x-openclaw-agent-id": agent_id,
-                        "x-openclaw-scopes": "operator.write",
-                        "x-openclaw-session-key": gateway_session_ref,
+                        "x-agent-id": agent_id,
+                        "x-agent-scopes": "operator.write",
+                        "x-agent-session-key": executor_session_ref,
                     },
                     stream=True,
                     timeout=180,
@@ -4804,19 +5371,19 @@ def chat_endpoint():
         import requests as _requests
         try:
             resp = _requests.post(
-                f"{gateway_url}/v1/chat/completions",
+                f"{executor_url}/v1/chat/completions",
                 json={
-                    "model": gateway_model,
+                    "model": executor_model,
                     "stream": False,
                     "messages": messages_payload,
-                    "user": gateway_session_ref,
+                    "user": executor_session_ref,
                 },
                 headers={
-                    "Authorization": f"Bearer {gateway_token}",
+                    "Authorization": f"Bearer {executor_token}",
                     "Content-Type": "application/json",
-                    "x-openclaw-agent-id": agent_id,
-                    "x-openclaw-scopes": "operator.write",
-                    "x-openclaw-session-key": gateway_session_ref,
+                    "x-agent-id": agent_id,
+                    "x-agent-scopes": "operator.write",
+                    "x-agent-session-key": executor_session_ref,
                 },
                 timeout=180,
             )
@@ -4863,8 +5430,8 @@ def app_status():
         {
             "flags": dict(_SYSTEM_FLAGS),
             "integrations": {"probes": _service_probes()},
-            "mcp": {"tools": []},
-            "mcp_resources": {"resources": []},
+            "mcp": {"tools": load_mcp_tools_for_status()},
+            "mcp_resources": {"resources": load_mcp_resources_for_status()},
             "recent_tool_calls": [],
             "tasks": tasks,
             "repairs": {"agent_runtime": runtime},
@@ -4943,11 +5510,14 @@ def agent_config():
         {
             "consoleAgentId": console_agent_id(),
             "visibleAgentIds": visible_agent_ids(),
-            "gatewayUrl": resolve_gateway_url(),
-            "gatewayTokenConfigured": bool(resolve_gateway_token()),
+            "executorUrl": resolve_agent_executor_url(),
+            "executorTokenConfigured": bool(resolve_agent_executor_token()),
             "workspacePath": host_workspace(),
+            "agentsRoot": str(agents_repo_root()),
             "registeredAgents": runtime.get("registered_agents", []),
             "teamAgents": load_team_agents(),
+            "sharedSkills": load_shared_skills(),
+            "mcpServers": [tool.get("server") for tool in load_mcp_tools_for_status()],
             "runtime": runtime,
         }
     )
@@ -4956,7 +5526,7 @@ def agent_config():
 @app.route("/api/agents/fleet", methods=["GET"])
 def agent_fleet():
     runtime = _agent_runtime_snapshot()
-    sessions = load_openclaw_sessions_for_agents(visible_agent_ids())
+    sessions = load_agent_sessions_for_agents(visible_agent_ids())
     verification = _build_focus_priority_verification_snapshot(auto_schedule=False)
     tickets = [dict(ticket) for ticket in list(verification.get("tickets") or []) if isinstance(ticket, dict)]
     sessions_by_agent: dict[str, list[dict]] = {}
@@ -5100,11 +5670,13 @@ def automations_status():
             "ok": bool(runtime.get("available")),
             "tickets_open": len(list(verification.get("tickets") or [])),
             "tickets": list(verification.get("tickets") or []),
-            "openclaw": {
+            "agents": {
                 "available": bool(runtime.get("available")),
                 "binary": runtime.get("binary"),
                 "model": runtime.get("model"),
                 "version": runtime.get("version"),
+                "skills_count": runtime.get("skills_count"),
+                "mcp_server_count": runtime.get("mcp_server_count"),
             },
             "experiments": {"completed": completed, "current": experiments_current},
             "repair_runs": [],
@@ -5237,7 +5809,7 @@ def agent_chat():
     if not incoming_session_id:
         session_key = default_web_session_key(agent_id)
     session_id = encode_session_ref(agent_id, session_key)
-    gateway_session_ref = gateway_session_key(agent_id, session_key)
+    executor_session_ref = agent_session_key(agent_id, session_key)
     _AGENT_SESSION_META.setdefault(session_id, {})
     if surface:
         _AGENT_SESSION_META[session_id]["surface"] = surface
@@ -5250,20 +5822,20 @@ def agent_chat():
         {"role": "user", "text": message, "ts": int(time.time() * 1000)}
     )
 
-    gateway_url = resolve_gateway_url()
-    gateway_token = resolve_gateway_token()
-    model = f"openclaw/{agent_id}"
+    executor_url = resolve_agent_executor_url()
+    executor_token = resolve_agent_executor_token()
+    model = resolve_agent_chat_model(agent_id)
 
     def generate():
         full_text = ""
         yield f"event: session_start\ndata: {json.dumps({'id': session_id})}\n\n"
-        if not gateway_token:
-            yield f"event: error\ndata: {json.dumps({'message': 'OpenClaw gateway token not configured'})}\n\n"
+        if not executor_token or not executor_url:
+            yield f"event: error\ndata: {json.dumps({'message': 'Agent executor is not configured. Set ARCHIVIST_AGENT_EXECUTOR_URL and ARCHIVIST_AGENT_EXECUTOR_TOKEN.'})}\n\n"
             yield "event: done\ndata: {}\n\n"
             return
         try:
             response = _requests.post(
-                f"{gateway_url}/v1/chat/completions",
+                f"{executor_url}/v1/chat/completions",
                 json={
                     "model": model,
                     "stream": True,
@@ -5271,21 +5843,21 @@ def agent_chat():
                         {"role": "system", "content": system_message},
                         {"role": "user", "content": message},
                     ],
-                    "user": gateway_session_ref,
+                    "user": executor_session_ref,
                 },
                 headers={
-                    "Authorization": f"Bearer {gateway_token}",
+                    "Authorization": f"Bearer {executor_token}",
                     "Content-Type": "application/json",
-                    "x-openclaw-agent-id": agent_id,
-                    "x-openclaw-session-key": gateway_session_ref,
-                    "x-openclaw-message-channel": "archivist-console",
-                    "x-openclaw-scopes": "operator.write",
+                    "x-agent-id": agent_id,
+                    "x-agent-session-key": executor_session_ref,
+                    "x-agent-message-channel": "archivist-console",
+                    "x-agent-scopes": "operator.write",
                 },
                 stream=True,
                 timeout=180,
             )
             if response.status_code >= 400:
-                yield f"event: error\ndata: {json.dumps({'message': f'Gateway returned HTTP {response.status_code}'})}\n\n"
+                yield f"event: error\ndata: {json.dumps({'message': f'Agent executor returned HTTP {response.status_code}'})}\n\n"
                 yield "event: done\ndata: {}\n\n"
                 return
             for line in response.iter_lines(decode_unicode=True):
@@ -5363,7 +5935,10 @@ _GOOGLE_SERVICE_CATALOG = [
         "id": "gmail",
         "name": "Gmail",
         "description": "Email archive & search",
-        "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        "scopes": [
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+        ],
         "checker": "_check_gmail",
         "aliases": ["gmail"],
         "enabled_by_default": True,
@@ -6645,7 +7220,7 @@ def _write_google_account_archive(
     return manifest
 
 
-_GOOGLE_JOURNAL_OVERVIEW_VERSION = 21
+_GOOGLE_JOURNAL_OVERVIEW_VERSION = 25
 _GOOGLE_JOURNAL_ROUTINE_CALENDAR_PATTERNS = [
     re.compile(r"^week \d+ of \d{4}$", re.IGNORECASE),
     re.compile(r"^(recycle and )?trash pickup$", re.IGNORECASE),
@@ -7380,6 +7955,8 @@ def _google_archive_story_topic_text(value: str | None) -> str:
 
 def _google_archive_topic_is_life_or_admin(source: str, text: str) -> bool:
     lowered = text.lower()
+    if business_matches_text(text):
+        return False
     admin_terms = (
         "paystub",
         "benefits",
@@ -7420,6 +7997,8 @@ def _google_archive_topic_is_life_or_admin(source: str, text: str) -> bool:
 
 def _google_archive_topic_is_project(source: str, text: str) -> bool:
     lowered = text.lower()
+    if business_matches_text(text):
+        return True
     project_terms = (
         "pr #",
         "pull request",
@@ -7446,6 +8025,9 @@ def _google_archive_topic_is_project(source: str, text: str) -> bool:
         "infra",
         "launch planning",
         "sync",
+        "versant",
+        "gigantor",
+        "vivonics",
     )
     if source in {"git", "github"}:
         return True
@@ -7512,10 +8094,10 @@ def _google_archive_story_buckets(context: dict) -> dict[str, list[str]]:
             bucket_name = "background"
         elif _google_archive_topic_is_background(source, raw_text):
             bucket_name = "background"
-        elif _google_archive_topic_is_life_or_admin(source, raw_text):
-            bucket_name = "life"
         elif _google_archive_topic_is_project(source, raw_text):
             bucket_name = "work"
+        elif _google_archive_topic_is_life_or_admin(source, raw_text):
+            bucket_name = "life"
         elif source in {"drive", "chat"}:
             bucket_name = "work"
         else:
@@ -7526,21 +8108,22 @@ def _google_archive_story_buckets(context: dict) -> dict[str, list[str]]:
         text = str(item or "").strip()
         if not text:
             continue
-        bucket_name = "life" if _google_archive_topic_is_life_or_admin("drive", text) else "work"
+        bucket_name = "work" if _google_archive_topic_is_project("drive", text) else ("life" if _google_archive_topic_is_life_or_admin("drive", text) else "work")
         _google_archive_add_story_topic(buckets[bucket_name], text, seen[bucket_name])
 
-    for item in (context.get("routine_calendar_items") or []):
-        _google_archive_add_story_topic(buckets["life"], str(item or ""), seen["life"])
+    if not buckets["work"] and not buckets["life"]:
+        for item in (context.get("routine_calendar_items") or []):
+            _google_archive_add_story_topic(buckets["life"], str(item or ""), seen["life"])
     return buckets
 
 
 def _google_archive_summary_lead(relation: str, primary: str, fallback_label: str) -> str:
     subject = primary or fallback_label or "current activity"
     if relation == "future":
-        return f"The day is shaping up around {subject}"
+        return f"Scheduled: {subject}"
     if relation == "present":
-        return f"Today's clearest thread is {subject}"
-    return f"The clearest thread was {subject}"
+        return f"Current: {subject}"
+    return f"Main signal: {subject}"
 
 
 def _google_archive_day_verb(relation: str, present: str, past: str, future: str | None = None) -> str:
@@ -7565,15 +8148,15 @@ def _google_archive_day_story(context: dict, *, max_chars: int = 220) -> str:
     if work_topics:
         rest = work_topics[1:4]
         if rest:
-            sentences.append(f"The work and project layer also shows {_google_archive_join_phrases(rest)}.")
+            sentences.append(f"Related work: {_google_archive_join_phrases(rest)}.")
     if life_topics:
         life_sentence_topics = life_topics[:3]
-        prefix = "Separate life and logistics context"
+        prefix = "Separate personal/logistics"
         if not work_topics:
             life_sentence_topics = life_topics[1:4]
-            prefix = "The life and logistics layer also"
+            prefix = "Related personal/logistics"
         if life_sentence_topics:
-            sentences.append(f"{prefix} includes {_google_archive_join_phrases(life_sentence_topics)}.")
+            sentences.append(f"{prefix}: {_google_archive_join_phrases(life_sentence_topics)}.")
     if background_topics and not (work_topics or life_topics):
         sentences.append(f"Background signals include {_google_archive_join_phrases(background_topics[:2])}.")
     if account_phrase:
@@ -7598,7 +8181,7 @@ def _google_archive_day_sections(context: dict) -> list[dict]:
     primary_theme_label = str(context.get("primary_theme_label") or "").strip()
     primary = work_topics[0] if work_topics else (life_topics[0] if life_topics else primary_theme_label)
     if primary:
-        what_parts.append(f"The main through-line {_google_archive_day_verb(relation, 'is', 'was', 'is')} {primary}.")
+        what_parts.append(f"Primary signal {_google_archive_day_verb(relation, 'is', 'was', 'is')} {primary}.")
     if work_topics and life_topics:
         life_tail = _google_archive_join_phrases(life_topics[:2])
         what_parts.append(
@@ -7621,7 +8204,7 @@ def _google_archive_day_sections(context: dict) -> list[dict]:
 
     if work_topics:
         work_sentences = [
-            f"On the work and project side, the strongest signal {_google_archive_day_verb(relation, 'is', 'was', 'is')} {work_topics[0]}."
+            f"Work signal {_google_archive_day_verb(relation, 'is', 'was', 'is')} {work_topics[0]}."
         ]
         if len(work_topics) > 1:
             work_sentences.append(f"Related work includes {_google_archive_join_phrases(work_topics[1:4])}.")
@@ -7630,7 +8213,7 @@ def _google_archive_day_sections(context: dict) -> list[dict]:
     life_sentences: list[str] = []
     if life_topics:
         life_sentences.append(
-            f"The personal logistics layer {_google_archive_day_verb(relation, 'is', 'was', 'is')} {_google_archive_join_phrases(life_topics[:4])}."
+            f"Personal logistics: {_google_archive_join_phrases(life_topics[:4])}."
         )
     if account_phrase:
         life_sentences.append(f"{account_phrase}.")
@@ -7669,7 +8252,12 @@ def _google_archive_day_score(
     mentions = [item for item in [*(context.get("notable_mentions") or []), *(context.get("supporting_mentions") or [])] if isinstance(item, dict)]
     meaningful_mentions = [item for item in mentions if not item.get("low_signal")]
     meaningful_media = [item for item in meaningful_mentions if str(item.get("source") or "") == "media"]
-    meaningful_work = [item for item in meaningful_mentions if str(item.get("source") or "") in {"git", "github", "drive", "chat", "media"}]
+    meaningful_work = [
+        item
+        for item in meaningful_mentions
+        if str(item.get("source") or "") in {"git", "github", "drive", "chat", "media"}
+        or business_matches_text(str(item.get("text") or ""), str(item.get("raw_text") or ""))
+    ]
     topic_text = " ".join(
         str(item or "")
         for item in [
@@ -7984,6 +8572,9 @@ def _google_archive_theme_scores(
         candidate_low_signal = bool(candidate.get("low_signal")) or _google_archive_is_low_signal_topic(source, raw_text, cleaned_text)
         if candidate_low_signal:
             weight *= 0.15
+        if business_matches_text(normalized, raw_text):
+            scores["engineering"] = scores.get("engineering", 0.0) + weight * 1.25
+            scores["planning"] = scores.get("planning", 0.0) + weight * 0.5
         if source == "media" and not candidate_low_signal and weight >= 2.4:
             rich_media_candidates += 1
             scores["research"] = scores.get("research", 0.0) + weight * 0.75
@@ -8845,12 +9436,14 @@ _journal_overview_cache: dict | None = None
 _journal_overview_cache_time: float = 0.0
 _journal_overview_building: bool = False
 _journal_overview_cache_fingerprint: str | None = None
+_journal_overview_cache_root: str | None = None
 
 
 def _build_google_journal_overview() -> dict:
-    global _journal_overview_cache, _journal_overview_cache_time, _journal_overview_building, _journal_overview_cache_fingerprint
+    global _journal_overview_cache, _journal_overview_cache_time, _journal_overview_building, _journal_overview_cache_fingerprint, _journal_overview_cache_root
     import time as _time
     now = _time.monotonic()
+    current_root = str(_google_archive_root().resolve())
     current_fingerprint = _google_archive_fingerprint()
     persisted = _load_persisted_google_journal_overview()
     # Return cached result if fresh (within 120s)
@@ -8858,6 +9451,7 @@ def _build_google_journal_overview() -> dict:
         _journal_overview_cache is not None
         and (now - _journal_overview_cache_time) < 120
         and _journal_overview_cache_fingerprint == current_fingerprint
+        and _journal_overview_cache_root == current_root
     ):
         cached_days = int(_journal_overview_cache.get("dayCount") or 0)
         persisted_days = int((persisted or {}).get("dayCount") or 0)
@@ -8865,6 +9459,7 @@ def _build_google_journal_overview() -> dict:
             _journal_overview_cache = persisted
             _journal_overview_cache_time = _time.monotonic()
             _journal_overview_cache_fingerprint = str(persisted.get("archiveFingerprint") or current_fingerprint)
+            _journal_overview_cache_root = current_root
             return persisted
         return _journal_overview_cache
     # If another thread is already building, return stale cache or empty
@@ -8881,6 +9476,7 @@ def _build_google_journal_overview() -> dict:
         _journal_overview_cache = result
         _journal_overview_cache_time = _time.monotonic()
         _journal_overview_cache_fingerprint = str(result.get("archiveFingerprint") or current_fingerprint)
+        _journal_overview_cache_root = current_root
         return result
     finally:
         _journal_overview_building = False
@@ -9322,6 +9918,33 @@ def _run_google_archive_index_sync(active_services: list[str]) -> tuple[dict, di
     summary = _persist_google_archive_views()
     archive_fingerprint = _google_archive_fingerprint()
     started_at = datetime.now(timezone.utc).isoformat()
+    embedding_status = check_embedding_service(
+        host=EMBEDDING_HOST,
+        port=EMBEDDING_PORT,
+        model=LOCAL_EMBEDDING_MODEL,
+    )
+    if embedding_status.get("status") != "ok":
+        error = str(embedding_status.get("error") or "embedding service unavailable")
+        _write_google_archive_index_status(
+            {
+                "status": "skipped",
+                "reason": "embeddings_unavailable",
+                "startedAt": started_at,
+                "finishedAt": datetime.now(timezone.utc).isoformat(),
+                "archiveFingerprint": archive_fingerprint,
+                "archiveVersion": GOOGLE_ARCHIVE_CONTENT_VERSION,
+                "embeddingModel": LOCAL_EMBEDDING_MODEL,
+                "services": active_services,
+                "summary": {
+                    "records_seen": 0,
+                    "records_indexed": 0,
+                    "chunks_inserted": 0,
+                    "errors": [error],
+                },
+            }
+        )
+        return summary, {"records_seen": 0, "records_indexed": 0, "chunks_inserted": 0, "errors": [error]}
+
     _write_google_archive_index_status(
         {
             "status": "indexing",
@@ -9918,6 +10541,11 @@ def _periodic_github_sync():
         _time.sleep(7200)  # 2 hours
 
 
+try:
+    tts_service.start()
+except Exception:
+    logging.exception("TTS service startup failed (non-fatal)")
+
 if _WEB_BACKGROUND_TASKS_ENABLED:
     # Start Google import scheduler (deferred to here since the function is defined above).
     try:
@@ -9936,6 +10564,146 @@ else:
     logging.info(
         "Archivist web background tasks disabled: skipping Google import scheduler, focus sync scheduler, journal prewarm, and periodic GitHub sync"
     )
+
+
+# ── Unified media pipeline (RTSP ingest + streaming transcription) ──────
+# Audio+video ingest from enabled sources in config/sources.yml.
+# Emits transcript.final + source.health events to Redis Streams.
+try:
+    import streaming_transcription_service
+    import rtsp_ingest_service
+    import vision_service
+    import archive_service
+    import retention_service
+    streaming_transcription_service.start_all()
+    try:
+        vision_service.start()
+    except Exception:
+        logging.exception("vision_service startup failed (non-fatal)")
+    rtsp_ingest_service.start_all()
+    try:
+        archive_service.start()
+    except Exception:
+        logging.exception("archive_service startup failed (non-fatal)")
+    try:
+        retention_service.start()
+    except Exception:
+        logging.exception("retention_service startup failed (non-fatal)")
+    try:
+        import health_monitor
+        health_monitor.start()
+    except Exception:
+        logging.exception("health_monitor startup failed (non-fatal)")
+    try:
+        import gpu_watchdog
+        gpu_watchdog.start()
+    except Exception:
+        logging.exception("gpu_watchdog startup failed (non-fatal)")
+    logging.info("RTSP ingest + streaming transcription + vision + archive + retention + health + gpu_watchdog started")
+except Exception:
+    logging.exception("RTSP ingest startup failed (non-fatal)")
+
+
+@app.route("/api/media/search", methods=["GET"])
+def _media_semantic_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "missing q"}), 400
+    try:
+        top_k = max(1, min(50, int(request.args.get("k", "10"))))
+    except (TypeError, ValueError):
+        top_k = 10
+    sources_param = request.args.get("sources") or ""
+    sources_filter = [s.strip() for s in sources_param.split(",") if s.strip()] or None
+    try:
+        import vision_service
+        hits = vision_service.search_by_text(q, top_k=top_k, sources=sources_filter)
+        return jsonify({"query": q, "k": top_k, "hits": hits})
+    except Exception as exc:
+        logging.exception("semantic search failed")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/media/keyframe", methods=["GET"])
+def _media_keyframe():
+    path = request.args.get("path") or ""
+    if not path:
+        return jsonify({"error": "missing path"}), 400
+    # Restrict to configured keyframe root for safety.
+    import os.path as _op
+    root = os.getenv("ARCHIVIST_KEYFRAMES_ROOT", "/data/media_store/keyframes")
+    real = _op.realpath(path)
+    if not real.startswith(_op.realpath(root)):
+        return jsonify({"error": "path outside keyframes root"}), 403
+    try:
+        directory = _op.dirname(real)
+        filename = _op.basename(real)
+        return send_from_directory(directory, filename, mimetype="image/jpeg")
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/media/sources/status", methods=["GET"])
+def _media_sources_status():
+    try:
+        import rtsp_ingest_service
+        import streaming_transcription_service
+        import motion_service
+        import vision_service
+        import archive_service
+        import retention_service
+        return jsonify({
+            "rtsp": rtsp_ingest_service.status(),
+            "streaming": streaming_transcription_service.status(),
+            "motion": motion_service.status(),
+            "vision": vision_service.status(),
+            "archive": archive_service.status(),
+            "retention": retention_service.status(),
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/media/retention/run", methods=["POST"])
+def _media_retention_run():
+    """Trigger an immediate retention GC pass. Body: {dry_run: bool, limit: int}."""
+    try:
+        import retention_service
+        body = request.get_json(silent=True) or {}
+        dry = bool(body.get("dry_run", True))
+        limit = int(body.get("limit", 500))
+        summary = retention_service.run_gc_pass(dry_run=dry, limit=limit)
+        return jsonify(summary)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/media/archive/run", methods=["POST"])
+def _media_archive_run():
+    """Trigger an immediate archive pass (local SSD → NAS).
+
+    Body: {dry_run: bool, backfill: bool, limit: int}
+    backfill=true ignores local_hold_hours (one-shot move of all local segments).
+    """
+    try:
+        import archive_service
+        body = request.get_json(silent=True) or {}
+        dry = bool(body.get("dry_run", False))
+        backfill = bool(body.get("backfill", False))
+        limit = int(body.get("limit", 2000))
+        summary = archive_service.run_archive_pass(backfill=backfill, dry_run=dry, limit=limit)
+        return jsonify(summary)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/metrics", methods=["GET"])
+def _prometheus_metrics():
+    try:
+        from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+        return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+    except Exception as exc:
+        return Response(f"# metrics unavailable: {exc}\n", mimetype="text/plain")
 
 
 if __name__ == '__main__':

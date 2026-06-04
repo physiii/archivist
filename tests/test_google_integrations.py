@@ -20,16 +20,18 @@ def _load_module(name: str, relative_path: str):
     return module
 
 
-def _load_main_with_stubs():
+def _load_main_with_stubs(monkeypatch):
+    monkeypatch.setenv("ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS", "0")
     load_stub = types.ModuleType("load")
     load_stub.load_to_vectorstore = lambda *a, **k: None
     load_stub.load_text_to_vectorstore = lambda *a, **k: {"ok": True}
     load_stub.clear_vectorstore_collection = lambda *a, **k: {"ok": True}
-    sys.modules["load"] = load_stub
+    monkeypatch.setitem(sys.modules, "load", load_stub)
 
     search_stub = types.ModuleType("search")
+    search_stub.CollectionLoadError = RuntimeError
     search_stub.search_vectorstore = lambda *a, **k: []
-    sys.modules["search"] = search_stub
+    monkeypatch.setitem(sys.modules, "search", search_stub)
 
     backups_stub = types.ModuleType("backups_service")
     backups_stub.BACKUP_ROOT = "/tmp"
@@ -37,6 +39,7 @@ def _load_main_with_stubs():
     backups_stub.delete_backup_target = lambda *a, **k: None
     backups_stub.get_backup_overview = lambda *a, **k: {"status": {"running": False}}
     backups_stub.get_run_logs = lambda *a, **k: []
+    backups_stub.list_backup_files = lambda *a, **k: []
     backups_stub.list_backup_targets = lambda *a, **k: []
     backups_stub.start_backup = lambda *a, **k: None
     backups_stub.start_scheduler_best_effort = lambda *a, **k: None
@@ -44,7 +47,7 @@ def _load_main_with_stubs():
     backups_stub.stop_backup = lambda *a, **k: None
     backups_stub.update_backup_target = lambda *a, **k: None
     backups_stub.update_schedule = lambda *a, **k: None
-    sys.modules["backups_service"] = backups_stub
+    monkeypatch.setitem(sys.modules, "backups_service", backups_stub)
 
     indexing_stub = types.ModuleType("indexing_service")
     indexing_stub.GOOGLE_ARCHIVE_CONTENT_VERSION = "google_archive_v1"
@@ -60,12 +63,12 @@ def _load_main_with_stubs():
     indexing_stub.start_target_indexing = lambda *a, **k: None
     indexing_stub.stop_indexing = lambda *a, **k: None
     indexing_stub.update_indexing_target = lambda *a, **k: None
-    sys.modules["indexing_service"] = indexing_stub
+    monkeypatch.setitem(sys.modules, "indexing_service", indexing_stub)
 
     movietime_stub = types.ModuleType("movietime_items")
     movietime_stub.search_movietime_items = lambda *a, **k: []
     movietime_stub.upsert_movietime_items = lambda *a, **k: {"ok": True}
-    sys.modules["movietime_items"] = movietime_stub
+    monkeypatch.setitem(sys.modules, "movietime_items", movietime_stub)
 
     chat_store_stub = types.ModuleType("chat_store")
     chat_store_stub.add_message = lambda *a, **k: None
@@ -75,38 +78,42 @@ def _load_main_with_stubs():
     chat_store_stub.init_db = lambda *a, **k: None
     chat_store_stub.list_sessions = lambda *a, **k: []
     chat_store_stub.update_session_title = lambda *a, **k: None
-    sys.modules["chat_store"] = chat_store_stub
+    monkeypatch.setitem(sys.modules, "chat_store", chat_store_stub)
 
     transcription_stub = types.ModuleType("transcription_service")
     transcription_stub.init_transcription_model = lambda *a, **k: None
-    sys.modules["transcription_service"] = transcription_stub
+    monkeypatch.setitem(sys.modules, "transcription_service", transcription_stub)
 
     agent_stub = types.ModuleType("agent_integration")
     agent_stub.build_agent_system_message = lambda *a, **k: "system"
-    agent_stub.console_agent_id = lambda: "archivist-main"
-    agent_stub.decode_session_ref = lambda raw=None: ("archivist-main", raw or "main:web:test@archivist-main")
-    agent_stub.default_web_session_key = lambda agent_id=None: "main:web:test@archivist-main"
+    agent_stub.console_agent_id = lambda: "operator-chat"
+    agent_stub.decode_session_ref = lambda raw=None: ("operator-chat", raw or "main:web:test@operator-chat")
+    agent_stub.default_web_session_key = lambda agent_id=None: "main:web:test@operator-chat"
     agent_stub.encode_session_ref = lambda agent_id, session_key: f"agent:{agent_id}:{session_key}"
-    agent_stub.gateway_session_key = lambda *a, **k: "gateway:web:test@archivist-main"
+    agent_stub.agent_session_key = lambda *a, **k: "executor:web:test@operator-chat"
+    agent_stub.agents_repo_root = lambda: REPO_ROOT
     agent_stub.host_workspace = lambda: str(REPO_ROOT)
     agent_stub.inspect_agent_runtime = lambda: {"available": False}
-    agent_stub.load_openclaw_config = lambda: ({}, None)
-    agent_stub.load_openclaw_messages_from_transcript = lambda *a, **k: []
-    agent_stub.load_openclaw_sessions_for_agents = lambda *a, **k: []
+    agent_stub.load_agent_messages_from_transcript = lambda *a, **k: []
+    agent_stub.load_agent_sessions_for_agents = lambda *a, **k: []
+    agent_stub.load_mcp_resources_for_status = lambda *a, **k: []
+    agent_stub.load_mcp_tools_for_status = lambda *a, **k: []
+    agent_stub.load_shared_skills = lambda *a, **k: []
     agent_stub.load_team_agents = lambda: []
     agent_stub.registered_agent_ids = lambda *a, **k: []
-    agent_stub.resolve_gateway_token = lambda: ""
-    agent_stub.resolve_gateway_url = lambda: "http://127.0.0.1:18789"
-    agent_stub.resolve_openclaw_session_file = lambda *a, **k: None
+    agent_stub.resolve_agent_chat_model = lambda *a, **k: "agents/operator-chat"
+    agent_stub.resolve_agent_executor_token = lambda: ""
+    agent_stub.resolve_agent_executor_url = lambda: "/media/mass/agents"
+    agent_stub.resolve_agent_session_file = lambda *a, **k: None
     agent_stub.session_kind = lambda *a, **k: "chat"
-    agent_stub.visible_agent_ids = lambda: ["archivist-main"]
-    sys.modules["agent_integration"] = agent_stub
+    agent_stub.visible_agent_ids = lambda: ["operator-chat"]
+    monkeypatch.setitem(sys.modules, "agent_integration", agent_stub)
 
     return _load_module("archivist_main_google_test", "main.py")
 
 
 def test_google_token_file_candidates_reads_legacy_and_account_dirs(tmp_path, monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     legacy = tmp_path / "google_token.json"
     account_dir = tmp_path / "google-accounts"
     account_dir.mkdir()
@@ -124,7 +131,7 @@ def test_google_token_file_candidates_reads_legacy_and_account_dirs(tmp_path, mo
 
 
 def test_google_account_token_path_uses_slugged_email(tmp_path, monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     monkeypatch.setattr(main, "_GOOGLE_ACCOUNT_TOKEN_DIRS", [str(tmp_path / "google-accounts")])
 
     token_path = main._google_account_token_path("Andy.Work+Archive@Example.com")
@@ -133,7 +140,7 @@ def test_google_account_token_path_uses_slugged_email(tmp_path, monkeypatch):
 
 
 def test_google_requested_scopes_include_enabled_chat_and_extra_scopes(monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     monkeypatch.setenv("ARCHIVIST_GOOGLE_SERVICES", "gmail, calendar, drive, chat")
     monkeypatch.setenv(
         "ARCHIVIST_GOOGLE_EXTRA_SCOPES",
@@ -142,6 +149,7 @@ def test_google_requested_scopes_include_enabled_chat_and_extra_scopes(monkeypat
 
     assert main._google_requested_scopes() == [
         "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
         "https://www.googleapis.com/auth/calendar.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
         "https://www.googleapis.com/auth/chat.spaces.readonly",
@@ -151,7 +159,7 @@ def test_google_requested_scopes_include_enabled_chat_and_extra_scopes(monkeypat
 
 
 def test_collect_google_accounts_prefers_named_account_token_over_legacy(tmp_path, monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     legacy = tmp_path / "google_token.json"
     account_dir = tmp_path / "google-accounts"
     account_dir.mkdir()
@@ -206,7 +214,7 @@ def test_collect_google_accounts_prefers_named_account_token_over_legacy(tmp_pat
 
 
 def test_integrations_status_flattens_multi_account_google_results(monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     accounts = [
         {
             "id": "work",
@@ -267,10 +275,11 @@ def test_integrations_status_flattens_multi_account_google_results(monkeypatch):
 
 
 def test_integrations_authorize_returns_auth_url(monkeypatch, tmp_path):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     secret = tmp_path / "client_secret.json"
     secret.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(main, "_GOOGLE_CLIENT_SECRET_PATHS", [str(secret)])
+    monkeypatch.setenv("ARCHIVIST_GOOGLE_SERVICES", "gmail,calendar,drive")
     main._GOOGLE_AUTH_PENDING.clear()
 
     google_pkg = types.ModuleType("google_auth_oauthlib")
@@ -308,6 +317,7 @@ def test_integrations_authorize_returns_auth_url(monkeypatch, tmp_path):
     assert payload["redirect_uri"].endswith("/api/integrations/oauth/google/callback")
     assert payload["requested_scopes"] == [
         "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
         "https://www.googleapis.com/auth/calendar.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
@@ -320,7 +330,7 @@ def test_integrations_authorize_returns_auth_url(monkeypatch, tmp_path):
 
 
 def test_integrations_authorize_includes_chat_scopes_when_enabled(monkeypatch, tmp_path):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     secret = tmp_path / "client_secret.json"
     secret.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(main, "_GOOGLE_CLIENT_SECRET_PATHS", [str(secret)])
@@ -367,7 +377,7 @@ def test_integrations_authorize_includes_chat_scopes_when_enabled(monkeypatch, t
 
 
 def test_integrations_authorize_callback_restores_code_verifier(monkeypatch, tmp_path):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     secret = tmp_path / "client_secret.json"
     secret.write_text("{}", encoding="utf-8")
     main._GOOGLE_AUTH_PENDING.clear()
@@ -424,7 +434,7 @@ def test_integrations_authorize_callback_restores_code_verifier(monkeypatch, tmp
 
 
 def test_google_service_since_date_requires_existing_service_file(monkeypatch, tmp_path):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     archive_dir = tmp_path / "google-archive"
     account_dir = archive_dir / main._google_account_slug("andy@example.com")
     account_dir.mkdir(parents=True)
@@ -439,7 +449,7 @@ def test_google_service_since_date_requires_existing_service_file(monkeypatch, t
 
 
 def test_google_service_since_date_calendar_uses_recent_event_window(monkeypatch, tmp_path):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     archive_dir = tmp_path / "google-archive"
     account_dir = archive_dir / main._google_account_slug("andy@example.com")
     account_dir.mkdir(parents=True)
@@ -465,7 +475,7 @@ def test_google_service_since_date_calendar_uses_recent_event_window(monkeypatch
 
 
 def test_google_archive_needs_index_sync_tracks_archive_fingerprint(monkeypatch, tmp_path):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     archive_dir = tmp_path / "google-archive"
     account_dir = archive_dir / "andy-example.com"
     account_dir.mkdir(parents=True)
@@ -508,7 +518,7 @@ def test_google_archive_needs_index_sync_tracks_archive_fingerprint(monkeypatch,
 
 
 def test_run_google_import_job_uses_drive_and_indexes_archive(monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     monkeypatch.setenv("ARCHIVIST_GOOGLE_SERVICES", "gmail,calendar,drive")
 
     main._GOOGLE_IMPORT_STATE.update(
@@ -557,6 +567,7 @@ def test_run_google_import_job_uses_drive_and_indexes_archive(monkeypatch):
         },
     )
     monkeypatch.setattr(main, "_google_archive_root", lambda: Path("/tmp/google-archive-test"))
+    monkeypatch.setattr(main, "check_embedding_service", lambda **kwargs: {"status": "ok"})
 
     def _fake_index(root, **kwargs):
         captured["index_services"] = kwargs.get("services")
@@ -578,8 +589,43 @@ def test_run_google_import_job_uses_drive_and_indexes_archive(monkeypatch):
     assert "1 drive files" in main._GOOGLE_IMPORT_STATE["message"]
 
 
+def test_google_archive_index_sync_skips_when_embeddings_down(monkeypatch):
+    main = _load_main_with_stubs(monkeypatch)
+    writes = []
+    monkeypatch.setattr(
+        main,
+        "_persist_google_archive_views",
+        lambda: {
+            "gmailMessages": 1,
+            "calendarEvents": 0,
+            "driveFiles": 0,
+            "chatMessages": 0,
+            "dayCount": 1,
+        },
+    )
+    monkeypatch.setattr(main, "_google_archive_fingerprint", lambda *a, **k: "fingerprint")
+    monkeypatch.setattr(main, "_write_google_archive_index_status", lambda payload: writes.append(payload))
+    monkeypatch.setattr(
+        main,
+        "check_embedding_service",
+        lambda **kwargs: {"status": "error", "error": "embedding backend down"},
+    )
+    monkeypatch.setattr(
+        main,
+        "index_google_archive_content",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("indexing should be skipped")),
+    )
+
+    summary, index_summary = main._run_google_archive_index_sync(["gmail"])
+
+    assert summary["gmailMessages"] == 1
+    assert index_summary["errors"] == ["embedding backend down"]
+    assert writes[-1]["status"] == "skipped"
+    assert writes[-1]["reason"] == "embeddings_unavailable"
+
+
 def test_build_work_focus_lane_prefers_latest_week_notes(tmp_path, monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     week4 = tmp_path / "WEEK4"
     week5 = tmp_path / "WEEK5"
     week4.mkdir()
@@ -616,12 +662,43 @@ Andy Payne
     assert lane["title"] == "Business"
     assert lane["available"] is True
     assert lane["sourcePath"].endswith("WEEK5/FOCUS.md")
-    assert lane["sourceLabel"] == "Latest business notes"
+    assert lane["sourceLabel"] == "Latest business notes · WEEK5"
     assert lane["sections"][0]["items"][0]["title"] == "Ship dashboard"
 
 
-def test_build_work_focus_lane_puts_archive_signals_before_stale_fallback_notes(tmp_path, monkeypatch):
-    main = _load_main_with_stubs()
+def test_build_work_focus_lane_uses_versant_docs_with_default_notes_root(tmp_path, monkeypatch):
+    main = _load_main_with_stubs(monkeypatch)
+    default_notes = tmp_path / "vnotes"
+    versant_root = tmp_path / "versant-home" / "versant"
+    week7 = versant_root / "WEEK7"
+    week7.mkdir(parents=True)
+    (week7 / "FOCUS.md").write_text(
+        """# Focus — Week 7: 2026-04-27 through 2026-05-01
+Andy Payne
+> Current Versant focus.
+
+## This Week — Priority Order
+| # | What | Owner | Status | Next action |
+| --- | --- | --- | --- | --- |
+| 1 | Confirm Andy's 10 UCP guest pass is live | Andy | active | Confirm access |
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main, "_DEFAULT_FOCUS_WORK_NOTES_ROOT", default_notes)
+    monkeypatch.setattr(main, "_FOCUS_WORK_NOTES_ROOT", default_notes)
+    monkeypatch.setattr(main, "_FOCUS_VERSANT_DOCS_ROOT", versant_root)
+
+    lane = main._build_work_focus_lane()
+
+    assert lane["sourceLabel"] == "Versant docs · WEEK7"
+    assert lane["sourcePath"].endswith("versant-home/versant/WEEK7/FOCUS.md")
+    assert lane["sections"][0]["id"] == "priorities"
+    assert lane["sections"][0]["items"][0]["title"] == "Confirm Andy's 10 UCP guest pass is live"
+
+
+def test_build_work_focus_lane_keeps_priorities_first_with_stale_fallback_notes(tmp_path, monkeypatch):
+    main = _load_main_with_stubs(monkeypatch)
     archive_dir = tmp_path / "google-archive"
     account_dir = archive_dir / main._google_account_slug("andy@pyfi.org")
     account_dir.mkdir(parents=True)
@@ -665,21 +742,100 @@ Andy Payne
             return base.astimezone(tz)
 
     monkeypatch.setattr(main, "_GOOGLE_ARCHIVE_ROOT", archive_dir)
+    monkeypatch.setattr(main, "_ARCHIVIST_GIT_REPO_DIRS", [])
+    monkeypatch.setattr(main, "_collect_git_activity_for_days", lambda: {})
+    monkeypatch.setattr(main, "_collect_media_activity_for_days", lambda: {})
     monkeypatch.setattr(main, "_FOCUS_WORK_NOTES_ROOT", tmp_path / "missing-vnotes")
     monkeypatch.setattr(main, "datetime", _FakeDateTime)
     monkeypatch.setattr(main.Path, "resolve", lambda self: tmp_path / "main.py")
+    import github_service
+    monkeypatch.setattr(github_service, "collect_github_activity_for_days", lambda: {})
 
     lane = main._build_work_focus_lane()
 
     assert lane["sourceLabel"] == "Fallback business notes"
     assert "not found" in lane["sourceWarning"]
-    assert lane["sections"][0]["id"] == "current_business_signals"
-    assert lane["sections"][0]["items"][0]["title"] == "Caddy production sampling review"
-    assert lane["sections"][1]["id"] == "recent_business_meetings"
+    assert lane["sections"][0]["id"] == "priorities"
+    assert lane["sections"][0]["items"][0]["title"] == "Old priority"
+    assert lane["sections"][1]["id"] == "current_business_signals"
+    assert lane["sections"][1]["items"][0]["title"] == "Caddy production sampling review"
+
+
+def test_focus_business_terms_are_never_personal(monkeypatch):
+    main = _load_main_with_stubs(monkeypatch)
+
+    assert main._focus_text_is_work_like("Gigantor execution planning")
+    assert main._focus_text_is_work_like("vivonics.ai DNS setup")
+    assert main._focus_text_is_work_like("MyVersant performance goals")
+
+    buckets = main._google_archive_story_buckets(
+        {
+            "notable_mentions": [
+                {
+                    "source": "email",
+                    "text": "VIVONICS.AI DNS renewal payment",
+                    "low_signal": False,
+                }
+            ],
+            "supporting_mentions": [],
+            "document_topics": [],
+        }
+    )
+
+    assert buckets["work"]
+    assert not buckets["life"]
+
+
+def test_personal_focus_cleanup_removes_generic_summary_framing(monkeypatch):
+    main = _load_main_with_stubs(monkeypatch)
+
+    lane = main._focus_clean_personal_lane(
+        {
+            "id": "personal",
+            "sections": [
+                {
+                    "id": "priorities",
+                    "kind": "priority_table",
+                    "items": [
+                        {
+                            "num": "1",
+                            "title": "Planning and coordination around Unconventional Methods",
+                            "owner": "Andy",
+                            "status": "Upcoming",
+                            "next_action": "Scheduled: Unconventional Methods.",
+                            "detail_md": "Scheduled: Unconventional Methods.\n\nPrimary signal is Unconventional Methods. Most of the visible signal sits in personal logistics.",
+                        }
+                    ],
+                },
+                {
+                    "id": "upcoming",
+                    "kind": "table",
+                    "items": [
+                        {
+                            "when": "2026-05-08",
+                            "event": "Planning and coordination",
+                            "why": "Scheduled: Unconventional Methods.",
+                        }
+                    ],
+                },
+                {
+                    "id": "watchlist",
+                    "kind": "list",
+                    "items": ["Main signal: Flight to SLC. Related personal/logistics: Flight to OKC."],
+                },
+            ],
+        }
+    )
+
+    assert lane["sections"][0]["items"][0]["title"] == "Unconventional Methods"
+    assert lane["sections"][0]["items"][0]["next_action"] == "Unconventional Methods"
+    assert "Primary signal" not in lane["sections"][0]["items"][0]["detail_md"]
+    assert lane["sections"][1]["items"][0]["event"] == "Unconventional Methods"
+    assert lane["sections"][2]["items"][0] == "Flight to SLC. Flight to OKC."
 
 
 def test_focus_overview_response_splits_business_and_personal(monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
 
     monkeypatch.setattr(
         main,
@@ -728,7 +884,7 @@ def test_focus_overview_response_splits_business_and_personal(monkeypatch):
 
 
 def test_personal_focus_snapshot_stays_current_until_morning_sync(monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
 
     class _FakeDateTime(main.datetime):
         @classmethod
@@ -754,7 +910,7 @@ def test_personal_focus_snapshot_stays_current_until_morning_sync(monkeypatch):
 
 
 def test_personal_focus_snapshot_holds_steady_during_google_import(monkeypatch):
-    main = _load_main_with_stubs()
+    main = _load_main_with_stubs(monkeypatch)
     monkeypatch.setattr(main, '_google_import_status_public', lambda: {'running': True})
 
     class _FakeDateTime(main.datetime):

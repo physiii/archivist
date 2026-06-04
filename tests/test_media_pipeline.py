@@ -1378,11 +1378,11 @@ class TestPipeline:
         payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
         assert payload["media_id"] == "abc123"
 
-    def test_generate_subject_line_falls_back_without_gateway(self, monkeypatch):
+    def test_generate_subject_line_falls_back_without_executor(self, monkeypatch):
         from media import pipeline
         from media.models import ComposedDocument, ContextualMemory, DerivedArtifact, MediaAsset, Modality, OutputFormat
 
-        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "")
+        monkeypatch.setattr(pipeline, "AGENT_EXECUTOR_TOKEN", "")
 
         asset = MediaAsset(
             media_id="abc123",
@@ -1408,9 +1408,9 @@ class TestPipeline:
         subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
         assert subject_line == "Meeting on launch planning reaches concrete decisions."
         assert details["generator"] == "heuristic"
-        assert details["reason"] == "gateway_unconfigured"
+        assert details["reason"] == "executor_unconfigured"
 
-    def test_generate_subject_line_uses_gateway_when_configured(self, monkeypatch):
+    def test_generate_subject_line_uses_executor_when_configured(self, monkeypatch):
         from media import pipeline
         from media.models import ComposedDocument, ContextualMemory, DerivedArtifact, MediaAsset, Modality, OutputFormat
 
@@ -1449,28 +1449,29 @@ class TestPipeline:
         class _FakeRequests:
             @staticmethod
             def post(url, json=None, headers=None, timeout=None):
-                assert url == "http://gateway/v1/chat/completions"
+                assert url == "http://executor/v1/chat/completions"
                 assert json["model"] == "test-model"
-                assert headers["x-openclaw-agent-id"] == "archivist-main"
-                assert headers["x-openclaw-session-key"] == "agent:archivist-main:media-subject:abc123"
+                assert headers["x-agent-id"] == "archivist-main"
+                assert headers["x-agent-session-key"] == "agent:archivist-main:media-subject:abc123"
                 assert json["user"] == "agent:archivist-main:media-subject:abc123"
                 return _FakeResponse()
 
-        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "token")
-        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_URL", "http://gateway")
-        monkeypatch.setattr(pipeline, "OPENCLAW_CHAT_MODEL", "test-model")
+        monkeypatch.setattr(pipeline, "AGENT_EXECUTOR_TOKEN", "token")
+        monkeypatch.setattr(pipeline, "AGENT_EXECUTOR_URL", "http://executor")
+        monkeypatch.setattr(pipeline, "AGENT_CHAT_MODEL", "test-model")
+        monkeypatch.setenv("ARCHIVIST_MEDIA_AGENT_ID", "archivist-main")
         monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
 
         subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
         assert subject_line == "Andy reviews launch planning and timelines with the team."
-        assert details["generator"] == "openclaw"
+        assert details["generator"] == "agent-executor"
         assert details["model"] == "test-model"
 
     def test_generate_subject_line_filters_noisy_participants(self, monkeypatch):
         from media import pipeline
         from media.models import ComposedDocument, ContextualMemory, DerivedArtifact, MediaAsset, Modality, OutputFormat
 
-        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "")
+        monkeypatch.setattr(pipeline, "AGENT_EXECUTOR_TOKEN", "")
 
         asset = MediaAsset(
             media_id="abc123",
@@ -1544,21 +1545,22 @@ class TestPipeline:
         class _FakeRequests:
             @staticmethod
             def post(url, json=None, headers=None, timeout=None):
-                assert url == "http://gateway/v1/chat/completions"
+                assert url == "http://executor/v1/chat/completions"
                 assert json["model"] == "test-model"
-                assert headers["x-openclaw-agent-id"] == "archivist-main"
-                assert headers["x-openclaw-session-key"] == "agent:archivist-main:media-subject:abc123"
+                assert headers["x-agent-id"] == "archivist-main"
+                assert headers["x-agent-session-key"] == "agent:archivist-main:media-subject:abc123"
                 assert json["user"] == "agent:archivist-main:media-subject:abc123"
                 return _FakeResponse()
 
-        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_TOKEN", "token")
-        monkeypatch.setattr(pipeline, "OPENCLAW_GATEWAY_URL", "http://gateway")
-        monkeypatch.setattr(pipeline, "OPENCLAW_CHAT_MODEL", "test-model")
+        monkeypatch.setattr(pipeline, "AGENT_EXECUTOR_TOKEN", "token")
+        monkeypatch.setattr(pipeline, "AGENT_EXECUTOR_URL", "http://executor")
+        monkeypatch.setattr(pipeline, "AGENT_CHAT_MODEL", "test-model")
+        monkeypatch.setenv("ARCHIVIST_MEDIA_AGENT_ID", "archivist-main")
         monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
 
         subject_line, details = pipeline._generate_subject_line(asset, artifacts, memory, document)
         assert subject_line == "Meeting on AI and ID covers decisions and open questions."
-        assert details["generator"] == "openclaw"
+        assert details["generator"] == "agent-executor"
 
     def test_select_public_artifacts_keeps_only_clean_bundle_outputs(self):
         from media import pipeline

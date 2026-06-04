@@ -11,57 +11,60 @@ def test_host_workspace_points_to_repo_root():
 
 
 def test_build_agent_system_message_contains_real_workspace():
-    message = ai.build_agent_system_message("archivist-main")
+    message = ai.build_agent_system_message("operator-chat")
     workspace = str(Path(__file__).resolve().parents[1])
     assert "archivist" in message.lower()
     assert workspace in message
     assert "/app" not in message.split("not /app", 1)[0].lower()
 
 
-def test_build_agent_system_message_mentions_agent_docs():
-    message = ai.build_agent_system_message("archivist-main")
-    assert "openclaw-team/agents/archivist-main" in message
-    assert "Agent identity (archivist-main)" in message
+def test_build_agent_system_message_mentions_shared_agents_repo():
+    message = ai.build_agent_system_message("operator-chat")
+    assert "/media/mass/agents" in message
+    assert "Agent identity (operator-chat)" in message
 
 
-def test_load_team_agents_discovers_archivist_main():
+def test_load_team_agents_discovers_shared_operator_chat():
     agents = ai.load_team_agents()
     agent_ids = {agent.get("agent_id") for agent in agents}
-    assert "archivist-main" in agent_ids
+    assert "operator-chat" in agent_ids
+    assert "runtime-health-monitor" in agent_ids
+
+
+def test_load_shared_skills_discovers_catalog():
+    skills = ai.load_shared_skills()
+    skill_ids = {skill.get("id") for skill in skills}
+    assert "engineering-code" in skill_ids
+    assert "verification-gate" in skill_ids
+
+
+def test_load_mcp_servers_discovers_registry():
+    servers = ai.load_mcp_servers()
+    server_names = {server.get("name") for server in servers}
+    assert "llm-tools" in server_names
 
 
 def test_encode_decode_session_ref_round_trip():
-    encoded = ai.encode_session_ref("archivist-main", "main:web:demo@archivist-main")
-    assert encoded == "agent:archivist-main:main:web:demo@archivist-main"
-    assert ai.decode_session_ref(encoded) == ("archivist-main", "main:web:demo@archivist-main")
+    encoded = ai.encode_session_ref("operator-chat", "main:web:demo@operator-chat")
+    assert encoded == "agent:operator-chat:main:web:demo@operator-chat"
+    assert ai.decode_session_ref(encoded) == ("operator-chat", "main:web:demo@operator-chat")
 
 
-def test_gateway_session_key_uses_agent_prefix():
+def test_agent_session_key_uses_agent_prefix():
     assert (
-        ai.gateway_session_key("archivist-main", "main:web:demo@archivist-main")
-        == "agent:archivist-main:main:web:demo@archivist-main"
+        ai.agent_session_key("operator-chat", "main:web:demo@operator-chat")
+        == "agent:operator-chat:main:web:demo@operator-chat"
     )
 
 
-def test_example_openclaw_config_uses_repo_root_workspaces():
-    example = (Path(__file__).resolve().parents[1] / "openclaw-team" / "openclaw.archivist-agents.example.json5").read_text(
-        encoding="utf-8"
-    )
-    assert "/home/andy/archivist/openclaw-team/agents/" not in example
-    assert example.count('workspace: "/home/andy/archivist"') >= 5
+def test_agent_session_roots_can_be_overridden(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCHIVIST_AGENT_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    roots = ai._agent_session_roots()
+
+    assert roots[0] == tmp_path / "sessions"
 
 
-def test_openclaw_config_candidates_prefer_repo_local_override(monkeypatch, tmp_path):
-    monkeypatch.setenv("OPENCLAW_CONFIG_PATH", str(tmp_path / "explicit.json"))
-    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "state"))
-    candidates = ai._openclaw_config_candidates()
-
-    assert candidates[0] == tmp_path / "explicit.json"
-    assert candidates[1] == tmp_path / "state" / "openclaw.json"
-    assert candidates[2] == Path(__file__).resolve().parents[1] / ".openclaw" / "openclaw.json"
-
-
-def test_load_openclaw_sessions_falls_back_to_main_store(tmp_path, monkeypatch):
+def test_load_agent_sessions_falls_back_to_main_store(tmp_path, monkeypatch):
     agents_root = tmp_path / "agents"
     main_sessions_dir = agents_root / "main" / "sessions"
     main_sessions_dir.mkdir(parents=True)
@@ -94,24 +97,24 @@ def test_load_openclaw_sessions_falls_back_to_main_store(tmp_path, monkeypatch):
     )
 
     store = {
-        "main:web:test@archivist-main": {
+        "main:web:test@operator-chat": {
             "updatedAt": 1775526795608,
             "sessionFile": str(session_file),
-            "systemPromptReport": {"sessionKey": "main:web:test@archivist-main"},
+            "systemPromptReport": {"sessionKey": "main:web:test@operator-chat"},
         }
     }
     (main_sessions_dir / "sessions.json").write_text(json.dumps(store), encoding="utf-8")
 
-    monkeypatch.setattr(ai, "_openclaw_agents_roots", lambda: [agents_root])
+    monkeypatch.setattr(ai, "_agent_session_roots", lambda: [agents_root])
 
-    sessions = ai.load_openclaw_sessions_for_agents(["archivist-main"])
+    sessions = ai.load_agent_sessions_for_agents(["operator-chat"])
     assert len(sessions) == 1
-    assert sessions[0]["agentId"] == "archivist-main"
-    assert sessions[0]["sessionKey"] == "main:web:test@archivist-main"
+    assert sessions[0]["agentId"] == "operator-chat"
+    assert sessions[0]["sessionKey"] == "main:web:test@operator-chat"
     assert sessions[0]["lastMessage"] == "/home/andy/archivist"
 
 
-def test_load_openclaw_sessions_skips_unrouted_default_store_entries(tmp_path, monkeypatch):
+def test_load_agent_sessions_skips_unrouted_default_store_entries(tmp_path, monkeypatch):
     agents_root = tmp_path / "agents"
     default_sessions_dir = agents_root / "default" / "sessions"
     default_sessions_dir.mkdir(parents=True)
@@ -119,7 +122,7 @@ def test_load_openclaw_sessions_skips_unrouted_default_store_entries(tmp_path, m
     (default_sessions_dir / "sessions.json").write_text(
         json.dumps(
             {
-                "agent:default:openai:test-session": {
+                "agent:default:api:test-session": {
                     "updatedAt": 1775526795608,
                     "sessionFile": str(default_sessions_dir / "session-1.jsonl"),
                 }
@@ -128,15 +131,15 @@ def test_load_openclaw_sessions_skips_unrouted_default_store_entries(tmp_path, m
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(ai, "_openclaw_agents_roots", lambda: [agents_root])
+    monkeypatch.setattr(ai, "_agent_session_roots", lambda: [agents_root])
 
-    assert ai.load_openclaw_sessions_for_agents(["archivist-main"]) == []
+    assert ai.load_agent_sessions_for_agents(["operator-chat"]) == []
 
 
-def test_load_openclaw_sessions_reads_all_candidate_stores(tmp_path, monkeypatch):
+def test_load_agent_sessions_reads_all_candidate_stores(tmp_path, monkeypatch):
     agents_root = tmp_path / "agents"
 
-    agent_sessions_dir = agents_root / "archivist-main" / "sessions"
+    agent_sessions_dir = agents_root / "operator-chat" / "sessions"
     main_sessions_dir = agents_root / "main" / "sessions"
     default_sessions_dir = agents_root / "default" / "sessions"
     agent_sessions_dir.mkdir(parents=True)
@@ -174,10 +177,10 @@ def test_load_openclaw_sessions_reads_all_candidate_stores(tmp_path, monkeypatch
     (main_sessions_dir / "sessions.json").write_text(
         json.dumps(
             {
-                "main:web:restored@archivist-main": {
+                "main:web:restored@operator-chat": {
                     "updatedAt": 1775526795608,
                     "sessionFile": str(routed_session_file),
-                    "systemPromptReport": {"sessionKey": "main:web:restored@archivist-main"},
+                    "systemPromptReport": {"sessionKey": "main:web:restored@operator-chat"},
                 }
             }
         ),
@@ -187,7 +190,7 @@ def test_load_openclaw_sessions_reads_all_candidate_stores(tmp_path, monkeypatch
     (default_sessions_dir / "sessions.json").write_text(
         json.dumps(
             {
-                "agent:default:openai:noise": {
+                "agent:default:api:noise": {
                     "updatedAt": 1775526795609,
                     "sessionFile": str(default_sessions_dir / "session-noise.jsonl"),
                 }
@@ -196,9 +199,9 @@ def test_load_openclaw_sessions_reads_all_candidate_stores(tmp_path, monkeypatch
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(ai, "_openclaw_agents_roots", lambda: [agents_root])
+    monkeypatch.setattr(ai, "_agent_session_roots", lambda: [agents_root])
 
-    sessions = ai.load_openclaw_sessions_for_agents(["archivist-main"])
+    sessions = ai.load_agent_sessions_for_agents(["operator-chat"])
     assert len(sessions) == 1
-    assert sessions[0]["sessionKey"] == "main:web:restored@archivist-main"
+    assert sessions[0]["sessionKey"] == "main:web:restored@operator-chat"
     assert sessions[0]["storeOwner"] == "main"

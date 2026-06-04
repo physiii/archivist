@@ -113,6 +113,7 @@ export type BackupOverview = {
   };
   timer_schedule?: string;
   backup_pool?: string;
+  archive_bwlimit?: string;
   rsync_bwlimit?: string;
   schedule: {
     enabled: boolean;

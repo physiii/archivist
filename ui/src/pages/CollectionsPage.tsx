@@ -31,6 +31,90 @@ function formatDistance(distance: number) {
   return Number.isFinite(distance) ? distance.toFixed(4) : "—";
 }
 
+function ResultDetails({ result }: { result: SearchResult }) {
+  const tags = parseStoredTags(result.tags);
+  return (
+    <div className="record-row-expanded">
+      <div className="record-row-expanded-head">
+        <dl className="detail-list detail-list--inline">
+          <div>
+            <dt>Row id</dt>
+            <dd className="mono">#{String(result.id)}</dd>
+          </div>
+          <div>
+            <dt>Collection</dt>
+            <dd>{result.collection ?? "unknown"}</dd>
+          </div>
+          <div>
+            <dt>Distance</dt>
+            <dd>{formatDistance(result.distance)}</dd>
+          </div>
+          <div>
+            <dt>Indexed</dt>
+            <dd>{result.creation_date || "Unknown"}</dd>
+          </div>
+          <div>
+            <dt>Path</dt>
+            <dd className="mono" title={getResultPath(result)}>
+              {getResultPath(result) || "Unavailable"}
+            </dd>
+          </div>
+        </dl>
+        {result.collection ? (
+          <Link className="button-link" to={`/collections/${encodeURIComponent(result.collection)}`}>
+            Open collection
+          </Link>
+        ) : null}
+      </div>
+      {tags.length > 0 ? (
+        <div className="workspace-chip-row">
+          {tags.map((tag) => (
+            <span key={`${resultKey(result)}:${tag}`} className="workspace-chip">
+              {tag}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <pre className="detail-preview compact">{(result.text ?? "").trim() || "No text available."}</pre>
+    </div>
+  );
+}
+
+function CollectionInlineDetails({ collection }: { collection: CollectionCard }) {
+  return (
+    <div className="collection-row-expanded">
+      <div className="collection-detail-strip">
+        <div>
+          <span className="collection-detail-label">Rows</span>
+          <strong>{typeof collection.num_entities === "number" ? collection.num_entities.toLocaleString() : "Unknown"}</strong>
+        </div>
+        <div>
+          <span className="collection-detail-label">Embedding</span>
+          <strong>{collection.vector_dim ? `${collection.vector_dim} dims` : "Unavailable"}</strong>
+        </div>
+        <div>
+          <span className="collection-detail-label">Retrieval</span>
+          <strong>{collection.has_sparse ? "Hybrid" : "Dense"}</strong>
+        </div>
+        <div>
+          <span className="collection-detail-label">Raw name</span>
+          <strong className="mono" title={collection.raw_name}>{collection.raw_name}</strong>
+        </div>
+      </div>
+      <div className="collection-detail-footer">
+        {collection.stats_error ? (
+          <span className="inline-warning">Stats error: {collection.stats_error}</span>
+        ) : (
+          <span className="collection-detail-note">Open the collection to search within this source and inspect row-level evidence.</span>
+        )}
+        <Link className="button-link collection-open-link" to={`/collections/${encodeURIComponent(collection.name)}`}>
+          Open collection
+        </Link>
+      </div>
+    </div>
+  );
+}
+
 export default function CollectionsPage() {
   const [collections, setCollections] = useState<CollectionCard[]>([]);
   const [loading, setLoading] = useState(true);
@@ -52,7 +136,7 @@ export default function CollectionsPage() {
         if (current && nextCollections.some((collection) => collection.name === current)) {
           return current;
         }
-        return nextCollections[0]?.name ?? null;
+        return null;
       });
       if (surfaceErrors) {
         setError(null);
@@ -79,7 +163,7 @@ export default function CollectionsPage() {
       const nextResults = payload.results ?? [];
       setGlobalResults(nextResults);
       setGlobalTotalCandidates(payload.total_candidates ?? null);
-      setSelectedResultKey(nextResults[0] ? resultKey(nextResults[0]) : null);
+      setSelectedResultKey(null);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Global search failed.");
@@ -101,9 +185,6 @@ export default function CollectionsPage() {
       window.clearTimeout(idleHandle);
     };
   }, []);
-
-  const selectedCollection = collections.find((collection) => collection.name === selectedCollectionName) ?? null;
-  const selectedResult = globalResults?.find((result) => resultKey(result) === selectedResultKey) ?? null;
 
   const totalRows = useMemo(
     () => collections.reduce((sum, collection) => sum + (collection.num_entities ?? 0), 0),
@@ -134,7 +215,7 @@ export default function CollectionsPage() {
 
       <WorkspacePanel
         title="Cross-collection search"
-        description="Use the global query bar for fast triage, then inspect the selected hit in the side panel before drilling into the source collection."
+        description="Use the global query bar for fast triage. Click any result to expand the row in place."
       >
         <div className="workspace-search-shell">
           <div className="workspace-search-row">
@@ -175,21 +256,22 @@ export default function CollectionsPage() {
         </div>
 
         {globalResults ? (
-          <div className="workspace-grid workspace-grid--two">
-            <div className="workspace-stack">
-              <div className="workspace-inline-meta">
-                <span>{globalResults.length} visible matches</span>
-                <span>{typeof globalTotalCandidates === "number" ? `${globalTotalCandidates} total candidates` : "Candidate count unavailable"}</span>
-              </div>
-              <div className="record-list" role="list" aria-label="Global search results">
-                {globalResults.map((result) => {
-                  const key = resultKey(result);
-                  return (
+          <div className="workspace-stack">
+            <div className="workspace-inline-meta">
+              <span>{globalResults.length} visible matches</span>
+              <span>{typeof globalTotalCandidates === "number" ? `${globalTotalCandidates} total candidates` : "Candidate count unavailable"}</span>
+            </div>
+            <div className="record-list" role="list" aria-label="Global search results">
+              {globalResults.map((result) => {
+                const key = resultKey(result);
+                const isSelected = selectedResultKey === key;
+                return (
+                  <article key={key} className={`record-row ${isSelected ? "active" : ""}`}>
                     <button
-                      key={key}
                       type="button"
-                      className={`record-row ${selectedResultKey === key ? "active" : ""}`}
-                      onClick={() => setSelectedResultKey(key)}
+                      className="record-row-click"
+                      onClick={() => setSelectedResultKey(isSelected ? null : key)}
+                      aria-expanded={isSelected}
                     >
                       <div className="record-row-head">
                         <div className="record-row-title-group">
@@ -205,160 +287,67 @@ export default function CollectionsPage() {
                       ) : null}
                       <span className="record-row-preview">{(result.text ?? "").trim() || "No text preview available."}</span>
                     </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="inspector-panel">
-              {selectedResult ? (
-                <>
-                  <div className="inspector-header">
-                    <div>
-                      <h3 className="inspector-title">Selected match</h3>
-                      <p className="inspector-subtitle">Inspect the row before opening the source collection.</p>
-                    </div>
-                    <Link className="button-link" to={`/collections/${encodeURIComponent(selectedResult.collection ?? "")}`}>
-                      Open collection
-                    </Link>
-                  </div>
-                  <dl className="detail-list">
-                    <div>
-                      <dt>Collection</dt>
-                      <dd>{selectedResult.collection ?? "unknown"}</dd>
-                    </div>
-                    <div>
-                      <dt>Distance</dt>
-                      <dd>{formatDistance(selectedResult.distance)}</dd>
-                    </div>
-                    <div>
-                      <dt>Indexed</dt>
-                      <dd>{selectedResult.creation_date || "Unknown"}</dd>
-                    </div>
-                    <div>
-                      <dt>Path</dt>
-                      <dd className="mono" title={getResultPath(selectedResult)}>
-                        {getResultPath(selectedResult) || "Unavailable"}
-                      </dd>
-                    </div>
-                  </dl>
-                  {parseStoredTags(selectedResult.tags).length > 0 ? (
-                    <div className="workspace-chip-row">
-                      {parseStoredTags(selectedResult.tags).map((tag) => (
-                        <span key={`${resultKey(selectedResult)}:${tag}`} className="workspace-chip">
-                          {tag}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                  <pre className="detail-preview">{(selectedResult.text ?? "").trim() || "No text available."}</pre>
-                </>
-              ) : (
-                <WorkspaceEmpty
-                  title="No match selected"
-                  description="Run a search, then click any result row to inspect the full context here."
-                />
-              )}
+                    {isSelected ? <ResultDetails result={result} /> : null}
+                  </article>
+                );
+              })}
             </div>
           </div>
         ) : (
           <WorkspaceEmpty
             title="Search is ready"
-            description="The result list and inspector appear here after you run a cross-collection query."
+            description="The result list appears here after you run a cross-collection query."
           />
         )}
       </WorkspacePanel>
 
-      <div className="workspace-grid workspace-grid--two">
-        <WorkspacePanel
-          title="Collection catalog"
-          description="Dense catalog rows keep the overview scannable even when the instance grows well beyond a handful of collections."
-        >
-          {loading ? (
-            <WorkspaceEmpty title="Loading collections" description="Waiting for collection metadata." />
-          ) : collections.length === 0 ? (
-            <WorkspaceEmpty title="No collections found" description="Create or index a collection to populate the catalog." />
-          ) : (
-            <div className="record-list" role="list" aria-label="Collection catalog">
-              {collections.map((collection) => (
-                <button
+      <WorkspacePanel
+        title="Collection catalog"
+        description="Click a collection to expand its metadata inline, then open it when you are ready to inspect rows."
+      >
+        {loading ? (
+          <WorkspaceEmpty title="Loading collections" description="Waiting for collection metadata." />
+        ) : collections.length === 0 ? (
+          <WorkspaceEmpty title="No collections found" description="Create or index a collection to populate the catalog." />
+        ) : (
+          <div className="record-list collection-catalog-list" role="list" aria-label="Collection catalog">
+            {collections.map((collection) => {
+              const isSelected = selectedCollectionName === collection.name;
+              return (
+                <article
                   key={collection.raw_name}
-                  type="button"
-                  className={`record-row ${selectedCollectionName === collection.name ? "active" : ""}`}
-                  onClick={() => setSelectedCollectionName(collection.name)}
+                  className={`record-row collection-catalog-row ${isSelected ? "active" : ""}`}
                 >
-                  <div className="record-row-head">
-                    <div className="record-row-title-group">
-                      <strong className="record-row-title mono">{collection.name}</strong>
-                      <span className={`workspace-chip ${collection.has_sparse ? "workspace-chip--success" : ""}`}>
-                        {collection.has_sparse ? "Hybrid" : "Dense"}
-                      </span>
+                  <button
+                    type="button"
+                    className="record-row-click collection-row-trigger"
+                    onClick={() => setSelectedCollectionName(isSelected ? null : collection.name)}
+                    aria-expanded={isSelected}
+                  >
+                    <div className="record-row-head">
+                      <div className="record-row-title-group">
+                        <strong className="record-row-title mono">{collection.name}</strong>
+                        <span className={`workspace-chip ${collection.has_sparse ? "workspace-chip--success" : ""}`}>
+                          {collection.has_sparse ? "Hybrid" : "Dense"}
+                        </span>
+                      </div>
+                      <span className="workspace-chip">{typeof collection.num_entities === "number" ? `${collection.num_entities.toLocaleString()} rows` : "—"}</span>
                     </div>
-                    <span className="workspace-chip">{typeof collection.num_entities === "number" ? `${collection.num_entities} rows` : "—"}</span>
-                  </div>
-                  <span className="record-row-subtitle mono" title={collection.raw_name}>
-                    {collection.raw_name}
-                  </span>
-                  <span className="record-row-preview">
-                    {collection.vector_dim ? `Vector dim ${collection.vector_dim}` : "Vector dimension unavailable"}
-                    {collection.stats_error ? ` · ${collection.stats_error}` : ""}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-        </WorkspacePanel>
-
-        <WorkspacePanel
-          title="Collection details"
-          description="Selection details stay pinned on the right so you do not need to navigate away just to confirm basic metadata."
-          actions={
-            selectedCollection ? (
-              <Link className="button-link" to={`/collections/${encodeURIComponent(selectedCollection.name)}`}>
-                Open collection
-              </Link>
-            ) : null
-          }
-        >
-          {selectedCollection ? (
-            <>
-              <dl className="detail-list">
-                <div>
-                  <dt>Name</dt>
-                  <dd className="mono">{selectedCollection.name}</dd>
-                </div>
-                <div>
-                  <dt>Raw name</dt>
-                  <dd className="mono" title={selectedCollection.raw_name}>
-                    {selectedCollection.raw_name}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Rows</dt>
-                  <dd>{selectedCollection.num_entities ?? "Unknown"}</dd>
-                </div>
-                <div>
-                  <dt>Embedding</dt>
-                  <dd>{selectedCollection.vector_dim ? `${selectedCollection.vector_dim} dimensions` : "Unavailable"}</dd>
-                </div>
-                <div>
-                  <dt>Retrieval mode</dt>
-                  <dd>{selectedCollection.has_sparse ? "Dense + sparse hybrid" : "Dense only"}</dd>
-                </div>
-              </dl>
-              {selectedCollection.stats_error ? (
-                <div className="inline-warning">Stats error: {selectedCollection.stats_error}</div>
-              ) : (
-                <p className="inspector-copy">
-                  This collection is ready for inspection. Open it to search within a single source and view the embeddings preview alongside individual row details.
-                </p>
-              )}
-            </>
-          ) : (
-            <WorkspaceEmpty title="No collection selected" description="Choose a collection row to inspect it here." />
-          )}
-        </WorkspacePanel>
-      </div>
+                    <span className="record-row-subtitle mono" title={collection.raw_name}>
+                      {collection.raw_name}
+                    </span>
+                    <span className="record-row-preview">
+                      {collection.vector_dim ? `Vector dim ${collection.vector_dim}` : "Vector dimension unavailable"}
+                      {collection.stats_error ? ` · ${collection.stats_error}` : ""}
+                    </span>
+                  </button>
+                  {isSelected ? <CollectionInlineDetails collection={collection} /> : null}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </WorkspacePanel>
     </WorkspacePage>
   );
 }

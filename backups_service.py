@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import re
 import selectors
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +22,8 @@ try:
 except Exception:  # pragma: no cover
     fcntl = None  # type: ignore
 
+logger = logging.getLogger("archivist.backups")
+
 
 BACKUP_ROOT = Path(os.getenv("VECTORSTORE_BACKUP_DIR", "/backups"))
 RUNS_DIR = BACKUP_ROOT / "runs"
@@ -28,6 +32,12 @@ BACKUP_CONFIG_FILE = BACKUP_ROOT / "backup-config.json"
 SCHEDULER_LOCK_FILE = BACKUP_ROOT / ".backup-scheduler.lock"
 RUN_LOCK_FILE = BACKUP_ROOT / ".backup-run.lock"
 RUN_SUMMARY_FILE = "summary.json"
+BACKUP_ROOT_REQUIRE_SEPARATE_MOUNT = str(
+    os.getenv("VECTORSTORE_BACKUP_REQUIRE_SEPARATE_MOUNT", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
+BACKUP_ROOT_MIN_TOTAL_BYTES = int(
+    os.getenv("VECTORSTORE_BACKUP_MIN_TOTAL_BYTES", str(10 * 1024**4))
+)
 
 # Canonical docker volume mounts for the vectorstore stack archive.
 ARCHIVE_SOURCE_DIRS = [
@@ -78,6 +88,32 @@ RSYNC_IDLE_TIMEOUT_SECONDS = max(int(os.getenv("VECTORSTORE_RSYNC_IDLE_TIMEOUT_S
 RSYNC_NICE_LEVEL = min(max(int(os.getenv("VECTORSTORE_RSYNC_NICE_LEVEL", "15")), 0), 19)
 RSYNC_IONICE_CLASS = str(os.getenv("VECTORSTORE_RSYNC_IONICE_CLASS", "idle")).strip().lower()
 RSYNC_IONICE_LEVEL = min(max(int(os.getenv("VECTORSTORE_RSYNC_IONICE_LEVEL", "7")), 0), 7)
+ARCHIVE_BWLIMIT = str(os.getenv("VECTORSTORE_ARCHIVE_BWLIMIT", "8M")).strip()
+
+# Retention: keep this many newest milvus_volumes_*.tar.gz archives; older ones
+# are pruned after a successful archive run. 0 or negative disables pruning.
+ARCHIVE_RETENTION_KEEP = int(os.getenv("VECTORSTORE_BACKUP_RETENTION_KEEP", "14"))
+
+THROTTLED_COPY_SCRIPT = (
+    "import sys,time\n"
+    "limit=int(sys.argv[1])\n"
+    "chunk=max(65536,min(1048576,limit or 1048576))\n"
+    "start=time.monotonic()\n"
+    "written=0\n"
+    "inp=sys.stdin.buffer\n"
+    "out=sys.stdout.buffer\n"
+    "while True:\n"
+    "    data=inp.read(chunk)\n"
+    "    if not data:\n"
+    "        break\n"
+    "    out.write(data)\n"
+    "    out.flush()\n"
+    "    written += len(data)\n"
+    "    if limit > 0:\n"
+    "        delay = (written / limit) - (time.monotonic() - start)\n"
+    "        if delay > 0:\n"
+    "            time.sleep(delay)\n"
+)
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -112,6 +148,13 @@ def _tail(path: Path, lines: int = 120) -> str:
             return "".join(tail_lines)
     except OSError:
         return ""
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temp.write_text(text, encoding="utf-8")
+    os.replace(temp, path)
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -202,12 +245,15 @@ def _zfs_runtime_available() -> tuple[bool, str | None]:
 
 def _resolve_archive_inputs() -> tuple[Path | None, list[str], list[str]]:
     roots = {path.parent for path, _label in ARCHIVE_SOURCE_DIRS}
-    archive_root = next(iter(roots)) if len(roots) == 1 else None
+    archive_root = next(iter(roots)) if len(roots) == 1 else Path("/")
     included_members: list[str] = []
     missing_paths: list[str] = []
     for path, member_name in ARCHIVE_SOURCE_DIRS:
         if path.exists():
-            included_members.append(member_name)
+            if len(roots) == 1:
+                included_members.append(member_name)
+            else:
+                included_members.append(str(path).lstrip("/"))
         else:
             missing_paths.append(str(path))
     return archive_root, included_members, missing_paths
@@ -224,7 +270,7 @@ def _delete_file_if_exists(path: Path | None) -> None:
 
 def _write_run_summary(run_dir: Path, summary: dict[str, Any]) -> None:
     try:
-        (run_dir / RUN_SUMMARY_FILE).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        _atomic_write_text(run_dir / RUN_SUMMARY_FILE, json.dumps(summary, indent=2))
     except OSError:
         pass
 
@@ -351,6 +397,49 @@ def _path_usage(path: str, expect_separate_mount: bool = False) -> dict[str, Any
         }
 
 
+def _backup_root_health() -> dict[str, Any]:
+    usage = _path_usage(str(BACKUP_ROOT), expect_separate_mount=BACKUP_ROOT_REQUIRE_SEPARATE_MOUNT)
+    total_bytes = usage.get("total_bytes")
+    min_total_ok = bool(
+        BACKUP_ROOT_MIN_TOTAL_BYTES <= 0
+        or (isinstance(total_bytes, int) and total_bytes >= BACKUP_ROOT_MIN_TOTAL_BYTES)
+    )
+    ready = all(
+        [
+            usage.get("exists"),
+            usage.get("writable"),
+            usage.get("mount_ok"),
+            min_total_ok,
+        ]
+    )
+    usage.update(
+        {
+            "ready": ready,
+            "min_total_bytes": BACKUP_ROOT_MIN_TOTAL_BYTES,
+            "min_total_ok": min_total_ok,
+            "require_separate_mount": BACKUP_ROOT_REQUIRE_SEPARATE_MOUNT,
+        }
+    )
+    return usage
+
+
+def _ensure_backup_root_safe() -> None:
+    health = _backup_root_health()
+    if health["ready"]:
+        return
+    reasons = []
+    if not health.get("exists"):
+        reasons.append("path does not exist")
+    if not health.get("writable"):
+        reasons.append("path is not writable")
+    if not health.get("mount_ok"):
+        reasons.append(f"path is not on a separate mount (mount_point={health.get('mount_point')})")
+    if not health.get("min_total_ok"):
+        total = health.get("total_bytes")
+        reasons.append(f"filesystem is too small for archive target (total_bytes={total})")
+    raise RuntimeError(f"Unsafe backup archive target {BACKUP_ROOT}: {', '.join(reasons)}")
+
+
 def _df_usage() -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     try:
@@ -470,6 +559,84 @@ def shutil_which(cmd: str) -> bool:
     return which(cmd) is not None
 
 
+def _parse_bwlimit_bytes(value: Any) -> int:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "0", "off", "none", "false", "unlimited"}:
+        return 0
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgt]?)(?:i?b)?(?:/s)?", raw)
+    if not match:
+        if raw == str(ARCHIVE_BWLIMIT or "").strip().lower():
+            return 8 * 1024**2
+        return _parse_bwlimit_bytes(ARCHIVE_BWLIMIT)
+    number = float(match.group(1))
+    multiplier = {
+        "": 1,
+        "k": 1024,
+        "m": 1024**2,
+        "g": 1024**3,
+        "t": 1024**4,
+    }[match.group(2)]
+    return max(int(number * multiplier), 0)
+
+
+def _build_archive_command(config: dict[str, Any], backup_path: Path, archive_root: Path, archive_members: list[str]) -> list[str]:
+    limit_label = config.get("archive_bwlimit") or ARCHIVE_BWLIMIT
+    limit_bytes = _parse_bwlimit_bytes(limit_label)
+    tar_args = [
+        "tar",
+        "--warning=no-file-changed",
+        "--ignore-failed-read",
+        "--checkpoint=500",
+        "--checkpoint-action=echo=archive checkpoint %u",
+        "-czf",
+    ]
+    if limit_bytes <= 0:
+        return [
+            *tar_args,
+            str(backup_path),
+            "-C",
+            str(archive_root),
+            *archive_members,
+        ]
+
+    if not shutil_which("bash"):
+        return [
+            *tar_args,
+            str(backup_path),
+            "-C",
+            str(archive_root),
+            *archive_members,
+        ]
+
+    script = (
+        "set -euo pipefail\n"
+        "backup_path=$1\n"
+        "archive_root=$2\n"
+        "limit_bytes=$3\n"
+        "python_bin=$4\n"
+        "copy_script=$5\n"
+        "shift 5\n"
+        "tar --warning=no-file-changed --ignore-failed-read "
+        "--checkpoint=500 --checkpoint-action=echo='archive checkpoint %u' "
+        "-czf - -C \"$archive_root\" \"$@\" "
+        "| \"$python_bin\" -c \"$copy_script\" \"$limit_bytes\" > \"$backup_path\"\n"
+    )
+    return [
+        "bash",
+        "-o",
+        "pipefail",
+        "-c",
+        script,
+        "archive-throttled",
+        str(backup_path),
+        str(archive_root),
+        str(limit_bytes),
+        sys.executable,
+        THROTTLED_COPY_SCRIPT,
+        *archive_members,
+    ]
+
+
 @dataclass
 class RuntimeState:
     process: subprocess.Popen[str] | None = None
@@ -500,6 +667,58 @@ _schedule = ScheduleState()
 _lock = threading.Lock()
 _scheduler_stop = threading.Event()
 _scheduler_lock_fd = None
+
+# Storage diagnostics probe the NAS/ZFS host over the network (df on sshfs mounts,
+# ssh to the ZFS host for `zpool status`), which can take ~20s under load. The data
+# changes slowly, so we serve a cached copy and refresh it in the background
+# (stale-while-revalidate) so the overview endpoint never blocks once warm.
+_storage_diag_cache: dict[str, Any] | None = None
+_storage_diag_cache_ts: float = 0.0
+_STORAGE_DIAG_TTL = 30.0
+_storage_diag_lock = threading.Lock()
+_storage_diag_refresh_thread: threading.Thread | None = None
+
+
+def _compute_storage_diagnostics(source_paths, destination_paths, backup_pool):
+    return {
+        "backup_root": _backup_root_health(),
+        "sources": [_path_usage(path, expect_separate_mount=_requires_separate_mount(path)) for path in source_paths],
+        "destinations": [_path_usage(path, expect_separate_mount=True) for path in destination_paths],
+        "filesystems": _df_usage(),
+        "zfs": _zfs_diagnostics(backup_pool),
+    }
+
+
+def _refresh_storage_diagnostics(source_paths, destination_paths, backup_pool):
+    global _storage_diag_cache, _storage_diag_cache_ts
+    diagnostics = _compute_storage_diagnostics(source_paths, destination_paths, backup_pool)
+    with _storage_diag_lock:
+        _storage_diag_cache = diagnostics
+        _storage_diag_cache_ts = time.time()
+    return diagnostics
+
+
+def _storage_diagnostics_cached(source_paths, destination_paths, backup_pool):
+    global _storage_diag_refresh_thread
+    with _storage_diag_lock:
+        cache = _storage_diag_cache
+        age = time.time() - _storage_diag_cache_ts
+    if cache is not None:
+        # Serve the cached copy immediately; kick off a background refresh when stale.
+        if age >= _STORAGE_DIAG_TTL:
+            with _storage_diag_lock:
+                running = _storage_diag_refresh_thread is not None and _storage_diag_refresh_thread.is_alive()
+                if not running:
+                    _storage_diag_refresh_thread = threading.Thread(
+                        target=_refresh_storage_diagnostics,
+                        args=(source_paths, destination_paths, backup_pool),
+                        name="backup-diag-refresh",
+                        daemon=True,
+                    )
+                    _storage_diag_refresh_thread.start()
+        return cache
+    # Cold cache (first call in this process): compute once synchronously.
+    return _refresh_storage_diagnostics(source_paths, destination_paths, backup_pool)
 _schedule_loaded = False
 
 
@@ -507,6 +726,7 @@ def _load_custodian_seed() -> dict[str, Any]:
     fallback = {
         "version": 1,
         "backup_pool": "mass",
+        "archive_bwlimit": ARCHIVE_BWLIMIT,
         "rsync_bwlimit": "20M",
         "sleep_seconds": 5,
         "exclude_hidden": True,
@@ -558,6 +778,7 @@ def _load_custodian_seed() -> dict[str, Any]:
         return {
             "version": 1,
             "backup_pool": getattr(module, "BACKUP_POOL", "mass"),
+            "archive_bwlimit": getattr(module, "ARCHIVE_BWLIMIT", ARCHIVE_BWLIMIT),
             "rsync_bwlimit": getattr(module, "RSYNC_BWLIMIT", "20M"),
             "sleep_seconds": int(getattr(module, "BACKUP_SLEEP_SECONDS", 5)),
             "exclude_hidden": True,
@@ -573,7 +794,7 @@ def _seed_backup_config_if_needed() -> None:
         return
     BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
     seed = _load_custodian_seed()
-    BACKUP_CONFIG_FILE.write_text(json.dumps(seed, indent=2), encoding="utf-8")
+    _atomic_write_text(BACKUP_CONFIG_FILE, json.dumps(seed, indent=2))
 
 
 def _load_backup_config() -> dict[str, Any]:
@@ -595,6 +816,7 @@ def _load_backup_config() -> dict[str, Any]:
         normalized = {
             "version": int(data.get("version", 1)),
             "backup_pool": data.get("backup_pool"),
+            "archive_bwlimit": data.get("archive_bwlimit") or ARCHIVE_BWLIMIT,
             "rsync_bwlimit": data.get("rsync_bwlimit"),
             "sleep_seconds": int(data.get("sleep_seconds", 5)),
             "exclude_hidden": bool(data.get("exclude_hidden", True)),
@@ -610,7 +832,7 @@ def _load_backup_config() -> dict[str, Any]:
 
 def _save_backup_config(config: dict[str, Any]) -> None:
     BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
-    BACKUP_CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    _atomic_write_text(BACKUP_CONFIG_FILE, json.dumps(config, indent=2))
 
 
 def list_backup_targets() -> list[dict[str, Any]]:
@@ -671,7 +893,7 @@ def _save_schedule_state() -> None:
     }
     try:
         BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
-        SCHEDULE_STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _atomic_write_text(SCHEDULE_STATE_FILE, json.dumps(payload, indent=2))
     except OSError:
         pass
 
@@ -823,6 +1045,10 @@ def _backup_files(limit: int = 20) -> list[dict[str, Any]]:
     return out
 
 
+def list_backup_files(limit: int = 20) -> list[dict[str, Any]]:
+    return _backup_files(limit=limit)
+
+
 def _target_health(profile: str, source: str, destination: str) -> dict[str, Any]:
     source_exists = os.path.exists(source)
     source_readable = os.access(source, os.R_OK) if source_exists else False
@@ -854,11 +1080,42 @@ def _target_health(profile: str, source: str, destination: str) -> dict[str, Any
     }
 
 
+def _unavailable_overview(exc: Exception) -> dict[str, Any]:
+    """Degraded overview payload when BACKUP_ROOT (a network mount) is unreachable."""
+    msg = f"Backup storage unavailable at {BACKUP_ROOT}: {exc}"
+    logger.warning(msg)
+    try:
+        schedule = get_schedule_config()
+    except Exception:
+        schedule = {}
+    return {
+        "status": {
+            "running": False, "pid": None, "run_id": None, "started_at": None,
+            "finished_at": None, "exit_code": None, "active_step": None,
+            "progress_current": 0, "progress_total": 0, "progress_line": None,
+        },
+        "storage_available": False,
+        "storage_error": msg,
+        "retention_keep": ARCHIVE_RETENTION_KEEP,
+        "backup_pool": None, "archive_bwlimit": None, "rsync_bwlimit": None,
+        "sleep_seconds": None, "exclude_hidden": True, "excludes": [],
+        "targets": [], "target_mappings": [], "target_health": [],
+        "storage_ready": False, "storage_diagnostics": {},
+        "timer_schedule": "daily", "schedule": schedule,
+        "snapshots": [], "recent_runs": [], "backup_files": [],
+    }
+
+
 def get_backup_overview() -> dict[str, Any]:
     global _schedule_loaded
-    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    _seed_backup_config_if_needed()
+    try:
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        _seed_backup_config_if_needed()
+    except OSError as exc:
+        # /backups is an sshfs/CIFS mount; if it drops it goes stale ("Transport
+        # endpoint is not connected"). Degrade gracefully instead of 500-ing.
+        return _unavailable_overview(exc)
     if not _schedule_loaded:
         _load_schedule_state()
         _schedule_loaded = True
@@ -883,12 +1140,7 @@ def get_backup_overview() -> dict[str, Any]:
         target_health.append(item)
     source_paths = sorted({t["source"] for t in target_mappings})
     destination_paths = sorted({t["destination"] for t in target_mappings})
-    storage_diagnostics = {
-        "sources": [_path_usage(path, expect_separate_mount=_requires_separate_mount(path)) for path in source_paths],
-        "destinations": [_path_usage(path, expect_separate_mount=True) for path in destination_paths],
-        "filesystems": _df_usage(),
-        "zfs": _zfs_diagnostics(cfg.get("backup_pool")),
-    }
+    storage_diagnostics = _storage_diagnostics_cached(source_paths, destination_paths, cfg.get("backup_pool"))
 
     with _lock:
         running = bool(_state.running)
@@ -908,7 +1160,10 @@ def get_backup_overview() -> dict[str, Any]:
 
     return {
         "status": status,
+        "storage_available": True,
+        "retention_keep": ARCHIVE_RETENTION_KEEP,
         "backup_pool": cfg.get("backup_pool"),
+        "archive_bwlimit": cfg.get("archive_bwlimit"),
         "rsync_bwlimit": cfg.get("rsync_bwlimit"),
         "sleep_seconds": cfg.get("sleep_seconds"),
         "exclude_hidden": bool(cfg.get("exclude_hidden", True)),
@@ -1103,6 +1358,44 @@ def _build_rsync_command(config: dict[str, Any], src: str, dst: str, excludes: l
     return command
 
 
+def _prune_old_archives(keep: int, log_path: Path | None = None) -> dict[str, Any]:
+    """Delete oldest milvus_volumes_*.tar.gz beyond the `keep` newest.
+
+    Runs after a successful archive. keep<=0 disables pruning. Best-effort: any
+    individual delete failure is recorded but never aborts the backup.
+    """
+    result: dict[str, Any] = {"keep": keep, "kept": 0, "deleted": [], "freed_bytes": 0, "errors": []}
+    if keep <= 0:
+        return result
+    try:
+        files = sorted(
+            BACKUP_ROOT.glob("milvus_volumes_*.tar.gz"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError as exc:
+        result["errors"].append(f"list failed: {exc}")
+        return result
+    result["kept"] = min(len(files), keep)
+    for old in files[keep:]:
+        try:
+            size = old.stat().st_size
+            old.unlink()
+            result["deleted"].append(old.name)
+            result["freed_bytes"] += size
+            if log_path is not None:
+                _append_log(log_path, f"Retention: deleted old archive {old.name} ({size} bytes)")
+        except OSError as exc:
+            result["errors"].append(f"delete {old.name} failed: {exc}")
+    if result["deleted"] and log_path is not None:
+        _append_log(
+            log_path,
+            f"Retention: kept {result['kept']} newest, deleted {len(result['deleted'])} "
+            f"archive(s), freed {result['freed_bytes']} bytes",
+        )
+    return result
+
+
 def _run_backup_job(
     run_id: str,
     run_dir: Path,
@@ -1137,6 +1430,7 @@ def _run_backup_job(
         "snapshot_status": "skipped",
         "snapshot_name": None,
         "snapshot_error": None,
+        "retention": None,
         "last_line": None,
         "errors": [],
     }
@@ -1173,23 +1467,19 @@ def _run_backup_job(
                 summary["last_line"] = summary["archive_error"]
                 _append_log(main_log_path, f"Archive step failed: {summary['archive_error']}")
             else:
-                tar_cmd = [
-                    "tar",
-                    "--warning=no-file-changed",
-                    "--ignore-failed-read",
-                    "--checkpoint=500",
-                    "--checkpoint-action=echo=archive checkpoint %u",
-                    "-czf",
-                    str(backup_path),
-                    "-C",
-                    str(archive_root),
-                    *archive_members,
-                ]
+                if backup_path is None:
+                    raise RuntimeError("Backup archive path is unavailable.")
+                tar_cmd = _build_archive_command(config, backup_path, archive_root, archive_members)
                 rc, last_line = _run_subprocess_with_logs(tar_cmd, main_log_path, debug_log_path, "archive")
                 summary["last_line"] = last_line
                 if rc == 0:
                     summary["archive_ok"] = True
                     _append_log(main_log_path, "Archive step completed.")
+                elif rc == 1 and backup_path is not None and backup_path.exists() and backup_path.stat().st_size > 0:
+                    summary["archive_ok"] = True
+                    summary["archive_error"] = "tar exited with code 1; kept live-data archive"
+                    summary["errors"].append(summary["archive_error"])
+                    _append_log(main_log_path, f"Archive step completed with warning: {summary['archive_error']}")
                 else:
                     run_failed = True
                     summary["archive_error"] = f"tar exited with code {rc}"
@@ -1269,10 +1559,14 @@ def _run_backup_job(
             with _lock:
                 _state.active_step = "snapshot"
                 _state.progress_line = f"Creating snapshot {summary['snapshot_name']}"
-            snap_cmd = ["zfs", "snapshot"]
+            snap_parts = ["zfs", "snapshot"]
             if ZFS_SNAPSHOT_RECURSIVE:
-                snap_cmd.append("-r")
-            snap_cmd.append(snapshot_ref)
+                snap_parts.append("-r")
+            snap_parts.append(snapshot_ref)
+            # Wrap with ssh+sudo when a remote ZFS host is configured; running the
+            # raw `zfs` binary locally fails ("No such file or directory: 'zfs'")
+            # because the pool lives on the remote host, not in the container.
+            snap_cmd = _zfs_command(*snap_parts)
             _append_log(main_log_path, f"Taking ZFS snapshot: {summary['snapshot_name']}")
             rc, last_line = _run_subprocess_with_logs(snap_cmd, main_log_path, debug_log_path, "snapshot")
             summary["last_line"] = last_line or summary["last_line"]
@@ -1289,6 +1583,12 @@ def _run_backup_job(
         else:
             summary["snapshot_status"] = "skipped"
             summary["snapshot_error"] = "snapshot skipped for target-only backup"
+
+        if include_archive and summary["archive_ok"]:
+            with _lock:
+                _state.active_step = "retention"
+                _state.progress_line = f"Pruning old archives (keep {ARCHIVE_RETENTION_KEEP})"
+            summary["retention"] = _prune_old_archives(ARCHIVE_RETENTION_KEEP, main_log_path)
 
         if summary["sync_failed"] > 0 or not summary["archive_ok"] or summary["snapshot_status"] == "failed":
             summary["status"] = "failed" if run_failed else "partial"
@@ -1328,6 +1628,8 @@ def start_backup(
     include_archive: bool = True,
     trigger: str = "manual",
 ) -> dict[str, Any]:
+    if include_archive:
+        _ensure_backup_root_safe()
     BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     config = _load_backup_config()

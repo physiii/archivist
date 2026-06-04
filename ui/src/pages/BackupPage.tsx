@@ -446,7 +446,11 @@ export default function BackupPage() {
                   <dd>{overview.backup_pool ?? "Unknown"}</dd>
                 </div>
                 <div>
-                  <dt>Bandwidth</dt>
+                  <dt>Archive cap</dt>
+                  <dd>{overview.archive_bwlimit ?? "Unknown"}</dd>
+                </div>
+                <div>
+                  <dt>Sync cap</dt>
                   <dd>{overview.rsync_bwlimit ?? "Unknown"}</dd>
                 </div>
                 <div>

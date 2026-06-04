@@ -90,7 +90,7 @@ export default function ConsolePage() {
                   textTransform: "uppercase",
                 }}
               >
-                OpenClaw
+                Agent
               </Box>
               <Box
                 component="h1"

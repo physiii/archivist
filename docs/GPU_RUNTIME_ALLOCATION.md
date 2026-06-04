@@ -9,12 +9,12 @@ and is no longer in the machine. Every GPU workload now shares `cuda:0`.
 | Host GPU | Workload | Container | Approx VRAM |
 | --- | --- | --- | --- |
 | 0 | Qwen/Qwen3-Embedding-4B (TEI, fp16) | `embed-tei-qwen3-4b-1` | ~8.3 GB |
-| 0 | faster-whisper `small.en` (int8) | `archivist` | ~0.5 GB |
+| 0 | faster-whisper `medium.en` (float16) | `archivist` | ~1.5 GB |
 | 0 | CLIP ViT-B-32 | `archivist` | ~0.5 GB |
 | 0 | XTTS-v2 streaming helper (`tts-env`) | host process | ~3.1 GB |
 | 0 | Immich ML (ONNX CLIP + face detection) | `immich_machine_learning` | ~2 GB |
 | 0 | Frigate decode + ffmpeg NVENC | `frigate` | transient ~0.3 GB |
-| 0 | _headroom_ | — | ~10 GB |
+| 0 | _headroom_ | — | ~9 GB |
 
 Confirm with:
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -11,11 +12,12 @@ import requests
 
 
 _DEFAULT_AGENT_IDS = (
-    "archivist-main",
-    "archivist-health",
-    "archivist-repair",
-    "archivist-observer",
-    "archivist-verifier",
+    "operator-chat",
+    "runtime-health-monitor",
+    "repair-worker",
+    "session-observer",
+    "verification-worker",
+    "quality-gate",
 )
 
 _AGENT_DOC_FILES = (
@@ -26,15 +28,43 @@ _AGENT_DOC_FILES = (
     "USER.md",
     "HEARTBEAT.md",
     "MEMORY.md",
+    "OBJECTIVE.md",
+    "SKILLS.md",
 )
+
+_LANE_ORDER = {
+    "system": 0,
+    "generic": 1,
+    "global": 2,
+    "specialist": 3,
+}
+_LEGACY_RUNTIME_TOKEN = "open" + "claw"
 
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def team_root() -> Path:
-    return repo_root() / "openclaw-team"
+def agents_repo_root() -> Path:
+    explicit = (os.getenv("ARCHIVIST_AGENTS_ROOT") or os.getenv("AGENTS_REPO_ROOT") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    local = repo_root() / "agents"
+    if local.exists():
+        return local
+    return Path("/media/mass/agents")
+
+
+def shared_agents_root() -> Path:
+    return agents_repo_root() / "agents"
+
+
+def shared_skills_root() -> Path:
+    return agents_repo_root() / "skills"
+
+
+def shared_mcp_root() -> Path:
+    return agents_repo_root() / "mcp"
 
 
 def host_workspace() -> str:
@@ -47,15 +77,92 @@ def host_workspace() -> str:
     return local
 
 
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _is_legacy_runtime_id(value: str) -> bool:
+    return _LEGACY_RUNTIME_TOKEN in str(value or "").lower()
+
+
+def _scrub_legacy_runtime_text(value: str) -> str:
+    return re.sub(_LEGACY_RUNTIME_TOKEN, "agent runtime", str(value or ""), flags=re.IGNORECASE)
+
+
+def _scrub_legacy_runtime_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return _scrub_legacy_runtime_text(value)
+    if isinstance(value, list):
+        return [_scrub_legacy_runtime_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _scrub_legacy_runtime_payload(item) for key, item in value.items()}
+    return value
+
+
+def _agent_catalog_path() -> Path:
+    return shared_agents_root() / "catalog.json"
+
+
+def load_agent_catalog() -> dict[str, Any]:
+    path = _agent_catalog_path()
+    try:
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+    except Exception:
+        pass
+    return {}
+
+
+def _catalog_agent_ids() -> list[str]:
+    catalog = load_agent_catalog()
+    ids: list[str] = []
+    ids.extend(str(item) for item in catalog.get("system_agents") or [])
+    ids.extend(str(item) for item in catalog.get("generic_workspace_agents") or [])
+    ids.extend(str(item) for item in catalog.get("global_role_briefs") or [])
+    domains = catalog.get("specialist_domains") or {}
+    if isinstance(domains, dict):
+        for values in domains.values():
+            if isinstance(values, list):
+                ids.extend(str(item) for item in values)
+    if not ids and shared_agents_root().is_dir():
+        ids.extend(path.name for path in shared_agents_root().iterdir() if path.is_dir() and path.name != "roles")
+    return [agent_id for agent_id in _dedupe(ids) if not _is_legacy_runtime_id(agent_id)]
+
+
 def console_agent_id() -> str:
-    return (os.getenv("ARCHIVIST_OPENCLAW_CONSOLE_AGENT_ID") or "archivist-main").strip() or "archivist-main"
+    configured = (
+        os.getenv("ARCHIVIST_AGENT_CONSOLE_AGENT_ID")
+        or os.getenv("ARCHIVIST_CONSOLE_AGENT_ID")
+        or ""
+    ).strip()
+    if configured:
+        return configured
+    ids = _catalog_agent_ids()
+    if "operator-chat" in ids:
+        return "operator-chat"
+    return ids[0] if ids else "operator-chat"
 
 
 def visible_agent_ids() -> list[str]:
-    raw = (os.getenv("ARCHIVIST_OPENCLAW_VISIBLE_AGENT_IDS") or "").strip()
+    raw = (
+        os.getenv("ARCHIVIST_VISIBLE_AGENT_IDS")
+        or os.getenv("ARCHIVIST_AGENT_VISIBLE_IDS")
+        or ""
+    ).strip()
     if raw:
         return _dedupe([part.strip() for part in raw.split(",")])
-    return list(_DEFAULT_AGENT_IDS)
+    ids = _catalog_agent_ids()
+    return ids if ids else list(_DEFAULT_AGENT_IDS)
 
 
 def default_web_session_key(agent_id: str | None = None) -> str:
@@ -69,7 +176,7 @@ def encode_session_ref(agent_id: str, session_key: str) -> str:
     return f"agent:{safe_agent}:{safe_key}"
 
 
-def gateway_session_key(agent_id: str, session_key: str) -> str:
+def agent_session_key(agent_id: str, session_key: str) -> str:
     return encode_session_ref(agent_id, session_key)
 
 
@@ -91,7 +198,7 @@ def session_kind(session_key: str) -> str:
         return "repair"
     if "observer" in key:
         return "observer"
-    if "verifier" in key:
+    if "verifier" in key or "verification" in key:
         return "verifier"
     if "health" in key:
         return "health"
@@ -100,39 +207,28 @@ def session_kind(session_key: str) -> str:
     return "session"
 
 
-def load_openclaw_config() -> tuple[dict[str, Any], Path | None]:
-    for candidate in _openclaw_config_candidates():
-        try:
-            if candidate.is_file():
-                return json.loads(candidate.read_text(encoding="utf-8")), candidate
-        except Exception:
-            continue
-    return {}, None
-
-
-def resolve_gateway_url() -> str:
-    explicit = (os.getenv("OPENCLAW_GATEWAY_URL") or "").strip()
-    if explicit:
-        return explicit.rstrip("/")
-    config, _ = load_openclaw_config()
-    port = config.get("gateway", {}).get("port", 18789)
-    default_host = "host.docker.internal" if str(repo_root()) == "/app" else "127.0.0.1"
-    return f"http://{default_host}:{port}"
-
-
-def resolve_gateway_token() -> str:
-    explicit = (os.getenv("OPENCLAW_GATEWAY_TOKEN") or "").strip()
-    if explicit:
-        return explicit
-    config, _ = load_openclaw_config()
-    return str(config.get("gateway", {}).get("auth", {}).get("token") or "").strip()
+def _agent_dir(agent_id: str) -> Path | None:
+    full = shared_agents_root() / agent_id
+    if full.is_dir():
+        return full
+    role = shared_agents_root() / "roles" / f"{agent_id}.md"
+    if role.is_file():
+        return role
+    return None
 
 
 def load_agent_docs(agent_id: str) -> str:
-    agent_dir = team_root() / "agents" / agent_id
+    target = _agent_dir(agent_id)
+    if target is None:
+        return ""
+    if target.is_file():
+        try:
+            return target.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
     parts: list[str] = []
     for filename in _AGENT_DOC_FILES:
-        path = agent_dir / filename
+        path = target / filename
         if not path.is_file():
             continue
         try:
@@ -147,18 +243,25 @@ def load_agent_docs(agent_id: str) -> str:
 def build_agent_system_message(agent_id: str | None = None, screen_context: str = "") -> str:
     aid = (agent_id or console_agent_id()).strip() or console_agent_id()
     project_root = host_workspace()
-    agent_dir = f"{project_root}/openclaw-team/agents/{aid}"
+    agent_target = _agent_dir(aid)
+    agent_docs_path = str(agent_target) if agent_target is not None else str(shared_agents_root() / aid)
     docs = load_agent_docs(aid)
     identity_block = f"\n\n## Agent identity ({aid})\n{docs}" if docs else ""
+    skill_names = [skill["name"] for skill in load_shared_skills()[:40]]
+    skill_block = ", ".join(skill_names)
+    mcp_names = [server["name"] for server in load_mcp_servers()[:30]]
+    mcp_block = ", ".join(mcp_names)
     return f"""You are Archivist's built-in operator assistant inside a self-hosted archive and media-analysis workspace.
 
 ## Runtime environment
 - Project name: Archivist
 - Project workspace (repo root): {project_root}
-- IMPORTANT: The real project workspace is {project_root} and not /app or /home/andy/.openclaw/workspace
-- Agent workspace docs: {agent_dir}
-- OpenClaw agent id: {aid}
-- OpenClaw gateway: {resolve_gateway_url()}
+- IMPORTANT: The real project workspace is {project_root} and not /app
+- Shared agent knowledge base: {agents_repo_root()}
+- Agent docs: {agent_docs_path}
+- Agent id: {aid}
+- Skills available from shared catalog: {skill_block or "none discovered"}
+- MCP registry entries: {mcp_block or "none discovered"}
 
 ## Product areas
 - Collections: Milvus-backed catalog, search, collection detail, embeddings preview
@@ -168,90 +271,340 @@ def build_agent_system_message(agent_id: str | None = None, screen_context: str 
 - Console: chat, fleet, system status, agent settings
 
 ## Codebase layout
-- {project_root}/main.py — Flask API routes and UI serving
-- {project_root}/backups_service.py — backup scheduler and logs
-- {project_root}/indexing_service.py — indexing scheduler and target management
-- {project_root}/media/ — pipeline, recaps, memory, evidence store, composer
-- {project_root}/ui/src/ — React UI
-- {project_root}/tests/ — pytest and Playwright coverage
-- {project_root}/docker-compose.yml — service deployment
+- {project_root}/main.py - Flask API routes and UI serving
+- {project_root}/backups_service.py - backup scheduler and logs
+- {project_root}/indexing_service.py - indexing scheduler and target management
+- {project_root}/media/ - pipeline, recaps, memory, evidence store, composer
+- {project_root}/ui/src/ - React UI
+- {project_root}/tests/ - pytest and Playwright coverage
+- {project_root}/docker-compose.yml - service deployment
 
 ## Working rules
 1. When asked what workspace you are using, answer with {project_root}
 2. Use absolute {project_root}/... paths when discussing files
-3. Never claim the project lives at /app
-4. Keep answers direct and technical
-5. If you need evidence, inspect the actual files or summarize concrete API state
+3. Keep answers direct and technical
+4. If you need evidence, inspect actual files or summarize concrete API state
 {identity_block}
 {screen_context}"""
 
 
-def inspect_agent_runtime() -> dict[str, Any]:
-    gateway_url = resolve_gateway_url()
-    token = resolve_gateway_token()
-    config, config_path = load_openclaw_config()
-    workspace = host_workspace()
-    mounted = Path(workspace).exists()
-    errors: list[str] = []
-    version = None
-    available = False
+def _read_manifest(agent_dir: Path, agent_id: str) -> dict[str, Any]:
+    manifest_path = agent_dir / "agent-manifest.json"
+    if manifest_path.is_file():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    return {"agent_id": agent_id, "id": agent_id}
+
+
+def _first_heading_or_line(path: Path) -> str:
     try:
-        response = requests.get(f"{gateway_url}/health", timeout=3)
-        if response.ok:
-            payload = response.json()
-            available = bool(payload.get("ok"))
-            version = payload.get("version")
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip().lstrip("#").strip()
+            if line:
+                return line
+    except Exception:
+        pass
+    return path.stem.replace("-", " ").replace("_", " ").title()
+
+
+def _catalog_lane_maps(catalog: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    lanes: dict[str, str] = {}
+    groups: dict[str, str] = {}
+    for agent_id in catalog.get("system_agents") or []:
+        lanes[str(agent_id)] = "system"
+        groups[str(agent_id)] = "System"
+    for agent_id in catalog.get("generic_workspace_agents") or []:
+        lanes[str(agent_id)] = "generic"
+        groups[str(agent_id)] = "Generic Workspace"
+    for role_id in catalog.get("global_role_briefs") or []:
+        lanes[str(role_id)] = "global"
+        groups[str(role_id)] = "Global Role Brief"
+    domains = catalog.get("specialist_domains") or {}
+    if isinstance(domains, dict):
+        for domain, values in domains.items():
+            if not isinstance(values, list):
+                continue
+            label = str(domain).replace("_", " ").replace("-", " ").title()
+            for agent_id in values:
+                lanes[str(agent_id)] = "specialist"
+                groups[str(agent_id)] = label
+    return lanes, groups
+
+
+def load_team_agents() -> list[dict[str, Any]]:
+    catalog = load_agent_catalog()
+    lane_by_id, group_by_id = _catalog_lane_maps(catalog)
+    agents: list[dict[str, Any]] = []
+    agents_root = shared_agents_root()
+    if not agents_root.is_dir():
+        return []
+
+    for agent_id in _catalog_agent_ids():
+        agent_dir = agents_root / agent_id
+        role_file = agents_root / "roles" / f"{agent_id}.md"
+        if agent_dir.is_dir():
+            payload = _read_manifest(agent_dir, agent_id)
+            payload.setdefault("agent_id", payload.get("id") or agent_id)
+            payload.setdefault("name", str(payload.get("agent_id") or agent_id).replace("-", " ").replace("_", " ").title())
+            identity = agent_dir / "IDENTITY.md"
+            if not payload.get("summary") and identity.is_file():
+                payload["summary"] = _first_heading_or_line(identity)
+            payload["_path"] = str(agent_dir)
+            payload["_source"] = "shared-agents"
+        elif role_file.is_file():
+            payload = {
+                "agent_id": agent_id,
+                "id": agent_id,
+                "name": _first_heading_or_line(role_file),
+                "summary": _first_heading_or_line(role_file),
+                "_path": str(role_file),
+                "_source": "shared-role",
+                "role": "global-role-brief",
+            }
         else:
-            errors.append(f"gateway_http_{response.status_code}")
-    except Exception as exc:
-        errors.append(f"gateway_unreachable:{exc}")
-    if not token:
-        errors.append("missing_gateway_token")
-    if not mounted:
-        errors.append("workspace_not_mounted")
-    registered = console_agent_id() in registered_agent_ids(config)
+            continue
+        payload.setdefault("fleet_lane", lane_by_id.get(agent_id, "specialist"))
+        payload = _scrub_legacy_runtime_payload(payload)
+        payload.setdefault("ui", {})
+        if isinstance(payload["ui"], dict):
+            payload["ui"].setdefault("badge", group_by_id.get(agent_id, payload.get("fleet_lane", "Agent")))
+            payload["ui"]["badge"] = _scrub_legacy_runtime_text(str(payload["ui"].get("badge") or ""))
+        agents.append(payload)
+
+    agents.sort(
+        key=lambda item: (
+            _LANE_ORDER.get(str(item.get("fleet_lane") or "specialist"), 9),
+            str((item.get("ui") or {}).get("badge") or ""),
+            str(item.get("name") or item.get("agent_id") or ""),
+        )
+    )
+    return agents
+
+
+def registered_agent_ids(_: dict[str, Any] | None = None) -> list[str]:
+    return _dedupe([str(agent.get("agent_id") or agent.get("id") or "") for agent in load_team_agents()])
+
+
+def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    header = text[3:end].strip()
+    body = text[end + 4 :].strip()
+    data: dict[str, str] = {}
+    for line in header.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip()] = value.strip().strip('"').strip("'")
+    return data, body
+
+
+def load_shared_skills() -> list[dict[str, Any]]:
+    skills: list[dict[str, Any]] = []
+    root = shared_skills_root()
+    if not root.is_dir():
+        return skills
+    for skill_file in sorted(root.glob("*/SKILL.md")):
+        skill_id = skill_file.parent.name
+        if skill_id.startswith("_"):
+            continue
+        try:
+            text = skill_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        meta, body = _parse_frontmatter(text)
+        description = meta.get("description") or ""
+        if not description:
+            for raw in body.splitlines():
+                line = raw.strip().lstrip("#").strip()
+                if line:
+                    description = line
+                    break
+        skills.append(
+            {
+                "id": skill_id,
+                "name": meta.get("name") or skill_id,
+                "description": _scrub_legacy_runtime_text(description),
+                "path": str(skill_file),
+                "source": "shared-agents",
+            }
+        )
+    return skills
+
+
+def load_mcp_servers() -> list[dict[str, Any]]:
+    registry = shared_mcp_root() / "registry.md"
+    servers: list[dict[str, Any]] = []
+    if not registry.is_file():
+        return servers
+    try:
+        lines = registry.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return servers
+    for line in lines:
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        name = cells[0].strip("`")
+        if name.lower() == "server":
+            continue
+        servers.append(
+            {
+                "name": name,
+                "status": cells[1] if len(cells) > 1 else "",
+                "transport": cells[2] if len(cells) > 2 else "",
+                "source": cells[3] if len(cells) > 3 else "",
+                "description": _scrub_legacy_runtime_text(cells[4] if len(cells) > 4 else ""),
+                "registry": str(registry),
+            }
+        )
+    return servers
+
+
+def load_mcp_tools_for_status() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": f"mcp:{server['name']}",
+            "description": server.get("description") or f"{server['name']} MCP server",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "const": server["name"]},
+                    "transport": {"type": "string"},
+                },
+            },
+            "server": server,
+        }
+        for server in load_mcp_servers()
+    ]
+
+
+def load_mcp_resources_for_status() -> list[dict[str, Any]]:
+    resources: list[dict[str, Any]] = []
+    for path in (
+        shared_mcp_root() / "registry.md",
+        shared_mcp_root() / "skill-integration.md",
+        shared_mcp_root() / "config-templates" / "codex.toml",
+        shared_mcp_root() / "config-templates" / "claude.mcp.json",
+        agents_repo_root() / "agents" / "catalog.json",
+    ):
+        if not path.is_file():
+            continue
+        resources.append(
+            {
+                "name": path.name,
+                "uri": str(path),
+                "description": f"Shared agents repository resource: {path.relative_to(agents_repo_root())}",
+                "mimeType": "application/json" if path.suffix == ".json" else "text/markdown",
+            }
+        )
+    return resources
+
+
+def resolve_agent_executor_url() -> str:
+    return (
+        os.getenv("ARCHIVIST_AGENT_EXECUTOR_URL")
+        or os.getenv("ARCHIVIST_AGENT_CHAT_URL")
+        or os.getenv("AGENT_EXECUTOR_URL")
+        or ""
+    ).strip().rstrip("/")
+
+
+def resolve_agent_executor_token() -> str:
+    return (
+        os.getenv("ARCHIVIST_AGENT_EXECUTOR_TOKEN")
+        or os.getenv("ARCHIVIST_AGENT_CHAT_TOKEN")
+        or os.getenv("AGENT_EXECUTOR_TOKEN")
+        or ""
+    ).strip()
+
+
+def resolve_agent_chat_model(agent_id: str | None = None) -> str:
+    configured = (os.getenv("ARCHIVIST_AGENT_CHAT_MODEL") or "").strip()
+    if configured:
+        return configured
+    aid = (agent_id or console_agent_id()).strip() or console_agent_id()
+    return f"agents/{aid}"
+
+
+def inspect_agent_runtime() -> dict[str, Any]:
+    root = agents_repo_root()
+    catalog_path = _agent_catalog_path()
+    agents = load_team_agents()
+    skills = load_shared_skills()
+    mcp_servers = load_mcp_servers()
+    executor_url = resolve_agent_executor_url()
+    token = resolve_agent_executor_token()
+    errors: list[str] = []
+    executor_available = False
+    version = None
+
+    if not root.exists():
+        errors.append("agents_repo_missing")
+    if not catalog_path.is_file():
+        errors.append("agent_catalog_missing")
+    if not skills:
+        errors.append("skills_catalog_empty")
+    if not mcp_servers:
+        errors.append("mcp_registry_empty")
+
+    if executor_url:
+        try:
+            response = requests.get(f"{executor_url}/health", timeout=3)
+            if response.ok:
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = {}
+                executor_available = bool(payload.get("ok", True))
+                version = payload.get("version")
+            else:
+                errors.append(f"executor_http_{response.status_code}")
+        except Exception as exc:
+            errors.append(f"executor_unreachable:{exc}")
+        if not token:
+            errors.append("executor_token_missing")
+
+    ids = registered_agent_ids()
+    registered = console_agent_id() in ids
     if not registered:
-        errors.append("agent_not_registered")
+        errors.append("console_agent_not_in_catalog")
+
+    catalog_available = root.exists() and catalog_path.is_file() and bool(agents)
+    execution_configured = bool(executor_url and token)
     return {
-        "available": available and bool(token) and mounted and registered,
-        "backend": "openclaw-gateway" if available else None,
-        "binary": gateway_url,
+        "available": catalog_available,
+        "execution_available": executor_available and execution_configured,
+        "backend": "agents-repository",
+        "executor_url": executor_url or None,
+        "binary": str(root),
         "version": version,
-        "model": f"openclaw/{console_agent_id()}",
-        "workspace_path": workspace,
-        "workspace_mounted": mounted,
+        "model": resolve_agent_chat_model(console_agent_id()),
+        "workspace_path": host_workspace(),
+        "workspace_mounted": Path(host_workspace()).exists(),
+        "agents_root": str(root),
+        "agents_count": len(agents),
+        "skills_count": len(skills),
+        "mcp_server_count": len(mcp_servers),
         "console_agent_id": console_agent_id(),
-        "config_path": str(config_path) if config_path else None,
+        "config_path": str(catalog_path) if catalog_path.is_file() else None,
         "token_configured": bool(token),
+        "executor_configured": execution_configured,
         "registered": registered,
         "errors": errors,
     }
 
 
-def registered_agent_ids(config: dict[str, Any] | None = None) -> list[str]:
-    data = config if config is not None else load_openclaw_config()[0]
-    return _dedupe([str(item.get("id") or "").strip() for item in data.get("agents", {}).get("list", []) if isinstance(item, dict)])
-
-
-def load_team_agents() -> list[dict[str, Any]]:
-    agents_dir = team_root() / "agents"
-    agents: list[dict[str, Any]] = []
-    for manifest in sorted(agents_dir.glob("*/agent-manifest.json")):
-        try:
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        try:
-            rel_path = manifest.parent.relative_to(repo_root())
-            payload["_path"] = f"{host_workspace()}/{rel_path.as_posix()}"
-        except Exception:
-            payload["_path"] = str(manifest.parent)
-        agents.append(payload)
-    agents.sort(key=lambda item: (item.get("ui", {}).get("sort_key", 9999), item.get("name", "")))
-    return agents
-
-
-def load_openclaw_sessions_for_agents(agent_ids: list[str] | None = None) -> list[dict[str, Any]]:
+def load_agent_sessions_for_agents(agent_ids: list[str] | None = None) -> list[dict[str, Any]]:
     sessions_by_id: dict[str, dict[str, Any]] = {}
     for agent_id in agent_ids or visible_agent_ids():
         for store_owner, store_path in _session_store_candidates(agent_id):
@@ -270,12 +623,12 @@ def load_openclaw_sessions_for_agents(agent_ids: list[str] | None = None) -> lis
                 effective_agent_id = routed_agent_id or agent_id
                 if effective_agent_id != agent_id:
                     continue
-                session_file = resolve_openclaw_session_file(meta.get("sessionFile"))
+                session_file = resolve_agent_session_file(meta.get("sessionFile"))
                 message_count = 0
                 last_message = ""
                 title = str(session_key)
                 if session_file and session_file.is_file():
-                    messages = load_openclaw_messages_from_transcript(session_file)
+                    messages = load_agent_messages_from_transcript(session_file)
                     if messages:
                         message_count = len(messages)
                         last_message = messages[-1].get("text", "")[:120]
@@ -287,7 +640,7 @@ def load_openclaw_sessions_for_agents(agent_ids: list[str] | None = None) -> lis
                     "id": session_id,
                     "agentId": effective_agent_id,
                     "sessionKey": str(session_key),
-                    "source": "openclaw",
+                    "source": "agents",
                     "status": str(meta.get("status") or "unknown"),
                     "createdAt": int(meta.get("startedAt") or 0),
                     "updatedAt": int(meta.get("updatedAt") or meta.get("endedAt") or 0),
@@ -303,16 +656,15 @@ def load_openclaw_sessions_for_agents(agent_ids: list[str] | None = None) -> lis
     return sessions
 
 
-def resolve_openclaw_session_file(path_text: str | None) -> Path | None:
+def resolve_agent_session_file(path_text: str | None) -> Path | None:
     raw = str(path_text or "").strip()
     if not raw:
         return None
     candidates = [
         Path(raw),
-        Path(raw.replace("/home/node/.openclaw/", "/host/.openclaw/")),
-        Path(raw.replace("/home/andy/.openclaw/", "/host/.openclaw/")),
-        Path(raw.replace("/home/node/.openclaw/", str(Path.home() / ".openclaw") + "/")),
-        Path(raw.replace("/home/andy/.openclaw/", str(Path.home() / ".openclaw") + "/")),
+        Path(raw.replace("/home/node/.claude/", str(Path.home() / ".claude") + "/")),
+        Path(raw.replace("/home/andy/.claude/", str(Path.home() / ".claude") + "/")),
+        agents_repo_root() / raw.lstrip("/"),
     ]
     for candidate in candidates:
         try:
@@ -323,7 +675,7 @@ def resolve_openclaw_session_file(path_text: str | None) -> Path | None:
     return None
 
 
-def load_openclaw_messages_from_transcript(session_file: Path) -> list[dict[str, Any]]:
+def load_agent_messages_from_transcript(session_file: Path) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     try:
         for line in session_file.read_text(encoding="utf-8").splitlines():
@@ -367,37 +719,13 @@ def _extract_message_text(content: Any) -> str:
     return str(content or "").strip()
 
 
-def _openclaw_config_candidates() -> list[Path]:
-    explicit = (os.getenv("OPENCLAW_CONFIG_PATH") or "").strip()
-    state_dir = (os.getenv("OPENCLAW_STATE_DIR") or "").strip()
+def _agent_session_roots() -> list[Path]:
+    explicit = (os.getenv("ARCHIVIST_AGENT_SESSIONS_ROOT") or "").strip()
     candidates = [
         Path(explicit).expanduser() if explicit else None,
-        (Path(state_dir).expanduser() / "openclaw.json") if state_dir else None,
-        repo_root() / ".openclaw" / "openclaw.json",
-        Path("/host/.openclaw/openclaw.json"),
-        Path("/host/openclaw.json"),
-        Path.home() / ".openclaw" / "openclaw.json",
-        Path("/home/andy/.openclaw/openclaw.json"),
-    ]
-    out: list[Path] = []
-    for candidate in candidates:
-        if not candidate:
-            continue
-        if candidate not in out:
-            out.append(candidate)
-    return out
-
-
-def _openclaw_agents_roots() -> list[Path]:
-    explicit = (os.getenv("OPENCLAW_AGENTS_DIR") or "").strip()
-    state_dir = (os.getenv("OPENCLAW_STATE_DIR") or "").strip()
-    candidates = [
-        Path(explicit).expanduser() if explicit else None,
-        (Path(state_dir).expanduser() / "agents") if state_dir else None,
-        repo_root() / ".openclaw" / "agents",
-        Path("/host/.openclaw/agents"),
-        Path.home() / ".openclaw" / "agents",
-        Path("/home/andy/.openclaw/agents"),
+        agents_repo_root() / "sessions",
+        shared_agents_root(),
+        Path.home() / ".claude" / "agents",
     ]
     out: list[Path] = []
     for candidate in candidates:
@@ -409,13 +737,16 @@ def _openclaw_agents_roots() -> list[Path]:
 
 
 def _first_readable_session_store(agent_id: str) -> Path | None:
-    for root in _openclaw_agents_roots():
-        candidate = root / agent_id / "sessions" / "sessions.json"
-        try:
-            if candidate.is_file():
-                return candidate
-        except Exception:
-            continue
+    for root in _agent_session_roots():
+        for candidate in (
+            root / agent_id / "sessions" / "sessions.json",
+            root / agent_id / "sessions.json",
+        ):
+            try:
+                if candidate.is_file():
+                    return candidate
+            except Exception:
+                continue
     return None
 
 
@@ -444,15 +775,3 @@ def _session_agent_id(session_key: str, meta: dict[str, Any]) -> str | None:
         if candidate:
             return candidate
     return None
-
-
-def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        text = str(value or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        out.append(text)
-    return out

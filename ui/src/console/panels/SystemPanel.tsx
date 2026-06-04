@@ -10,17 +10,29 @@ import { postJson, getJson } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { consoleEndpoints } from '../config/endpoints'
 import { StatusChip } from '../components/StatusChip'
-import type { GoogleAccountStatus, GoogleIntegrationsSummary, GitHubIntegrationStatus } from '../../types'
+import type {
+  GoogleAccountStatus,
+  GoogleIntegrationsSummary,
+  GitHubIntegrationStatus,
+  IntegrationsStatusResponse,
+} from '../../types'
 
 type Probe = { name: string; ok: boolean; status?: number; latency_ms?: number; target?: string; configured?: boolean }
 type McpTool = { name: string; description: string; inputSchema?: { properties?: Record<string, unknown> } }
+type RecentToolCall = { mcp_actual_tool?: string; mcp_tool?: string }
+type McpResource = { name?: string; uri?: string; description?: string; mimeType?: string }
 
 type AgentRuntime = {
   available?: boolean
+  execution_available?: boolean
   backend?: string | null
   binary?: string | null
+  executor_url?: string | null
   version?: string | null
   model?: string | null
+  agents_count?: number
+  skills_count?: number
+  mcp_server_count?: number
   errors?: string[]
 }
 
@@ -68,18 +80,22 @@ type AutomationsStatus = {
   }
 }
 
-type Props = {
-  status: {
+export type SystemPanelStatus = {
     integrations?: { probes?: Probe[] }
     mcp?: { tools?: McpTool[] }
     flags?: { system_enabled?: boolean; speech_input_enabled?: boolean }
-    recent_tool_calls?: { mcp_actual_tool?: string; mcp_tool?: string }[]
-    mcp_resources?: { resources?: { name?: string; uri?: string; description?: string; mimeType?: string }[] }
+    recent_tool_calls?: RecentToolCall[]
+    mcp_resources?: { resources?: McpResource[] }
     repairs?: {
       agent_runtime?: AgentRuntime
     }
   } | null
+type Props = {
+  status: SystemPanelStatus
 }
+type FlagsResponse = { flags?: { system_enabled?: boolean; speech_input_enabled?: boolean } }
+type AuthorizationResponse = { auth_url?: string; message?: string }
+type GoogleImportResponse = { message?: string }
 
 function verificationSeverity(status: string | undefined): 'ok' | 'warn' | 'bad' | 'default' {
   const value = String(status || '').toLowerCase()
@@ -111,17 +127,23 @@ export default function SystemPanel({ status }: Props) {
   const [integrationMessage, setIntegrationMessage] = useState<string | null>(null)
   const [integrationAuthUrl, setIntegrationAuthUrl] = useState<string | null>(null)
   const [importMessage, setImportMessage] = useState<string | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const { data: automations } = useApi<AutomationsStatus>(consoleEndpoints.automationsStatus, { pollMs: 10000 })
 
   const flags = status?.flags || {}
   useEffect(() => {
-    setSystemEnabled(flags.system_enabled !== false)
-    setSpeechEnabled(flags.speech_input_enabled !== false)
+    let cancelled = false
+    queueMicrotask(() => {
+      if (cancelled) return
+      setSystemEnabled(flags.system_enabled !== false)
+      setSpeechEnabled(flags.speech_input_enabled !== false)
+    })
+    return () => { cancelled = true }
   }, [flags.system_enabled, flags.speech_input_enabled])
 
   const syncGoogle = useCallback(async () => {
     try {
-      const j = await getJson<any>(consoleEndpoints.integrationsStatus)
+      const j = await getJson<IntegrationsStatusResponse>(consoleEndpoints.integrationsStatus)
       setGoogleStatus(j.google || null)
       setGithubStatus(j.github || null)
     } catch {
@@ -131,10 +153,18 @@ export default function SystemPanel({ status }: Props) {
   }, [])
 
   useEffect(() => {
-    syncGoogle()
+    let cancelled = false
+    queueMicrotask(() => {
+      if (!cancelled) void syncGoogle()
+    })
     const t = setInterval(syncGoogle, 10000)
-    return () => clearInterval(t)
+    return () => { cancelled = true; clearInterval(t) }
   }, [syncGoogle])
+
+  useEffect(() => {
+    const t = setInterval(() => setNowMs(Date.now()), 60000)
+    return () => clearInterval(t)
+  }, [])
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
@@ -152,7 +182,7 @@ export default function SystemPanel({ status }: Props) {
   const toggleSystem = async (checked: boolean) => {
     setControlError(null)
     try {
-      const res = await postJson<any>(consoleEndpoints.flags, { flags: { system_enabled: checked, speech_input_enabled: checked ? speechEnabled : false } })
+      const res = await postJson<FlagsResponse>(consoleEndpoints.flags, { flags: { system_enabled: checked, speech_input_enabled: checked ? speechEnabled : false } })
       const f = res.flags || {}
       setSystemEnabled(f.system_enabled !== false)
       setSpeechEnabled(f.speech_input_enabled !== false)
@@ -164,7 +194,7 @@ export default function SystemPanel({ status }: Props) {
   const toggleSpeech = async (checked: boolean) => {
     setControlError(null)
     try {
-      const res = await postJson<any>(consoleEndpoints.flags, { flags: { speech_input_enabled: checked } })
+      const res = await postJson<FlagsResponse>(consoleEndpoints.flags, { flags: { speech_input_enabled: checked } })
       setSpeechEnabled(res.flags?.speech_input_enabled !== false)
     } catch (error) {
       setControlError(error instanceof Error ? error.message : String(error))
@@ -186,7 +216,7 @@ export default function SystemPanel({ status }: Props) {
     }
 
     try {
-      const j = await postJson<any>(consoleEndpoints.integrationsAuthorize, {})
+      const j = await postJson<AuthorizationResponse>(consoleEndpoints.integrationsAuthorize, {})
       if (j.auth_url) {
         setIntegrationAuthUrl(j.auth_url)
         if (popup && !popup.closed) {
@@ -218,7 +248,7 @@ export default function SystemPanel({ status }: Props) {
 
   const selectedTool = tools.find(t => t.name === activeTool) || null
   const recentCalls = (status?.recent_tool_calls || []).filter(
-    (c: any) => (c.mcp_actual_tool || c.mcp_tool) === activeTool
+    (c) => (c.mcp_actual_tool || c.mcp_tool) === activeTool
   )
   const resources = status?.mcp_resources?.resources || []
 
@@ -391,7 +421,7 @@ export default function SystemPanel({ status }: Props) {
                       onClick={async () => {
                         setImportMessage(null)
                         try {
-                          const j = await postJson<any>(consoleEndpoints.googleImport, {})
+                          const j = await postJson<GoogleImportResponse>(consoleEndpoints.googleImport, {})
                           setImportMessage(j.message || 'Google history import started.')
                           void syncGoogle()
                         } catch (error) {
@@ -567,7 +597,7 @@ export default function SystemPanel({ status }: Props) {
                       </Typography>
                       {githubStatus.expires_at ? (() => {
                         const exp = new Date(githubStatus.expires_at)
-                        const daysLeft = Math.ceil((exp.getTime() - Date.now()) / 86400000)
+                        const daysLeft = Math.ceil((exp.getTime() - nowMs) / 86400000)
                         const isWarning = daysLeft < 30
                         return (
                           <Typography variant="caption" sx={{
@@ -599,20 +629,16 @@ export default function SystemPanel({ status }: Props) {
               <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
                 <Typography variant="overline" color="text.secondary" sx={{ mb: 1, display: 'block' }}>Agent Runtime</Typography>
                 <Box
-                  data-testid="system-openclaw-integration"
+                  data-testid="system-agents-integration"
                   sx={{ border: '1px solid', borderColor: 'divider', borderRadius: '8px', p: 1.25 }}
                 >
                   <Stack direction="row" justifyContent="space-between" alignItems="center">
                     <Typography variant="body2" sx={{ fontWeight: 800, fontSize: '0.8125rem' }}>
-                      OpenClaw
+                      Agent
                     </Typography>
                     <Chip
                       size="small"
-                      label={
-                        agentRuntime.backend === 'openclaw-gateway' ? 'ONLINE'
-                        : agentRuntime.available ? 'AVAILABLE'
-                        : 'OFFLINE'
-                      }
+                      label={agentRuntime.execution_available ? 'EXECUTOR ONLINE' : agentRuntime.available ? 'CATALOG ONLINE' : 'OFFLINE'}
                       sx={{
                         height: 22,
                         fontSize: '0.6875rem',
@@ -625,16 +651,19 @@ export default function SystemPanel({ status }: Props) {
                     />
                   </Stack>
                   <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                    {agentRuntime.backend === 'openclaw-gateway'
-                      ? 'Primary executor — agents route through gateway'
+                    {agentRuntime.execution_available
+                      ? 'Executor configured; catalog, skills, and MCP registry are loaded from /media/mass/agents'
                       : agentRuntime.available
-                        ? 'Gateway available as fallback'
-                        : 'Gateway unreachable — agents cannot dispatch'}
+                        ? 'Catalog mode; configure an agent executor only when live chat dispatch is needed'
+                        : 'Shared agents repository unavailable'}
                   </Typography>
                   <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
                     {[
                       agentRuntime.backend || null,
                       agentRuntime.model ? `model ${agentRuntime.model}` : null,
+                      agentRuntime.agents_count != null ? `${agentRuntime.agents_count} agents` : null,
+                      agentRuntime.skills_count != null ? `${agentRuntime.skills_count} skills` : null,
+                      agentRuntime.mcp_server_count != null ? `${agentRuntime.mcp_server_count} MCP` : null,
                       agentRuntime.version || null,
                     ].filter(Boolean).join(' · ') || 'No runtime metadata'}
                   </Typography>
@@ -769,7 +798,7 @@ export default function SystemPanel({ status }: Props) {
                 <Box>
                   <Typography variant="overline" color="text.secondary">Resources ({resources.length})</Typography>
                   <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 1, mt: 0.5 }}>
-                    {resources.slice(0, 12).map((r: any, i: number) => (
+                    {resources.slice(0, 12).map((r, i: number) => (
                       <Box key={i} sx={{ border: '1px solid', borderColor: 'divider', borderRadius: '8px', p: 1 }}>
                         <Typography variant="body2" sx={{ fontWeight: 700, fontSize: '0.8125rem' }}>{r.name || r.uri}</Typography>
                         <Typography variant="caption" color="text.secondary">{r.description || r.mimeType}</Typography>

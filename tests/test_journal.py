@@ -1,6 +1,7 @@
 """Tests for journal freshness, staleness detection, and enrichment."""
 
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS", "0")
 
 # main.py requires pymilvus and other heavy deps; skip if unavailable.
 try:
@@ -18,6 +20,25 @@ except ImportError:
     _HAS_MAIN = False
 
 needs_main = pytest.mark.skipif(not _HAS_MAIN, reason="main.py deps not available")
+
+
+@pytest.fixture(autouse=True)
+def _reset_journal_cache():
+    if not _HAS_MAIN:
+        return
+    import main
+
+    main._journal_overview_cache = None
+    main._journal_overview_cache_time = 0.0
+    main._journal_overview_building = False
+    main._journal_overview_cache_fingerprint = None
+    main._journal_overview_cache_root = None
+    yield
+    main._journal_overview_cache = None
+    main._journal_overview_cache_time = 0.0
+    main._journal_overview_building = False
+    main._journal_overview_cache_fingerprint = None
+    main._journal_overview_cache_root = None
 
 
 @needs_main
@@ -233,11 +254,11 @@ class TestJournalDayBucketing:
 
         days_by_date = {d["date"]: d for d in overview["days"]}
         assert len(days_by_date["2000-01-02"]["summary"]) <= 220
-        assert days_by_date["2000-01-02"]["summary"].startswith("The clearest thread was")
+        assert days_by_date["2000-01-02"]["summary"].startswith("Main signal:")
         assert "archive cleanup" in days_by_date["2000-01-02"]["summary"].lower()
         assert "1 email" not in days_by_date["2000-01-02"]["summary"]
         assert len(days_by_date["2099-01-02"]["summary"]) <= 220
-        assert days_by_date["2099-01-02"]["summary"].startswith("The day is shaping up around")
+        assert days_by_date["2099-01-02"]["summary"].startswith("Scheduled:")
         assert "Launch planning sync" in days_by_date["2099-01-02"]["summary"]
         assert "both accounts scheduled" in days_by_date["2099-01-02"]["summary"].lower()
 
@@ -484,7 +505,7 @@ class TestJournalDayBucketing:
         day = {entry["date"]: entry for entry in overview["days"]}["2026-04-15"]
         assert day["title"].startswith("Research")
         assert "Engineering push" not in day["title"]
-        assert "AI output constraints" in day["summary"]
+        assert "recommendation-system trust" in day["summary"]
         assert "Created branch" not in day["summary"]
 
 
@@ -496,7 +517,7 @@ class TestIncrementalImportDedup:
         import main
 
         archive_dir = tmp_path / "google-archive"
-        account_dir = archive_dir / "test-at-test-com"
+        account_dir = archive_dir / main._google_account_slug("test@test.com")
         account_dir.mkdir(parents=True)
 
         # Existing records

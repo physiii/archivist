@@ -1,0 +1,116 @@
+# Authoritative source list for archivist's unified media pipeline.
+# Ported from /home/andy/automation/frigate/config/config.yml.
+# Phase 1: only `office` is enabled.
+
+defaults:
+  rtsp_transport: tcp
+  reconnect_min_s: 2
+  reconnect_max_s: 60
+  audio:
+    sample_rate: 16000
+    channels: 1
+  transcription:
+    enabled: true
+    no_speech_threshold: 0.5
+  retention:
+    local_hold_hours: 48            # sonic SSD staging window
+    nas_continuous_days: 30         # continuous archive on megamind NAS
+    nas_event_days: 365             # after 30d, keep only labeled events, up to 365d
+    keep_labels: [motion, person, car, truck, speech]
+
+sources:
+  - id: office
+    enabled: true
+    kind: camera
+    location: office
+    audio_url: "rtsp://admin:Qweasdzxc1@192.168.1.200:554/cam/realmonitor?channel=1&subtype=0"
+    video_main_url: "rtsp://admin:Qweasdzxc1@192.168.1.200:554/cam/realmonitor?channel=1&subtype=0"
+    video_sub_url: "rtsp://admin:Qweasdzxc1@192.168.1.200:554/cam/realmonitor?channel=1&subtype=1"
+    detect:
+      width: 704
+      height: 480
+      fps: 10
+    motion:
+      threshold: 40
+      contour_area: 11
+      improve_contrast: true
+      mask: [0.029, 0.933, 0.249, 0.931, 0.249, 0.963, 0.028, 0.97]
+    zones:
+      Door: [0.803, 0.182, 0.923, 0.228, 0.853, 0.524, 0.743, 0.526]
+      Computer: [0.248, 0.174, 0.488, 0.193, 0.491, 0.468, 0.241, 0.458]
+
+  - id: kids
+    enabled: true
+    kind: camera
+    location: kids
+    audio_url: "rtsp://admin:Qweasdzxc1@192.168.1.201:554/cam/realmonitor?channel=1&subtype=0"
+    video_main_url: "rtsp://admin:Qweasdzxc1@192.168.1.201:554/cam/realmonitor?channel=1&subtype=0"
+    video_sub_url: "rtsp://admin:Qweasdzxc1@192.168.1.201:554/cam/realmonitor?channel=1&subtype=1"
+    detect: { width: 704, height: 480, fps: 10 }
+
+  - id: backyard
+    enabled: true
+    kind: camera
+    location: backyard
+    audio_url: "rtsp://admin:Qweasdzxc1@192.168.1.202:554/cam/realmonitor?channel=1&subtype=0"
+    video_main_url: "rtsp://admin:Qweasdzxc1@192.168.1.202:554/cam/realmonitor?channel=1&subtype=0"
+    video_sub_url: "rtsp://admin:Qweasdzxc1@192.168.1.202:554/cam/realmonitor?channel=1&subtype=1"
+    detect: { width: 704, height: 480, fps: 10 }
+    motion:
+      threshold: 35
+      contour_area: 20
+      improve_contrast: true
+      mask: [0, 0, 1, 0, 1, 0.181, 0.711, 0.201, 0.641, 0.227, 0.263, 0.158, 0.231, 0.172, 0, 0.51, 0, 0.125]
+
+  - id: hallway
+    enabled: true
+    kind: camera
+    location: hallway
+    audio_url: "rtsp://admin:Qweasdzxc1@192.168.1.199:554"
+    video_main_url: "rtsp://admin:Qweasdzxc1@192.168.1.199:554"
+    video_sub_url: "rtsp://admin:Qweasdzxc1@192.168.1.199:554/cam/realmonitor?channel=1&subtype=1"
+    detect: { width: 704, height: 480, fps: 10 }
+
+  - id: front_door
+    enabled: true
+    kind: camera
+    location: front_door
+    audio_url: "rtsp://admin:Qweasdzxc1@192.168.1.203:554"
+    video_main_url: "rtsp://admin:Qweasdzxc1@192.168.1.203:554"
+    video_sub_url: "rtsp://admin:Qweasdzxc1@192.168.1.203:554/cam/realmonitor?channel=1&subtype=1"
+    # 4K stream produces packets MP4 muxer rejects (EINVAL); mpegts is forgiving.
+    segment_format: mpegts
+    detect: { width: 704, height: 480, fps: 10 }
+    motion:
+      threshold: 54
+      contour_area: 50
+      improve_contrast: true
+
+  - id: floodlight
+    enabled: true
+    kind: camera
+    location: floodlight
+    audio_url: "rtsp://admin:Qweasdzxc1@192.168.1.175:554"
+    video_main_url: "rtsp://admin:Qweasdzxc1@192.168.1.175:554"
+    video_sub_url: "rtsp://admin:Qweasdzxc1@192.168.1.175:554/Preview_01_sub"
+    detect: { width: 1536, height: 576, fps: 10 }
+    motion:
+      threshold: 44
+      contour_area: 10
+      improve_contrast: true
+
+  - id: office_mic
+    enabled: true
+    kind: mic
+    location: office
+    audio_url: "rtsp://192.168.1.43:8554/mic"
+    video_main_url: null
+    video_sub_url: null
+
+  - id: living_room
+    enabled: true
+    kind: mic
+    location: living_room
+    audio_url: "rtsp://192.168.1.139:8554/mic"
+    video_main_url: null
+    video_sub_url: null

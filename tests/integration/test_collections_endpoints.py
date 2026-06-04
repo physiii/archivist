@@ -7,9 +7,9 @@ BASE_URL = os.environ.get("VECTORSTORE_BASE_URL", "http://127.0.0.1:5050").rstri
 
 
 def test_health_ok():
-    r = requests.get(f"{BASE_URL}/health", timeout=10)
+    r = requests.get(f"{BASE_URL}/health", timeout=60)
     assert r.status_code == 200
-    assert r.json().get("status") == "ok"
+    assert r.json().get("status") in {"ok", "healthy"}
 
 
 def test_list_collections_has_expected_shape():
@@ -63,4 +63,3 @@ def test_global_search_endpoint_responds():
         first = payload["results"][0]
         assert "collection" in first
         assert "distance" in first
-

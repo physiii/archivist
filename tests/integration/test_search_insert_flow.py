@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import requests
 
@@ -13,7 +14,13 @@ import requests
 BASE_URL = os.environ.get("VECTORSTORE_BASE_URL", "http://127.0.0.1:5050").rstrip("/")
 
 
-def _deterministic_embedding(text: str, dim: int = 4096) -> list[float]:
+def _fake_embedding_host() -> str:
+    return os.environ.get("VECTORSTORE_FAKE_EMBEDDING_HOST") or (
+        "127.0.0.1" if Path("/.dockerenv").exists() else "host.docker.internal"
+    )
+
+
+def _deterministic_embedding(text: str, dim: int = 2560) -> list[float]:
     h = hashlib.sha256(text.encode("utf-8")).digest()
     # Expand the hash into dim floats in [0, 1).
     out: list[float] = []
@@ -89,7 +96,7 @@ def _post(path: str, payload: dict, timeout: float = 120):
     return body
 
 
-def _poll_search(collection: str, token: str, embedding_port: int, mode: str, timeout_s: float = 45):
+def _poll_search(collection: str, token: str, embedding_host: str, embedding_port: int, mode: str, timeout_s: float = 45):
     deadline = time.time() + timeout_s
     last = None
     while time.time() < deadline:
@@ -99,7 +106,7 @@ def _poll_search(collection: str, token: str, embedding_port: int, mode: str, ti
                 "query": token,
                 "limit": 5,
                 "mode": mode,
-                "embedding_host": "host.docker.internal",
+                "embedding_host": embedding_host,
                 "embedding_port": embedding_port,
             },
             timeout=120,
@@ -114,6 +121,7 @@ def _poll_search(collection: str, token: str, embedding_port: int, mode: str, ti
 def test_insert_and_search_dense_bm25_hybrid():
     server = FakeEmbeddingServer()
     port = server.start()
+    embedding_host = _fake_embedding_host()
     collection = f"pytest_{uuid.uuid4().hex[:10]}"
     try:
         token = f"uniqtoken_{uuid.uuid4().hex}"
@@ -126,15 +134,15 @@ def test_insert_and_search_dense_bm25_hybrid():
                 "model": "local_model",
                 "chunk_size": 20000,
                 "overlap": 0,
-                "embedding_host": "host.docker.internal",
+                "embedding_host": embedding_host,
                 "embedding_port": port,
             },
             timeout=120,
         )
 
-        _poll_search(collection, token, port, mode="dense", timeout_s=60)
-        _poll_search(collection, token, port, mode="bm25", timeout_s=60)
-        _poll_search(collection, token, port, mode="hybrid", timeout_s=60)
+        _poll_search(collection, token, embedding_host, port, mode="dense", timeout_s=60)
+        _poll_search(collection, token, embedding_host, port, mode="bm25", timeout_s=60)
+        _poll_search(collection, token, embedding_host, port, mode="hybrid", timeout_s=60)
     finally:
         try:
             _post(f"/api/collections/{collection}/drop", {}, timeout=60)

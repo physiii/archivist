@@ -244,8 +244,8 @@ Previous chunks for a media ID are deleted before re-indexing via `source_id == 
 Builds a single-sentence subject line from the full artifact bundle after document composition and vectorstore projection.
 
 - Uses representative artifacts across document, memory, recap, event, and transcript layers
-- Calls the configured OpenClaw-compatible chat endpoint when available
-- Falls back to a deterministic heuristic sentence when the gateway is unavailable
+- Calls the configured agent executor endpoint when available
+- Falls back to a deterministic heuristic sentence when the executor is unavailable
 - Persists the result as:
   - top-level `subject_line` in the pipeline result
   - a `subject_line` derived artifact in the clean public artifact bundle
@@ -353,13 +353,17 @@ Integrates **faster-whisper** directly into the archivist process.
 | Setting | Environment Variable | Default |
 |---------|---------------------|---------|
 | Model | `TRANSCRIBE_MODEL` | `medium.en` |
+| Provider | `TRANSCRIBE_PROVIDER` | `local_first` |
+| Host GPU | `ARCHIVIST_GPU_ID` | `0` |
+| Container CUDA device | `TRANSCRIBE_GPU_ID` | `0` |
 | Compute type | `TRANSCRIBE_COMPUTE_TYPE` | `float16` (GPU) / `int8` (CPU) |
 | Beam size | `TRANSCRIBE_BEAM_SIZE` | `1` |
-| Max concurrent | `TRANSCRIBE_MAX_CONCURRENT` | `2` |
+| Max concurrent | `TRANSCRIBE_MAX_CONCURRENT` | `1` |
 | Normalization target | `TRANSCRIBE_TARGET_PEAK` | `0.10` |
 
-- **Lazy loading:** model loaded on first transcription request, not at startup
-- **GPU-first:** uses `cuda:0` by default, falls back to `cpu` with `int8`
+- **Primary backend:** faster-whisper runs inside Archivist; remote transcription is fallback-only when configured
+- **GPU-first:** production compose exposes one host GPU and Whisper uses container-local `cuda:0`; falls back to `cpu` with `int8`
+- **GPU allocation:** see `docs/GPU_RUNTIME_ALLOCATION.md` for the transcription, embedding, and speech-generation split
 - **Audio normalization:** peak detection and gain adjustment before transcription
 - **Concurrency:** semaphore-limited to prevent GPU memory exhaustion
 - **Output:** segments with start/end times and word-level timestamps
@@ -489,9 +493,12 @@ The pipeline follows a **graceful degradation** strategy:
 | `MEDIA_PIPELINE_DIR` | `/data/media_pipeline` | Pipeline result cache |
 | `MEDIA_WATCH_INTERVAL_S` | `30` | Watcher scan interval (seconds) |
 | `TRANSCRIBE_MODEL` | `medium.en` | Whisper model variant |
+| `TRANSCRIBE_PROVIDER` | `local_first` | Backend preference (`local_first`, `local_only`, `remote_first`, `remote_only`) |
+| `ARCHIVIST_GPU_ID` | `0` | Host GPU exposed to Archivist by compose |
+| `TRANSCRIBE_GPU_ID` | `0` | Container-local CUDA device index |
 | `TRANSCRIBE_COMPUTE_TYPE` | `float16` | Inference precision |
 | `TRANSCRIBE_BEAM_SIZE` | `1` | Beam search width |
-| `TRANSCRIBE_MAX_CONCURRENT` | `2` | Max parallel transcriptions |
+| `TRANSCRIBE_MAX_CONCURRENT` | `1` | Max parallel transcriptions |
 | `TRANSCRIBE_TARGET_PEAK` | `0.10` | Audio normalization target |
 | `MILVUS_HOST` | `localhost` | Milvus vector DB host |
 | `EMBEDDING_HOST` | `localhost` | Embedding service host |

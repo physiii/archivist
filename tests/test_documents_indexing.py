@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import indexing_service
 from documents.chunking import chunk_document_segments
 from documents.extract import ExtractedDocumentSegment, extract_document_segments
+from transcripts.parsers import parse_transcript
 
 
 def test_extract_document_segments_pdf(monkeypatch):
@@ -85,6 +86,45 @@ def test_indexing_file_discovery_includes_documents(tmp_path):
     assert [Path(path).name for path in files] == ["a.pdf", "b.docx", "c.txt"]
 
 
+def test_indexing_file_discovery_includes_source_logs(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "twin_app.log").write_text(
+        "2025-08-01 23:46:02,559 [twin] [INFO] [main.py] [Source] different compute architecture\n",
+        encoding="utf-8",
+    )
+
+    files = indexing_service._iter_target_files(str(docs_dir), recursive=False)
+    count, timed_out = indexing_service._target_scan_count(str(docs_dir), recursive=False)
+
+    assert timed_out is False
+    assert count == 1
+    assert [Path(path).name for path in files] == ["twin_app.log"]
+
+
+def test_parse_source_log_transcript_lines(tmp_path):
+    path = tmp_path / "twin_app.log"
+    path.write_text(
+        "\n".join(
+            [
+                "2025-08-01 23:46:02,559 [twin] [INFO] [main.py] [Source] It's just going to be like a different compute architecture.",
+                "2025-08-01 23:46:04,960 [twin] [INFO] [main.py] [Source] architecture and like structure for a semantic space.",
+                "2025-08-01 23:46:16,943 [twin] [INFO] [main.py] [Source] due to Euclidean relationships.",
+                "2025-08-01 23:46:17,960 [twin] [INFO] [main.py] [Debug] not transcript text",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cues, reason = parse_transcript(path)
+
+    assert reason is None
+    assert len(cues) == 3
+    assert cues[0].end_ms > cues[0].start_ms
+    assert "different compute architecture" in cues[0].text
+    assert "Euclidean relationships" in cues[-1].text
+
+
 def test_indexing_file_discovery_dedupes_media_sidecars(tmp_path):
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir()
@@ -144,6 +184,30 @@ def test_parent_target_scan_excludes_nested_target(tmp_path):
     assert child_count == 1
 
 
+def test_google_archive_business_records_get_business_tags():
+    cases = [
+        ("versant", "Versant onsite schedule", "The Versant AI director workstream is active."),
+        ("gigantor", "Gigantor investor update", "Gigantor execution planning needs follow-up."),
+        ("vivonics", "vivonics.ai is now active on Cloudflare", "Cloudflare is now boosting vivonics.ai."),
+    ]
+
+    for slug, subject, body in cases:
+        record = {
+            "service": "gmail",
+            "account": "andy@example.com",
+            "day": "2026-04-12",
+            "id": f"{slug}-record",
+            "subject": subject,
+            "body": body,
+            "labels": ["CATEGORY_UPDATES"],
+        }
+
+        tags = indexing_service._google_archive_extra_tags(record)
+
+        assert "category:business" in tags
+        assert f"business:{slug}" in tags
+
+
 def test_indexing_scan_prunes_generated_directories(tmp_path):
     root = tmp_path / "docs"
     (root / "node_modules" / "package").mkdir(parents=True)
@@ -166,6 +230,7 @@ def test_collection_and_version_dispatch_for_documents():
     assert indexing_service._collection_name_for_path("/docs/file.docx") == indexing_service.DOCUMENTS_COLLECTION
     assert indexing_service._content_version_for_path("/docs/file.pdf") == indexing_service.DOCUMENT_CONTENT_VERSION
     assert indexing_service._collection_name_for_path("/docs/file.vtt") == indexing_service.TRANSCRIPT_COLLECTION
+    assert indexing_service._collection_name_for_path("/docs/twin_app.log") == indexing_service.TRANSCRIPT_COLLECTION
 
 
 def test_plain_txt_defaults_to_documents(tmp_path):

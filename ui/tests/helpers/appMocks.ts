@@ -3,6 +3,12 @@ import type { Locator, Page } from "@playwright/test";
 export const TEST_COLLECTION_NAME = "transcripts";
 export const TEST_MEDIA_ID = "media-001";
 
+async function domClick(locator: Locator) {
+  await locator.evaluate((node) => {
+    if (node instanceof HTMLElement) node.click();
+  });
+}
+
 function isoDayForMonth(monthParam: string, day = 14) {
   const [year, month] = monthParam.split("-").map(Number);
   return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
@@ -223,7 +229,7 @@ function testReportPayload() {
       p50_s: 0.18,
       p95_s: 0.33,
       slowest_tests: [
-        { name: "tests/test_focus_priority_console_eval.py::test_focus_priority_performance_slow_gateway_falls_back_without_locking_the_route", duration_s: 0.33 },
+        { name: "tests/test_focus_priority_console_eval.py::test_focus_priority_performance_slow_executor_falls_back_without_locking_the_route", duration_s: 0.33 },
       ],
     },
     category_breakdown: {
@@ -241,7 +247,7 @@ function testReportPayload() {
     performance_metrics: [],
     results: [
       {
-        name: "tests/test_focus_priority_console_eval.py::test_focus_priority_eval_adds_personal_note_when_gateway_is_unavailable",
+        name: "tests/test_focus_priority_console_eval.py::test_focus_priority_eval_adds_personal_note_when_executor_is_unavailable",
         status: "passed",
         duration_s: 0.14,
         timestamp: "2026-04-23T19:40:00Z",
@@ -315,7 +321,7 @@ export async function mockAppApis(page: Page) {
     }
 
     if (pathname === "/api/chat/sessions") {
-      return fulfillJson(route, { sessions: [], oc_sessions: [] });
+      return fulfillJson(route, { sessions: [], agent_sessions: [] });
     }
 
     if (/^\/api\/chat\/sessions\/.+\/messages$/.test(pathname)) {
@@ -327,7 +333,7 @@ export async function mockAppApis(page: Page) {
         flags: { system_enabled: true, speech_input_enabled: true },
         integrations: {
           probes: [
-            { name: "OpenClaw Gateway", ok: true, status: 200, target: "http://127.0.0.1:18789", latency_ms: 12 },
+            { name: "Agent Knowledge Base", ok: true, status: 200, target: "/media/mass/agents", latency_ms: 12 },
             { name: "Backup Service", ok: true, status: 200, target: "internal", latency_ms: 4 },
             { name: "Indexing Service", ok: true, status: 200, target: "internal", latency_ms: 5 },
           ],
@@ -352,12 +358,12 @@ export async function mockAppApis(page: Page) {
         repairs: {
           agent_runtime: {
             available: true,
-            backend: "openclaw-gateway",
-            binary: "http://127.0.0.1:18789",
-            model: "openclaw/archivist-main",
+            backend: "agents-repository",
+            binary: "/media/mass/agents",
+            model: "agents/operator-chat",
             workspace_path: "/home/andy/archivist",
             workspace_mounted: true,
-            console_agent_id: "archivist-main",
+            console_agent_id: "operator-chat",
             registered: true,
             errors: [],
           },
@@ -367,19 +373,19 @@ export async function mockAppApis(page: Page) {
 
     if (pathname === "/api/agent/config") {
       return fulfillJson(route, {
-        consoleAgentId: "archivist-main",
-        visibleAgentIds: ["archivist-main", "archivist-health", "archivist-verifier"],
-        gatewayUrl: "http://127.0.0.1:18789",
-        gatewayTokenConfigured: true,
+        consoleAgentId: "operator-chat",
+        visibleAgentIds: ["operator-chat", "runtime-health-monitor", "verification-worker"],
+        executorUrl: "/media/mass/agents",
+        executorTokenConfigured: true,
         workspacePath: "/home/andy/archivist",
-        registeredAgents: ["archivist-main", "archivist-health", "archivist-verifier"],
+        registeredAgents: ["operator-chat", "runtime-health-monitor", "verification-worker"],
         teamAgents: [],
         runtime: {
           available: true,
-          backend: "openclaw-gateway",
-          binary: "http://127.0.0.1:18789",
-          model: "openclaw/archivist-main",
-          registered_agents: ["archivist-main", "archivist-health", "archivist-verifier"],
+          backend: "agents-repository",
+          binary: "/media/mass/agents",
+          model: "agents/operator-chat",
+          registered_agents: ["operator-chat", "runtime-health-monitor", "verification-worker"],
         },
       });
     }
@@ -410,13 +416,13 @@ export async function mockAppApis(page: Page) {
             },
             agents: [
               {
-                id: "archivist-main",
+                id: "operator-chat",
                 name: "Archivist Main",
                 description: "Human-facing operator",
                 status: "active",
                 role: "operator",
                 summary: "Primary control-plane operator for the Archivist console and chat surfaces.",
-                workspace: "/home/andy/archivist/openclaw-team/agents/archivist-main",
+                workspace: "/media/mass/agents/agents/operator-chat",
                 registered: true,
                 group_label: "operator",
                 lane: "system",
@@ -428,13 +434,13 @@ export async function mockAppApis(page: Page) {
                 tickets: [],
               },
               {
-                id: "archivist-verifier",
+                id: "verification-worker",
                 name: "Archivist Verifier",
                 description: "Validation gate for Archivist builds, tests, and runtime checks.",
                 status: "active",
                 role: "verifier",
                 summary: "Owns targeted sign-off for backend, console, and focus-priority regressions.",
-                workspace: "/home/andy/archivist/openclaw-team/agents/archivist-verifier",
+                workspace: "/media/mass/agents/agents/verification-worker",
                 registered: true,
                 group_label: "verifier",
                 lane: "system",
@@ -458,7 +464,7 @@ export async function mockAppApis(page: Page) {
                     summary: "Focus priority evals are stale (75.0 minutes old).",
                     status: "open",
                     severity: "high",
-                    authority: "archivist-verifier",
+                    authority: "verification-worker",
                     created_at: "2026-04-23T19:20:00Z",
                     last_seen_at: "2026-04-23T19:20:00Z",
                   },
@@ -478,7 +484,7 @@ export async function mockAppApis(page: Page) {
                 status: "active",
                 role: "specialist",
                 summary: "Handles focus-specific analysis and revisions.",
-                workspace: "/home/andy/archivist/openclaw-team/agents/priority-specialist",
+                workspace: "/media/mass/agents/agents/priority-specialist",
                 registered: true,
                 group_label: "specialist",
                 lane: "specialist",
@@ -505,16 +511,16 @@ export async function mockAppApis(page: Page) {
             summary: "Focus priority evals are stale (75.0 minutes old).",
             status: "open",
             severity: "high",
-            authority: "archivist-verifier",
+            authority: "verification-worker",
             created_at: "2026-04-23T19:20:00Z",
             last_seen_at: "2026-04-23T19:20:00Z",
             details: { profile: "focus-priorities", age_minutes: 75 },
           },
         ],
-        openclaw: {
+        agents: {
           available: true,
-          binary: "http://127.0.0.1:18789",
-          model: "openclaw/archivist-main",
+          binary: "/media/mass/agents",
+          model: "agents/operator-chat",
           version: "test",
         },
         experiments: { completed: ["focus-priorities (scheduled)"], current: null },
@@ -524,7 +530,7 @@ export async function mockAppApis(page: Page) {
             profile: "focus-priorities",
             label: "Focus Priority Evals",
             status: "stale",
-            owner_agents: ["archivist-verifier", "archivist-health"],
+            owner_agents: ["verification-worker", "runtime-health-monitor"],
             stale_after_minutes: 45,
             latest: {
               run_id: "focus-priorities-report",
@@ -541,7 +547,7 @@ export async function mockAppApis(page: Page) {
                 summary: "Focus priority evals are stale (75.0 minutes old).",
                 status: "open",
                 severity: "high",
-                authority: "archivist-verifier",
+                authority: "verification-worker",
                 last_seen_at: "2026-04-23T19:20:00Z",
                 details: { examples: ["tests/test_focus_priority_console_eval.py::test_focus_priority_eval_query_overview_surfaces_personal_manual_focus_first"] },
               },
@@ -556,7 +562,7 @@ export async function mockAppApis(page: Page) {
     if (pathname === "/api/agent/sessions") {
       return fulfillJson(route, [
         {
-          id: "agent:archivist-main:main:web:test-session@archivist-main",
+          id: "agent:operator-chat:main:web:test-session@operator-chat",
           source: "local",
           status: "active",
           createdAt: 1712400000_000,
@@ -564,13 +570,13 @@ export async function mockAppApis(page: Page) {
           messageCount: 2,
           lastMessage: "Workspace is /home/andy/archivist.",
           title: "Confirm the workspace path",
-          agentId: "archivist-main",
-          sessionKey: "main:web:test-session@archivist-main",
+          agentId: "operator-chat",
+          sessionKey: "main:web:test-session@operator-chat",
           surface: "console",
           historyScope: "main-chat",
         },
         {
-          id: "agent:archivist-verifier:main:web:fleet-archivist-verifier@archivist-verifier",
+          id: "agent:verification-worker:main:web:fleet-verification-worker@verification-worker",
           source: "local",
           status: "active",
           createdAt: 1712403800_000,
@@ -578,8 +584,8 @@ export async function mockAppApis(page: Page) {
           messageCount: 2,
           lastMessage: "Focus priority evals are stale.",
           title: "Verifier lane follow-up",
-          agentId: "archivist-verifier",
-          sessionKey: "main:web:fleet-archivist-verifier@archivist-verifier",
+          agentId: "verification-worker",
+          sessionKey: "main:web:fleet-verification-worker@verification-worker",
           surface: "console",
           historyScope: "fleet-system",
         },
@@ -587,13 +593,13 @@ export async function mockAppApis(page: Page) {
     }
 
     if (/^\/api\/agent\/sessions\/.+$/.test(pathname)) {
-      const isVerifier = pathname.includes("archivist-verifier");
+      const isVerifier = pathname.includes("verification-worker");
       return fulfillJson(route, {
         id: isVerifier
-          ? "agent:archivist-verifier:main:web:fleet-archivist-verifier@archivist-verifier"
-          : "agent:archivist-main:main:web:test-session@archivist-main",
-        agentId: isVerifier ? "archivist-verifier" : "archivist-main",
-        sessionKey: isVerifier ? "main:web:fleet-archivist-verifier@archivist-verifier" : "main:web:test-session@archivist-main",
+          ? "agent:verification-worker:main:web:fleet-verification-worker@verification-worker"
+          : "agent:operator-chat:main:web:test-session@operator-chat",
+        agentId: isVerifier ? "verification-worker" : "operator-chat",
+        sessionKey: isVerifier ? "main:web:fleet-verification-worker@verification-worker" : "main:web:test-session@operator-chat",
         source: "local",
         surface: "console",
         historyScope: isVerifier ? "fleet-system" : "main-chat",
@@ -1010,11 +1016,12 @@ export async function mockAppApis(page: Page) {
 export async function clickSidebarNav(page: Page, label: string) {
   const menuButton = page.getByRole("button", { name: "Open menu" });
   if (await menuButton.isVisible().catch(() => false)) {
-    await menuButton.click();
-    await page.locator(".sidebar-mobile.open .sidebar-nav-item").filter({ hasText: label }).first().click();
+    await domClick(menuButton);
+    await page.waitForSelector(".sidebar-mobile.open");
+    await domClick(page.locator(".sidebar-mobile.open .sidebar-nav-item").filter({ hasText: label }).first());
     return;
   }
-  await page.locator(".sidebar-nav-item").filter({ hasText: label }).first().click();
+  await domClick(page.locator(".sidebar-nav-item").filter({ hasText: label }).first());
 }
 
 export async function waitForRowsOrEmpty(page: Page, rows: Locator, emptyState: Locator) {

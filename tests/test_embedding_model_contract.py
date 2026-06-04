@@ -34,6 +34,7 @@ def test_search_vectorstore_uses_explicit_embedding_model(monkeypatch):
     monkeypatch.setattr(search.connections, "connect", lambda *a, **k: None)
     monkeypatch.setattr(search.connections, "disconnect", lambda *a, **k: None)
     monkeypatch.setattr(search.utility, "has_collection", lambda *a, **k: True)
+    monkeypatch.setattr(search.utility, "wait_for_loading_complete", lambda *a, **k: None)
 
     class _Field:
         def __init__(self, name, params=None):
@@ -65,7 +66,7 @@ def test_search_vectorstore_uses_explicit_embedding_model(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def load(self):
+        def load(self, *args, **kwargs):
             return None
 
         def search(self, **kwargs):
@@ -97,7 +98,7 @@ def test_vectorstore_search_endpoint_threads_model(monkeypatch):
     load_stub.load_to_vectorstore = lambda *a, **k: None
     load_stub.load_text_to_vectorstore = lambda *a, **k: {"ok": True}
     load_stub.clear_vectorstore_collection = lambda *a, **k: {"ok": True}
-    sys.modules["load"] = load_stub
+    monkeypatch.setitem(sys.modules, "load", load_stub)
 
     backups_stub = types.ModuleType("backups_service")
     backups_stub.BACKUP_ROOT = "/tmp"
@@ -105,6 +106,7 @@ def test_vectorstore_search_endpoint_threads_model(monkeypatch):
     backups_stub.delete_backup_target = lambda *a, **k: None
     backups_stub.get_backup_overview = lambda *a, **k: {}
     backups_stub.get_run_logs = lambda *a, **k: []
+    backups_stub.list_backup_files = lambda *a, **k: []
     backups_stub.list_backup_targets = lambda *a, **k: []
     backups_stub.start_backup = lambda *a, **k: None
     backups_stub.start_scheduler_best_effort = lambda *a, **k: None
@@ -112,13 +114,15 @@ def test_vectorstore_search_endpoint_threads_model(monkeypatch):
     backups_stub.stop_backup = lambda *a, **k: None
     backups_stub.update_backup_target = lambda *a, **k: None
     backups_stub.update_schedule = lambda *a, **k: None
-    sys.modules["backups_service"] = backups_stub
+    monkeypatch.setitem(sys.modules, "backups_service", backups_stub)
 
     indexing_stub = types.ModuleType("indexing_service")
+    indexing_stub.GOOGLE_ARCHIVE_CONTENT_VERSION = "google_archive_v1"
     indexing_stub.add_indexing_target = lambda *a, **k: None
     indexing_stub.delete_indexing_target = lambda *a, **k: None
     indexing_stub.get_indexing_overview = lambda *a, **k: {}
     indexing_stub.get_indexing_run_logs = lambda *a, **k: []
+    indexing_stub.index_google_archive_content = lambda *a, **k: {"records_seen": 0, "records_indexed": 0, "chunks_inserted": 0, "errors": []}
     indexing_stub.list_indexing_targets = lambda *a, **k: []
     indexing_stub.scan_indexing_target = lambda *a, **k: {}
     indexing_stub.start_indexing = lambda *a, **k: None
@@ -126,12 +130,12 @@ def test_vectorstore_search_endpoint_threads_model(monkeypatch):
     indexing_stub.start_target_indexing = lambda *a, **k: None
     indexing_stub.stop_indexing = lambda *a, **k: None
     indexing_stub.update_indexing_target = lambda *a, **k: None
-    sys.modules["indexing_service"] = indexing_stub
+    monkeypatch.setitem(sys.modules, "indexing_service", indexing_stub)
 
     movietime_stub = types.ModuleType("movietime_items")
     movietime_stub.search_movietime_items = lambda *a, **k: []
     movietime_stub.upsert_movietime_items = lambda *a, **k: {"ok": True}
-    sys.modules["movietime_items"] = movietime_stub
+    monkeypatch.setitem(sys.modules, "movietime_items", movietime_stub)
 
     main = _load_module("archivist_main_test", "main.py")
     captured = {}
