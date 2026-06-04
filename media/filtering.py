@@ -49,6 +49,55 @@ def _lowpri_prefix() -> list[str]:
     return pre
 LOWPRI_PREFIX = _lowpri_prefix()
 
+# ── GPU-accelerated decode (NVDEC) ───────────────────────────────────────
+# Batch video decode (scene detection, keyframes) is the heaviest CPU cost in
+# the pipeline — software-decoding 4K HEVC pegs many cores. Offload decode to the
+# GPU's hardware decoder when available, with an automatic software fallback so
+# an unsupported codec never breaks indexing. Needs `video` in the container's
+# NVIDIA_DRIVER_CAPABILITIES so libnvcuvid is present.
+FFMPEG_HWACCEL = os.getenv("MEDIA_FFMPEG_HWACCEL", "cuda").strip()
+_HWACCEL_MAX_FAILURES = max(1, int(os.getenv("MEDIA_FFMPEG_HWACCEL_MAX_FAILURES", "3")))
+_hwaccel_failures = 0
+_hwaccel_disabled = False
+
+
+def _hwaccel_args() -> list[str]:
+    """ffmpeg flags to insert before -i for GPU decode, or [] when disabled."""
+    if _hwaccel_disabled or not FFMPEG_HWACCEL:
+        return []
+    return ["-hwaccel", FFMPEG_HWACCEL]
+
+
+def _run_ffmpeg_decode(build_cmd, *, timeout: float, text: bool = False):
+    """Run a video-decode ffmpeg command on the GPU when configured, falling back
+    to software if the hardware decoder rejects the input.
+
+    build_cmd(hwaccel) returns the full argv with the `hwaccel` flags (e.g.
+    ["-hwaccel", "cuda"]) inserted just before -i. After repeated hwaccel
+    failures the GPU path is disabled process-wide so we don't double-run files.
+    """
+    global _hwaccel_failures, _hwaccel_disabled
+    hw = _hwaccel_args()
+    result = subprocess.run(build_cmd(hw), capture_output=True, text=text, timeout=timeout)
+    if hw:
+        if result.returncode == 0:
+            _hwaccel_failures = 0
+        else:
+            _hwaccel_failures += 1
+            logger.info(
+                "ffmpeg hwaccel=%s failed (rc=%d); retrying in software [%d/%d]",
+                FFMPEG_HWACCEL, result.returncode, _hwaccel_failures, _HWACCEL_MAX_FAILURES,
+            )
+            if _hwaccel_failures >= _HWACCEL_MAX_FAILURES:
+                _hwaccel_disabled = True
+                logger.warning(
+                    "Disabling ffmpeg hwaccel=%s after %d consecutive failures; using software decode",
+                    FFMPEG_HWACCEL, _HWACCEL_MAX_FAILURES,
+                )
+            result = subprocess.run(build_cmd([]), capture_output=True, text=text, timeout=timeout)
+    return result
+
+
 # ── Video Filtering ─────────────────────────────────────────────────────
 
 
@@ -83,16 +132,17 @@ def detect_scene_changes(asset: MediaAsset, threshold: float = 0.3) -> list[Scen
         vf_filters.append("showinfo")
         # Use ffmpeg (not ffprobe) with the select filter to detect scene changes.
         # -f null - discards the output; showinfo prints pts_time for each selected frame.
-        result = subprocess.run(
-            [
-                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "info", "-i", asset.path,
+        def _build(hw: list[str]) -> list[str]:
+            return [
+                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "info",
+                *hw, "-i", asset.path,
                 "-an", "-sn", "-dn",
                 "-vf", ",".join(vf_filters),
                 "-vsync", "vfr",
                 "-f", "null", "-",
-            ],
-            capture_output=True, text=True,
-            timeout=max(300, int(asset.duration_s * 0.5)),
+            ]
+        result = _run_ffmpeg_decode(
+            _build, timeout=max(300, int(asset.duration_s * 0.5)), text=True,
         )
         # ffmpeg writes filter output to stderr
         output = result.stderr or ""
@@ -165,21 +215,21 @@ def extract_keyframes(asset: MediaAsset, output_dir: str, max_frames: int = 100,
 
         for idx, ts in enumerate(timestamps, start=1):
             frame_path = os.path.join(output_dir, f"keyframe_{idx:04d}.jpg")
-            cmd = [
-                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{ts:.3f}",
-                "-i", asset.path,
-                "-an", "-sn", "-dn",
-            ]
-            if scale_filter:
-                cmd.extend(["-vf", scale_filter])
-            cmd.extend([
-                "-frames:v", "1",
-                "-q:v", "2",
-                frame_path,
-            ])
+
+            def _build(hw: list[str], ts: float = ts, frame_path: str = frame_path) -> list[str]:
+                cmd = [
+                    *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    *hw,
+                    "-ss", f"{ts:.3f}",
+                    "-i", asset.path,
+                    "-an", "-sn", "-dn",
+                ]
+                if scale_filter:
+                    cmd.extend(["-vf", scale_filter])
+                cmd.extend(["-frames:v", "1", "-q:v", "2", frame_path])
+                return cmd
             try:
-                result = subprocess.run(cmd, capture_output=True, timeout=60)
+                result = _run_ffmpeg_decode(_build, timeout=60)
             except subprocess.TimeoutExpired:
                 logger.warning("Keyframe seek extraction timed out for %s at %.2fs", asset.filename, ts)
                 continue
@@ -201,18 +251,18 @@ def extract_keyframes(asset: MediaAsset, output_dir: str, max_frames: int = 100,
         vf_filters.append("select='eq(pict_type\\,I)'")
 
     try:
-        result = subprocess.run(
-            [
-                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", asset.path,
+        def _build(hw: list[str]) -> list[str]:
+            return [
+                *LOWPRI_PREFIX, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                *hw, "-i", asset.path,
                 "-an", "-sn", "-dn",
                 "-vf", ",".join(vf_filters),
                 "-frames:v", str(max_frames),
                 "-vsync", "vfr",
                 "-q:v", "2",
                 os.path.join(output_dir, "keyframe_%04d.jpg"),
-            ],
-            capture_output=True, timeout=180,
-        )
+            ]
+        result = _run_ffmpeg_decode(_build, timeout=180)
         if result.returncode != 0:
             logger.warning("Keyframe extraction failed for %s", asset.filename)
             return []

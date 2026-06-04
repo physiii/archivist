@@ -72,6 +72,52 @@ import threading as _threading
 MEDIA_MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MEDIA_MAX_CONCURRENT_JOBS", "2")))
 _MEDIA_JOB_SEM = _threading.Semaphore(MEDIA_MAX_CONCURRENT_JOBS)
 
+# Priority gate: background (batch) media work yields to real-time transcription.
+# A new batch file is deferred while the 1-minute load average per CPU exceeds
+# this ratio, so live RTSP transcription always gets the host first. 0 disables
+# the gate; manual/forced reprocesses are never deferred.
+MEDIA_WATCH_MAX_LOAD_PER_CPU = max(0.0, float(os.getenv("MEDIA_WATCH_MAX_LOAD_PER_CPU", "0.70")))
+MEDIA_WATCH_POLL_S = max(1.0, float(os.getenv("MEDIA_WATCH_POLL_S", "15")))
+MEDIA_WATCH_DEFER_LOG_INTERVAL_S = max(0, int(os.getenv("MEDIA_WATCH_DEFER_LOG_INTERVAL_S", "300")))
+MEDIA_WATCH_MAX_DEFER_S = max(0.0, float(os.getenv("MEDIA_WATCH_MAX_DEFER_S", "0")))  # 0 = wait indefinitely
+
+
+def _wait_for_media_capacity() -> None:
+    """Block a batch media job until the host has spare CPU headroom.
+
+    Ensures real-time RTSP transcription always has priority over batch
+    movie-library indexing. No-op when disabled (ratio<=0) or when the load
+    average can't be read. Honors MEDIA_WATCH_MAX_DEFER_S (0 = wait indefinitely).
+    """
+    if MEDIA_WATCH_MAX_LOAD_PER_CPU <= 0:
+        return
+    cpus = os.cpu_count() or 1
+    threshold = MEDIA_WATCH_MAX_LOAD_PER_CPU * cpus
+    start = time.monotonic()
+    last_log = 0.0
+    while True:
+        try:
+            load1 = os.getloadavg()[0]
+        except (OSError, AttributeError):
+            return
+        if load1 <= threshold:
+            return
+        elapsed = time.monotonic() - start
+        if MEDIA_WATCH_MAX_DEFER_S and elapsed >= MEDIA_WATCH_MAX_DEFER_S:
+            logger.info(
+                "Batch media: proceeding after %.0fs defer (load %.1f > %.1f on %d cores)",
+                elapsed, load1, threshold, cpus,
+            )
+            return
+        now = time.monotonic()
+        if MEDIA_WATCH_DEFER_LOG_INTERVAL_S and (last_log == 0.0 or (now - last_log) >= MEDIA_WATCH_DEFER_LOG_INTERVAL_S):
+            logger.info(
+                "Deferring batch media: load %.1f > %.1f (%d cores) — real-time transcription has priority",
+                load1, threshold, cpus,
+            )
+            last_log = now
+        time.sleep(MEDIA_WATCH_POLL_S)
+
 # ...and run the heavy ffmpeg decoders at low CPU/IO priority so the OS hands
 # CPU/disk to the live pipeline first. Prefix is computed once at import.
 def _lowpri_prefix() -> list[str]:
@@ -1202,7 +1248,12 @@ def process_media_file(
     Acquires a global semaphore so at most MEDIA_MAX_CONCURRENT_JOBS files
     process concurrently — keeps batch (movie-library) work from starving
     real-time RTSP transcription. Waiting callers block here cheaply.
+
+    Background (non-forced) jobs also defer while the host is under load, so
+    real-time transcription always has CPU priority.
     """
+    if not force_reprocess:
+        _wait_for_media_capacity()
     with _MEDIA_JOB_SEM:
         return _process_media_file_impl(
             path,
