@@ -10,37 +10,11 @@ const BackupPage = lazy(() => import("./pages/BackupPage"));
 const CollectionDetailPage = lazy(() => import("./pages/CollectionDetailPage"));
 const CollectionsPage = lazy(() => import("./pages/CollectionsPage"));
 const ConsolePage = lazy(() => import("./pages/ConsolePage"));
-const FocusPage = lazy(() => import("./pages/FocusPage"));
 const IndexingPage = lazy(() => import("./pages/IndexingPage"));
-const JournalPage = lazy(() => import("./pages/JournalPage"));
 const MediaDetailPage = lazy(() => import("./pages/MediaDetailPage"));
 const MediaPage = lazy(() => import("./pages/MediaPage"));
 
 const navItems = [
-  {
-    label: "Focus",
-    sub: "whole-life control layer",
-    path: "/focus",
-    icon: (
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="12" r="8" />
-        <circle cx="12" cy="12" r="3" />
-        <path d="M12 2v2M12 20v2M2 12h2M20 12h2" />
-      </svg>
-    ),
-  },
-  {
-    label: "Journal",
-    sub: "day-by-day life log",
-    path: "/journal",
-    icon: (
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M5 4.5A2.5 2.5 0 0 1 7.5 2H20v18H7.5A2.5 2.5 0 0 0 5 22Z" />
-        <path d="M5 4.5V22H4a2 2 0 0 1-2-2V6.5a2 2 0 0 1 2-2h1Z" />
-        <path d="M9 7h7M9 11h7M9 15h5" />
-      </svg>
-    ),
-  },
   {
     label: "Collections",
     sub: "catalog & search",
@@ -188,8 +162,6 @@ export default function App() {
               <Route path="/indexing" element={<IndexingPage />} />
               <Route path="/media" element={<MediaPage />} />
               <Route path="/media/:mediaId" element={<MediaDetailPage />} />
-              <Route path="/focus" element={<FocusPage />} />
-              <Route path="/journal" element={<JournalPage />} />
               <Route path="/console" element={<ConsolePage />} />
               <Route path="*" element={<Navigate to="/collections" replace />} />
             </Routes>

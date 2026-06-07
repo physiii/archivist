@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { WorkspaceEmpty, WorkspacePage, WorkspacePanel } from "../components/Workspace";
@@ -16,6 +16,19 @@ interface SourceHealth {
   last_event_age_s: number | null;
   last_health_state?: string;
   error: string | null;
+}
+
+interface ConfiguredSource {
+  id: string;
+  enabled: boolean;
+  kind: "camera" | "mic";
+  location: string;
+  has_audio?: boolean;
+  has_video_main?: boolean;
+  has_video_sub?: boolean;
+  motion_enabled?: boolean;
+  transcription_enabled?: boolean;
+  segment_format?: string;
 }
 
 interface RtspSource {
@@ -49,12 +62,13 @@ interface VisionSource {
 }
 
 interface SourcesStatus {
-  rtsp: RtspSource[];
-  streaming: StreamingSource[];
-  motion: MotionSource[];
-  vision: (VisionSource | { clip_available?: boolean; yolo_available?: boolean })[];
-  archive: { alive: boolean; enabled: boolean; last_pass?: { scanned: number; moved: number } };
-  retention: { alive: boolean; enabled: boolean };
+  configured?: ConfiguredSource[];
+  rtsp?: RtspSource[];
+  streaming?: StreamingSource[];
+  motion?: MotionSource[];
+  vision?: (VisionSource | { clip_available?: boolean; yolo_available?: boolean })[];
+  archive?: { alive: boolean; enabled: boolean; last_pass?: { scanned: number; moved: number } };
+  retention?: { alive: boolean; enabled: boolean };
 }
 
 interface TranscribeStatus {
@@ -75,7 +89,7 @@ interface IngestSource {
   id: string;
   kind: "camera" | "mic";
   location: string;
-  state: "up" | "down" | "stale" | "unknown";
+  state: "up" | "down" | "stale" | "degraded" | "connecting" | "reconnecting" | "unknown";
   lastEventAge: number | null;
   segmentsWritten: number;
   transcriptionsSubmitted: number;
@@ -87,8 +101,59 @@ interface IngestSource {
   visionDetections: number | null;
 }
 
+const MEDIA_FETCH_TIMEOUT_MS = 8000;
+
+async function fetchJson<T>(url: string, timeoutMs = MEDIA_FETCH_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return (await response.json()) as T;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function refreshFailureLabel(label: string, err: unknown) {
+  if (err instanceof DOMException && err.name === "AbortError") return `${label} timed out`;
+  if (err instanceof Error && err.name === "AbortError") return `${label} timed out`;
+  return `${label} failed`;
+}
+
+function normalizeSourceState(state?: string): IngestSource["state"] {
+  if (
+    state === "up" ||
+    state === "down" ||
+    state === "stale" ||
+    state === "degraded" ||
+    state === "connecting" ||
+    state === "reconnecting"
+  ) {
+    return state;
+  }
+  return "unknown";
+}
+
+function sourceStateFrom(health: SourceHealth | undefined, rtsp: RtspSource | undefined): IngestSource["state"] {
+  if (health?.status === "healthy") return "up";
+  if (health?.status === "degraded" || health?.status === "stale" || health?.status === "down") {
+    return health.status;
+  }
+  return normalizeSourceState(health?.last_health_state ?? rtsp?.state);
+}
+
+function sourceStateChipClass(state: IngestSource["state"]) {
+  if (state === "up") return "workspace-chip--success";
+  if (state === "degraded" || state === "stale" || state === "down" || state === "connecting" || state === "reconnecting") {
+    return "workspace-chip--warning";
+  }
+  return "";
+}
+
 export default function MediaPage() {
   const navigate = useNavigate();
+  const refreshingRef = useRef(false);
 
   const [assets, setAssets] = useState<MediaAsset[]>([]);
   const [jobs, setJobs] = useState<MediaPipelineJob[]>([]);
@@ -104,38 +169,38 @@ export default function MediaPage() {
   const [migrating, setMigrating] = useState(false);
 
   const fetchData = useCallback(async () => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+
+    async function refresh<T>(label: string, url: string, apply: (data: T) => void, timeoutMs = MEDIA_FETCH_TIMEOUT_MS) {
+      try {
+        apply(await fetchJson<T>(url, timeoutMs));
+        return null;
+      } catch (err) {
+        return refreshFailureLabel(label, err);
+      }
+    }
+
     try {
-      const [assetsRes, jobsRes, compatRes, healthRes, sourcesRes, transcribeRes] = await Promise.all([
-        fetch("/api/media/assets"),
-        fetch("/api/media/jobs"),
-        fetch("/api/media/pipeline/compat-status"),
-        fetch("/health"),
-        fetch("/api/media/sources/status"),
-        fetch("/api/transcribe/status"),
-      ]);
-      if (assetsRes.ok) {
-        const data = (await assetsRes.json()) as { assets?: MediaAsset[] };
-        setAssets(data.assets ?? []);
-      }
-      if (jobsRes.ok) {
-        const data = (await jobsRes.json()) as { jobs?: MediaPipelineJob[] };
-        setJobs(data.jobs ?? []);
-      }
-      if (compatRes.ok) {
-        setCompatStatus(await compatRes.json() as CompatStatus);
-      }
-      if (healthRes.ok) {
-        const health = (await healthRes.json()) as { components?: { source_ingest?: { sources?: Record<string, SourceHealth> } } };
-        setSourceHealth(health.components?.source_ingest?.sources ?? null);
-      }
-      if (sourcesRes.ok) {
-        setSourcesStatus(await sourcesRes.json() as SourcesStatus);
-      }
-      if (transcribeRes.ok) {
-        setTranscribeStatus(await transcribeRes.json() as TranscribeStatus);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to refresh media status.");
+      const failures = (
+        await Promise.all([
+          refresh<{ assets?: MediaAsset[] }>("assets", "/api/media/assets", data => setAssets(data.assets ?? []), 8000),
+          refresh<{ jobs?: MediaPipelineJob[] }>("jobs", "/api/media/jobs", data => setJobs(data.jobs ?? []), 8000),
+          refresh<CompatStatus>("pipeline", "/api/media/pipeline/compat-status", data => setCompatStatus(data), 8000),
+          refresh<{ components?: { source_ingest?: { sources?: Record<string, SourceHealth> } } }>(
+            "health",
+            "/health",
+            health => setSourceHealth(health.components?.source_ingest?.sources ?? null),
+            5000,
+          ),
+          refresh<SourcesStatus>("sources", "/api/media/sources/status", data => setSourcesStatus(data), 5000),
+          refresh<TranscribeStatus>("transcription", "/api/transcribe/status", data => setTranscribeStatus(data), 5000),
+        ])
+      ).filter((failure): failure is string => Boolean(failure));
+
+      setError(failures.length ? `Some media data did not refresh: ${failures.join(", ")}.` : null);
+    } finally {
+      refreshingRef.current = false;
     }
   }, []);
 
@@ -150,41 +215,49 @@ export default function MediaPage() {
   const ingestSources = useMemo<IngestSource[]>(() => {
     if (!sourcesStatus) return [];
     const healthMap = sourceHealth ?? {};
-    const streamMap = new Map(sourcesStatus.streaming.map(s => [s.source, s]));
+    const rtspMap = new Map((sourcesStatus.rtsp ?? []).map(s => [s.id, s]));
+    const configuredMap = new Map<string, ConfiguredSource>();
+    for (const source of sourcesStatus.configured ?? []) {
+      configuredMap.set(source.id, source);
+    }
+    for (const rtsp of sourcesStatus.rtsp ?? []) {
+      if (!configuredMap.has(rtsp.id)) {
+        configuredMap.set(rtsp.id, {
+          id: rtsp.id,
+          enabled: true,
+          kind: rtsp.kind,
+          location: rtsp.location,
+        });
+      }
+    }
+    const streamMap = new Map((sourcesStatus.streaming ?? []).map(s => [s.source, s]));
     const motionMap = new Map(
-      sourcesStatus.motion.map(s => [s.source, s])
+      (sourcesStatus.motion ?? []).map(s => [s.source, s])
     );
-    const visionSources = sourcesStatus.vision.filter(
+    const visionSources = (sourcesStatus.vision ?? []).filter(
       (v): v is VisionSource => "source" in v
     );
     const visionMap = new Map(visionSources.map(s => [s.source, s]));
 
-    return sourcesStatus.rtsp.map(rtsp => {
-      const health = healthMap[rtsp.id];
-      const stream = streamMap.get(rtsp.id);
-      const motion = motionMap.get(rtsp.id);
-      const vision = visionMap.get(rtsp.id);
-
-      let state: "up" | "down" | "stale" | "unknown" = "unknown";
-      if (health) {
-        if (health.status === "healthy" || health.last_health_state === "up") state = "up";
-        else if (health.status === "stale") state = "stale";
-        else if (health.status === "down") state = "down";
-      } else if (rtsp.state === "up") state = "up";
-      else if (rtsp.state === "down") state = "down";
+    return [...configuredMap.values()].map(configured => {
+      const rtsp = rtspMap.get(configured.id);
+      const health = healthMap[configured.id];
+      const stream = streamMap.get(configured.id);
+      const motion = motionMap.get(configured.id);
+      const vision = visionMap.get(configured.id);
 
       return {
-        id: rtsp.id,
-        kind: rtsp.kind,
-        location: rtsp.location,
-        state,
+        id: configured.id,
+        kind: configured.kind,
+        location: configured.location,
+        state: sourceStateFrom(health, rtsp),
         lastEventAge: health?.last_event_age_s ?? null,
-        segmentsWritten: rtsp.segments_written,
+        segmentsWritten: rtsp?.segments_written ?? 0,
         transcriptionsSubmitted: stream?.submitted ?? 0,
         dropped: stream?.dropped ?? 0,
         queueSize: stream?.qsize ?? 0,
         streamAlive: stream?.alive ?? false,
-        lastError: rtsp.last_error ?? health?.error ?? null,
+        lastError: rtsp?.last_error ?? health?.error ?? null,
         motionEvents: motion?.events_published ?? null,
         visionDetections: vision?.detections ?? null,
       };
@@ -231,20 +304,20 @@ export default function MediaPage() {
   );
 
   const totalMotionEvents = useMemo(
-    () => sourcesStatus?.motion.reduce((sum, m) => sum + m.events_published, 0) ?? 0,
+    () => sourcesStatus?.motion?.reduce((sum, m) => sum + m.events_published, 0) ?? 0,
     [sourcesStatus],
   );
 
   const totalVisionDetections = useMemo(() => {
     if (!sourcesStatus) return 0;
-    return sourcesStatus.vision
+    return (sourcesStatus.vision ?? [])
       .filter((v): v is VisionSource => "source" in v)
       .reduce((sum, v) => sum + v.detections, 0);
   }, [sourcesStatus]);
 
   const totalVisionEmbeddings = useMemo(() => {
     if (!sourcesStatus) return 0;
-    return sourcesStatus.vision
+    return (sourcesStatus.vision ?? [])
       .filter((v): v is VisionSource => "source" in v)
       .reduce((sum, v) => sum + v.embeddings, 0);
   }, [sourcesStatus]);
@@ -315,7 +388,10 @@ export default function MediaPage() {
         description={ingestSources.length > 0 ? `${healthyCount}/${ingestSources.length} sources streaming` : undefined}
       >
         {ingestSources.length === 0 ? (
-          <WorkspaceEmpty title="Loading sources..." description="Waiting for ingest status data." />
+          <WorkspaceEmpty
+            title={sourcesStatus ? "No configured ingest sources" : "Loading source inventory..."}
+            description={sourcesStatus ? "The source status API returned no configured or active sources." : "Waiting for ingest status data."}
+          />
         ) : (
           <div className="workspace-grid workspace-grid--two">
             {ingestSources.map(source => (
@@ -325,12 +401,7 @@ export default function MediaPage() {
                     <strong className="record-row-title">
                       {source.kind === "mic" ? "[MIC]" : "[CAM]"} {source.id.replace(/_/g, " ")}
                     </strong>
-                    <span className={`workspace-chip ${
-                      source.state === "up" ? "workspace-chip--success" :
-                      source.state === "stale" ? "workspace-chip--warning" :
-                      source.state === "down" ? "workspace-chip--warning" :
-                      ""
-                    }`}>
+                    <span className={`workspace-chip ${sourceStateChipClass(source.state)}`}>
                       {source.state}
                     </span>
                     <span className="workspace-chip">{source.kind}</span>
@@ -340,7 +411,7 @@ export default function MediaPage() {
                   </span>
                 </div>
                 <span className="record-row-subtitle">
-                  {source.segmentsWritten.toLocaleString()} segments · {source.transcriptionsSubmitted.toLocaleString()} transcriptions
+                  {source.location} · {source.segmentsWritten.toLocaleString()} segments · {source.transcriptionsSubmitted.toLocaleString()} transcriptions
                   {source.dropped > 0 ? ` · ${source.dropped} dropped` : ""}
                   {source.queueSize > 0 ? ` · queue: ${source.queueSize}` : ""}
                 </span>

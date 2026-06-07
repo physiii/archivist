@@ -5,10 +5,12 @@ decode). If someone accidentally calls packet.decode() on the video path,
 this test catches it.
 """
 
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from array import array
 from pathlib import Path
 
@@ -131,8 +133,162 @@ def test_segment_writer_waits_for_keyframe_to_open(fixture_mp4, tmp_path, monkey
 
     writer.feed_packet(first_video, is_video=True)
     assert writer._container is not None, "writer didn't open on the first keyframe"
+    assert first_video.stream is v_in, "writer mutated the input packet stream"
     writer.close()
     container.close()
+
+
+def test_segment_writer_rebases_nonzero_segment_timestamps(fixture_mp4, tmp_path, monkeypatch):
+    """A segment that starts mid-stream should still start near timestamp zero."""
+    try:
+        import av
+    except ImportError:
+        pytest.skip("PyAV not installed")
+
+    import rtsp_ingest_service as ingest
+    monkeypatch.setattr(ingest, "SEGMENTS_ROOT", tmp_path / "segments")
+    monkeypatch.setattr(ingest, "SEGMENT_TARGET_S", 60)
+    monkeypatch.setattr(ingest.events_bus, "publish", lambda *a, **kw: None)
+
+    container = av.open(str(fixture_mp4))
+    v_in = container.streams.video[0]
+    a_in = container.streams.audio[0]
+    pkts = list(container.demux(v_in, a_in))
+    keyframe_indexes = [
+        idx for idx, packet in enumerate(pkts)
+        if packet.stream.type == "video" and packet.is_keyframe and packet.dts is not None
+    ]
+    if len(keyframe_indexes) < 2:
+        pytest.skip("fixture did not contain a second keyframe")
+
+    writer = ingest._SegmentWriter("test_src", video_in_stream=v_in, audio_in_stream=a_in)
+    for packet in pkts[keyframe_indexes[1]:]:
+        writer.feed_packet(packet, is_video=packet.stream.type == "video")
+    writer.close()
+    container.close()
+
+    segments = sorted((tmp_path / "segments" / "test_src").rglob("*.mp4"))
+    assert segments
+    with av.open(str(segments[0])) as out:
+        video = out.streams.video[0]
+        first_packet = next(packet for packet in out.demux(video) if packet.dts is not None)
+        first_dts_s = float(first_packet.dts * first_packet.time_base)
+    assert first_dts_s == pytest.approx(0.0, abs=0.1)
+
+
+def test_segment_writer_sidecar_marks_stalled_capture(fixture_mp4, tmp_path, monkeypatch):
+    try:
+        import av
+    except ImportError:
+        pytest.skip("PyAV not installed")
+
+    import rtsp_ingest_service as ingest
+    monkeypatch.setattr(ingest, "SEGMENTS_ROOT", tmp_path / "segments")
+    monkeypatch.setattr(ingest.events_bus, "publish", lambda *a, **kw: None)
+
+    container = av.open(str(fixture_mp4))
+    v_in = container.streams.video[0]
+    a_in = container.streams.audio[0]
+    writer = ingest._SegmentWriter("test_src", video_in_stream=v_in, audio_in_stream=a_in)
+    for packet in container.demux(v_in, a_in):
+        writer.feed_packet(packet, is_video=packet.stream.type == "video")
+    container.close()
+
+    assert writer._segment_start_wall is not None
+    writer._segment_start_wall = time.time() - 60.0
+    writer.close()
+
+    sidecars = sorted((tmp_path / "segments" / "test_src").rglob("*.json"))
+    assert sidecars
+    sidecar = json.loads(sidecars[0].read_text())
+    assert sidecar["capture_health"] == "stalled"
+    assert sidecar["media_duration_s"] > 2.0
+    assert sidecar["duration_s"] >= 59.0
+
+
+def test_segment_writer_hard_cap_reopens_camera_only_on_keyframe(fixture_mp4, tmp_path, monkeypatch):
+    try:
+        import av
+    except ImportError:
+        pytest.skip("PyAV not installed")
+
+    import rtsp_ingest_service as ingest
+    monkeypatch.setattr(ingest, "SEGMENTS_ROOT", tmp_path / "segments")
+    monkeypatch.setattr(ingest.events_bus, "publish", lambda *a, **kw: None)
+
+    container = av.open(str(fixture_mp4))
+    v_in = container.streams.video[0]
+    a_in = container.streams.audio[0]
+    pkts = list(container.demux(v_in, a_in))
+    first_key = next(
+        packet for packet in pkts
+        if packet.stream.type == "video" and packet.is_keyframe and packet.dts is not None
+    )
+    audio_pkt = next(packet for packet in pkts if packet.stream.type == "audio" and packet.dts is not None)
+    non_key = next(
+        packet for packet in pkts
+        if packet.stream.type == "video" and not packet.is_keyframe and packet.dts is not None
+    )
+    keyframes = [
+        packet for packet in pkts
+        if packet.stream.type == "video" and packet.is_keyframe and packet.dts is not None
+    ]
+    if len(keyframes) < 2:
+        pytest.skip("fixture did not contain a second keyframe")
+
+    writer = ingest._SegmentWriter("test_src", video_in_stream=v_in, audio_in_stream=a_in)
+    writer.feed_packet(first_key, is_video=True)
+    assert writer._container is not None
+
+    assert writer._segment_start_wall is not None
+    writer._segment_start_wall = time.time() - ingest.SEGMENT_MAX_S - 1.0
+    writer.feed_packet(audio_pkt, is_video=False)
+    assert writer._container is None, "hard-cap rotation reopened camera segment on audio"
+
+    writer.feed_packet(non_key, is_video=True)
+    assert writer._container is None, "hard-cap rotation reopened camera segment on a non-keyframe"
+
+    writer.feed_packet(keyframes[1], is_video=True)
+    assert writer._container is not None, "writer did not reopen on the next keyframe"
+    writer.close()
+    container.close()
+
+
+def test_segment_writer_accepts_pts_only_packets(fixture_mp4, tmp_path, monkeypatch):
+    try:
+        import av
+    except ImportError:
+        pytest.skip("PyAV not installed")
+
+    import rtsp_ingest_service as ingest
+    monkeypatch.setattr(ingest, "SEGMENTS_ROOT", tmp_path / "segments")
+    monkeypatch.setattr(ingest.events_bus, "publish", lambda *a, **kw: None)
+
+    container = av.open(str(fixture_mp4))
+    v_in = container.streams.video[0]
+    a_in = container.streams.audio[0]
+    first_key = next(
+        packet for packet in container.demux(v_in, a_in)
+        if packet.stream.type == "video" and packet.is_keyframe and packet.pts is not None
+    )
+
+    pts_only = av.Packet(bytes(first_key))
+    pts_only.pts = first_key.pts
+    pts_only.dts = None
+    pts_only.time_base = first_key.time_base
+    pts_only.is_keyframe = True
+    pts_only.stream = v_in
+
+    writer = ingest._SegmentWriter("test_src", video_in_stream=v_in, audio_in_stream=a_in)
+    writer.feed_packet(pts_only, is_video=True)
+    writer.close()
+    container.close()
+
+    sidecars = sorted((tmp_path / "segments" / "test_src").rglob("*.json"))
+    assert sidecars
+    sidecar = json.loads(sidecars[0].read_text())
+    assert sidecar["packet_counts"]["video"] == 1
+    assert sidecar["dropped_missing_timestamp_packets"] == 0
 
 
 def test_rtsp_errors_redact_credentials():
@@ -184,3 +340,114 @@ def test_audio_health_payload_marks_low_signal(monkeypatch):
     assert payload["audio_state"] == "low_signal"
     assert payload["voice_activity"] is False
     assert payload["audio_rms_dbfs"] == -120.0
+
+
+def test_camera_motion_detect_stream_is_opt_in(monkeypatch):
+    import rtsp_ingest_service as ingest
+    from sources_config import DetectProfile, Source
+
+    source = Source(
+        id="office",
+        enabled=True,
+        kind="camera",
+        location="office",
+        audio_url=None,
+        video_main_url="rtsp://example/main",
+        video_sub_url="rtsp://example/sub",
+        rtsp_transport="tcp",
+        reconnect_min_s=1.0,
+        reconnect_max_s=2.0,
+        detect=DetectProfile(fps=10),
+        motion=None,
+    )
+
+    monkeypatch.setattr(ingest, "CAMERA_MOTION_ENABLED", False)
+    assert ingest._should_start_detect_stream(source) is False
+
+    monkeypatch.setattr(ingest, "CAMERA_MOTION_ENABLED", True)
+    assert ingest._should_start_detect_stream(source) is True
+
+
+def test_motion_frame_interval_respects_global_cap(monkeypatch):
+    import rtsp_ingest_service as ingest
+    from sources_config import DetectProfile, Source
+
+    source = Source(
+        id="office",
+        enabled=True,
+        kind="camera",
+        location="office",
+        audio_url=None,
+        video_main_url="rtsp://example/main",
+        video_sub_url="rtsp://example/sub",
+        rtsp_transport="tcp",
+        reconnect_min_s=1.0,
+        reconnect_max_s=2.0,
+        detect=DetectProfile(fps=10),
+        motion=None,
+    )
+
+    monkeypatch.setattr(ingest, "CAMERA_MOTION_MAX_FPS", 2.0)
+
+    assert ingest._motion_frame_interval_s(source) == pytest.approx(0.5)
+
+
+def test_camera_main_stream_prefers_video_url_even_when_audio_url_is_set():
+    import rtsp_ingest_service as ingest
+    from sources_config import DetectProfile, Source
+
+    source = Source(
+        id="floodlight",
+        enabled=True,
+        kind="camera",
+        location="floodlight",
+        audio_url="rtsp://example/root",
+        video_main_url="rtsp://example/h264Preview_01_sub",
+        video_sub_url="rtsp://example/h264Preview_01_sub",
+        rtsp_transport="tcp",
+        reconnect_min_s=1.0,
+        reconnect_max_s=2.0,
+        detect=DetectProfile(fps=10),
+        motion=None,
+    )
+
+    assert ingest._main_stream_url(source) == "rtsp://example/h264Preview_01_sub"
+
+
+def test_configured_sources_status_is_inventory_without_urls(monkeypatch):
+    import rtsp_ingest_service as ingest
+    from sources_config import DetectProfile, MotionProfile, Source
+
+    source = Source(
+        id="office",
+        enabled=True,
+        kind="camera",
+        location="office",
+        audio_url="rtsp://user:password@example/main",
+        video_main_url="rtsp://user:password@example/main",
+        video_sub_url="rtsp://user:password@example/sub",
+        rtsp_transport="tcp",
+        reconnect_min_s=1.0,
+        reconnect_max_s=2.0,
+        detect=DetectProfile(fps=10),
+        motion=MotionProfile(),
+    )
+    monkeypatch.setattr(ingest.sources_config, "enabled_sources", lambda: [source])
+
+    status = ingest.configured_sources_status()
+
+    assert status == [
+        {
+            "id": "office",
+            "enabled": True,
+            "kind": "camera",
+            "location": "office",
+            "has_audio": True,
+            "has_video_main": True,
+            "has_video_sub": True,
+            "motion_enabled": True,
+            "transcription_enabled": True,
+            "segment_format": "mp4",
+        }
+    ]
+    assert "rtsp://" not in json.dumps(status)

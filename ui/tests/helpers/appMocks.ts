@@ -9,211 +9,6 @@ async function domClick(locator: Locator) {
   });
 }
 
-function isoDayForMonth(monthParam: string, day = 14) {
-  const [year, month] = monthParam.split("-").map(Number);
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-}
-
-function focusOverviewPayload() {
-  return {
-    available: true,
-    generatedAt: "2026-04-23T19:30:00Z",
-    sync: {
-      running: false,
-      message: "",
-      startedAt: null,
-      finishedAt: "2026-04-23T18:55:00Z",
-      lastSuccessfulAt: "2026-04-23T18:55:00Z",
-      error: null,
-      stale: false,
-      schedule: {
-        enabled: true,
-        time_of_day: "05:30",
-        timezone: "America/Chicago",
-        next_run_at: "2026-04-24T10:30:00Z",
-        last_triggered_at: "2026-04-23T10:30:00Z",
-      },
-    },
-    lanes: [
-      {
-        id: "work",
-        title: "Business",
-        subtitle: "Updated Apr 13",
-        available: true,
-        sourceLabel: "Business notes",
-        generatedAt: "2026-04-23T18:55:00Z",
-        sections: [
-          {
-            id: "manual_priorities",
-            title: "Manual Focus",
-            kind: "priority_table",
-            items: [
-              {
-                num: "1",
-                title: "Review the launch checklist",
-                owner: "Andy",
-                status: "Updated Apr 23",
-                next_action: "Confirm the riskiest open items before the next meeting.",
-                detail_md: "Keep the launch review at the top and remove stale business follow-ups.",
-              },
-            ],
-          },
-        ],
-      },
-      {
-        id: "personal",
-        title: "Personal",
-        subtitle: "Updated Apr 23",
-        available: true,
-        sourceLabel: "Personal archive synthesis",
-        generatedAt: "2026-04-23T18:55:00Z",
-        sections: [
-          {
-            id: "manual_priorities",
-            title: "Manual Focus",
-            kind: "priority_table",
-            items: [
-              {
-                num: "1",
-                title: "Confirm Jonas pickup time",
-                owner: "Andy",
-                status: "Live",
-                next_action: "Need to confirm Jonas pickup time before Sunday.",
-                detail_md: "Need to confirm Jonas pickup time, finish the bank paperwork, and get travel details squared away before Sunday.",
-              },
-            ],
-          },
-          {
-            id: "upcoming",
-            title: "Upcoming",
-            kind: "table",
-            items: [
-              {
-                event: "Family travel lock-in",
-                when: "2026-04-27",
-                why: "Travel details need to be finalized before Sunday.",
-              },
-            ],
-          },
-        ],
-      },
-    ],
-  };
-}
-
-function journalOverviewPayload(monthParam: string) {
-  const day = isoDayForMonth(monthParam, 14);
-  return {
-    available: true,
-    generatedAt: "2026-04-23T19:30:00Z",
-    accountCount: 1,
-    gmailMessages: 12,
-    calendarEvents: 5,
-    driveFiles: 2,
-    chatMessages: 3,
-    dayCount: 1,
-    days: [
-      {
-        id: day,
-        date: day,
-        title: "Archive review and planning",
-        summary: "Email, calendar, and drive activity all point to a focused planning day with a few important follow-ups.",
-        tone: "Focused",
-        focus: "Planning",
-        movement: "Steady",
-        signalCount: 6,
-        sources: ["calendar", "email", "drive"],
-        sections: [
-          { label: "Theme", text: "The day centered on reviewing plans, syncing the calendar, and keeping personal logistics current." },
-          { label: "Why it mattered", text: "The strongest signals were scheduling, email follow-up, and active file work." },
-        ],
-        signals: [
-          { key: "calendar", count: "2", note: "Two scheduled blocks" },
-          { key: "email", count: "3", note: "Inbox follow-up" },
-          { key: "drive", count: "1", note: "Docs updated" },
-        ],
-        evidence: [
-          {
-            key: "calendar",
-            count: 2,
-            items: [
-              { title: "Planning block", meta: "Morning", detail: "Focused time reserved for review.", kind: "event" },
-            ],
-          },
-        ],
-        score: {
-          overall: 68,
-          rank: 18,
-          percentile: 84,
-          label: "Engaged",
-          mood: "Focused",
-          reasons: ["calendar", "email"],
-          metrics: {
-            activity: 64,
-            importance: 72,
-            intensity: 58,
-            excitement: 40,
-            wonder: 36,
-            sadness: 8,
-            friction: 20,
-            connection: 44,
-            momentum: 61,
-          },
-        },
-        closing: "The day closed with concrete follow-ups rather than noise.",
-      },
-    ],
-    sources: [
-      {
-        key: "calendar",
-        label: "Google Calendar",
-        shortLabel: "Calendar",
-        cadence: "Scheduled",
-        contribution: "Events and focus blocks",
-        detail: "Pulled from imported calendar activity.",
-        accent: "#5b8cff",
-      },
-      {
-        key: "email",
-        label: "Gmail",
-        shortLabel: "Email",
-        cadence: "Asynchronous",
-        contribution: "Inbox follow-ups",
-        detail: "Pulled from imported Gmail activity.",
-        accent: "#f2b36d",
-      },
-      {
-        key: "drive",
-        label: "Google Drive",
-        shortLabel: "Drive",
-        cadence: "Document work",
-        contribution: "File edits",
-        detail: "Pulled from imported Drive activity.",
-        accent: "#7cc7ff",
-      },
-    ],
-    mode: "live",
-    lastImportedAt: "2026-04-23T18:55:00Z",
-    import: {
-      running: false,
-      message: "Import idle",
-      startedAt: null,
-      finishedAt: "2026-04-23T18:55:00Z",
-      lastSuccessfulAt: "2026-04-23T18:55:00Z",
-      error: null,
-    },
-    archive: {
-      available: true,
-      gmailMessages: 12,
-      calendarEvents: 5,
-      driveFiles: 2,
-      chatMessages: 3,
-      dayCount: 1,
-      lastImportedAt: "2026-04-23T18:55:00Z",
-    },
-  };
-}
-
 function testReportPayload() {
   return {
     summary: {
@@ -685,30 +480,6 @@ export async function mockAppApis(page: Page) {
       });
     }
 
-    if (pathname === "/api/focus/overview") {
-      return fulfillJson(route, focusOverviewPayload());
-    }
-
-    if (pathname === "/api/focus/sync") {
-      return fulfillJson(route, {
-        ok: true,
-        started: true,
-        sync: focusOverviewPayload().sync,
-      });
-    }
-
-    if (pathname === "/api/focus/manual-priorities") {
-      return fulfillJson(route, {
-        ok: true,
-        entries: focusOverviewPayload().lanes[1].sections[0].items,
-      });
-    }
-
-    if (pathname === "/api/journal/overview") {
-      const monthParam = searchParams.get("month") || "2026-04";
-      return fulfillJson(route, journalOverviewPayload(monthParam));
-    }
-
     if (pathname === "/api/collections") {
       return fulfillJson(route, {
         collections: [
@@ -947,6 +718,53 @@ export async function mockAppApis(page: Page) {
 
     if (pathname === "/api/media/pipeline/compat-status") {
       return fulfillJson(route, { current: 1, stale: 0, broken: 0, total: 1 });
+    }
+
+    if (pathname === "/api/media/sources/status") {
+      return fulfillJson(route, {
+        configured: [
+          {
+            id: "office",
+            enabled: true,
+            kind: "camera",
+            location: "office",
+            has_audio: true,
+            has_video_main: true,
+            has_video_sub: true,
+            motion_enabled: true,
+            transcription_enabled: true,
+            segment_format: "mp4",
+          },
+          {
+            id: "office_mic",
+            enabled: true,
+            kind: "mic",
+            location: "office",
+            has_audio: true,
+            has_video_main: false,
+            has_video_sub: false,
+            motion_enabled: false,
+            transcription_enabled: true,
+            segment_format: "mp4",
+          },
+        ],
+        rtsp: [
+          { id: "office", state: "reconnecting", segments_written: 12, kind: "camera", location: "office", last_error: "RTSP reconnecting" },
+          { id: "office_mic", state: "up", segments_written: 14, kind: "mic", location: "office", last_error: null },
+        ],
+        streaming: [
+          { source: "office_mic", submitted: 8, dropped: 0, qsize: 0, alive: true },
+        ],
+        motion: [
+          { source: "office", events_published: 4, frames_seen: 80 },
+        ],
+        vision: [
+          { source: "office", detections: 2, embeddings: 1, frames_seen: 20 },
+          { clip_available: true, yolo_available: true },
+        ],
+        archive: { alive: true, enabled: true, last_pass: { scanned: 27, moved: 2 } },
+        retention: { alive: true, enabled: true },
+      });
     }
 
     if (pathname === "/api/media/process" || pathname === "/api/media/pipeline/migrate") {

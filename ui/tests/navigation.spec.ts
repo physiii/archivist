@@ -81,11 +81,6 @@ test("primary routes render their current shells", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Collections", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Collection catalog", exact: true })).toBeVisible();
 
-  await clickSidebarNav(page, "Focus");
-  await expect(page).toHaveURL(/\/focus$/);
-  await expect(page.getByRole("heading", { name: "Focus", exact: true })).toBeVisible();
-  await expect(page.getByRole("tablist", { name: "Focus lanes" })).toBeVisible();
-
   await clickSidebarNav(page, "Backup");
   await expect(page).toHaveURL(/\/backup$/);
   await expect(page.getByRole("heading", { name: "Backup", exact: true })).toBeVisible();
@@ -96,12 +91,7 @@ test("primary routes render their current shells", async ({ page }) => {
 
   await clickSidebarNav(page, "Media");
   await expect(page).toHaveURL(/\/media$/);
-  await expect(page.getByRole("heading", { name: "Media Processing", exact: true })).toBeVisible();
-
-  await clickSidebarNav(page, "Journal");
-  await expect(page).toHaveURL(/\/journal$/);
-  await expect(page.getByRole("heading", { name: "Journal", exact: true })).toBeVisible();
-  await expect(page.locator(".journal-calendar-board")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Live Ingest & Processing", exact: true })).toBeVisible();
 
   await clickSidebarNav(page, "Console");
   await expect(page).toHaveURL(/\/console$/);
@@ -110,6 +100,25 @@ test("primary routes render their current shells", async ({ page }) => {
   await expect(page.getByRole("tab", { name: "Fleet", exact: true })).toBeVisible();
   await expect(page.getByRole("tab", { name: "System", exact: true })).toBeVisible();
   await expect(page.getByRole("tab", { name: "Tests", exact: true })).toBeVisible();
+});
+
+test("media ingest sources render even when processed assets are slow", async ({ page }) => {
+  await page.route("**/api/media/assets", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ assets: [] }),
+    });
+  });
+
+  await page.goto("/media");
+  const officeSource = page.locator(".record-row").filter({ hasText: "[CAM] office" });
+  const micSource = page.locator(".record-row").filter({ hasText: "[MIC] office mic" });
+  await expect(officeSource).toBeVisible({ timeout: 2500 });
+  await expect(micSource).toBeVisible();
+  await expect(officeSource.locator(".workspace-chip").filter({ hasText: /^reconnecting$/ })).toBeVisible();
+  await expect(micSource.locator(".workspace-chip").filter({ hasText: /^up$/ })).toBeVisible();
 });
 
 test("collections search results expand inline", async ({ page }) => {

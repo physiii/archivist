@@ -23,6 +23,7 @@ import os
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -61,6 +62,8 @@ _thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
 _last_pass: dict = {}
 _state_lock = threading.Lock()
+_keyframe_move_lock = threading.Lock()
+_archive_pass_lock = threading.Lock()
 
 
 @dataclass
@@ -79,15 +82,32 @@ def _copy_verify_unlink(src: Path, dst: Path) -> int:
     """Copy src → dst, verify sizes match, unlink src. Returns bytes moved."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     src_size = src.stat().st_size
-    tmp_dst = dst.with_suffix(dst.suffix + ".partial")
+    tmp_dst = dst.with_name(f"{dst.name}.partial.{os.getpid()}.{threading.get_ident()}")
+    tmp_dst.unlink(missing_ok=True)
     shutil.copy2(src, tmp_dst)
     dst_size = tmp_dst.stat().st_size
     if dst_size != src_size:
         tmp_dst.unlink(missing_ok=True)
         raise RuntimeError(f"size mismatch copying {src} → {dst}: src={src_size} dst={dst_size}")
-    tmp_dst.rename(dst)
+    tmp_dst.replace(dst)
     src.unlink()
     return src_size
+
+
+def _move_optional_keyframe(src: Path, dst: Path) -> int:
+    """Move a keyframe if it still exists.
+
+    Archive workers process overlapping segment windows in parallel, so the same
+    keyframe can legitimately be claimed by an adjacent segment first.
+    """
+    with _keyframe_move_lock:
+        if not src.exists():
+            return 0
+        src_size = src.stat().st_size
+        if dst.exists() and dst.stat().st_size == src_size:
+            src.unlink(missing_ok=True)
+            return 0
+        return _copy_verify_unlink(src, dst)
 
 
 def _milvus_rewrite_segment_path(old_path: str, new_path: str) -> int:
@@ -154,8 +174,12 @@ def _milvus_rewrite_batch(pairs: dict[str, str]) -> int:
 
 def _move_one(sidecar_path: Path, source_id: str, keep_keyframes: bool = True) -> Optional[_MoveResult]:
     """Move a single segment + sidecar + keyframes to NAS. Returns None on failure."""
+    if not sidecar_path.exists():
+        return None
     try:
         sidecar = json.loads(sidecar_path.read_text())
+    except FileNotFoundError:
+        return None
     except Exception:
         logger.exception("bad sidecar %s", sidecar_path)
         return None
@@ -179,6 +203,9 @@ def _move_one(sidecar_path: Path, source_id: str, keep_keyframes: bool = True) -
     bytes_moved = 0
     try:
         bytes_moved += _copy_verify_unlink(old_seg_path, new_seg_path)
+    except FileNotFoundError:
+        sidecar_path.unlink(missing_ok=True)
+        return None
     except Exception:
         logger.exception("failed to move segment %s → %s", old_seg_path, new_seg_path)
         return None
@@ -210,10 +237,12 @@ def _move_one(sidecar_path: Path, source_id: str, keep_keyframes: bool = True) -
             if local_day_dir.is_dir():
                 for jpg in local_day_dir.glob("*.jpg"):
                     try:
+                        if not jpg.exists():
+                            continue
                         m = jpg.stat().st_mtime
                         if start - 2 <= m <= end + 2:
                             nas_jpg = nas_day_dir / jpg.name
-                            bytes_moved += _copy_verify_unlink(jpg, nas_jpg)
+                            bytes_moved += _move_optional_keyframe(jpg, nas_jpg)
                             new_keyframe_paths.append(str(nas_jpg))
                             moved_kf_map[str(jpg)] = str(nas_jpg)
                     except Exception:
@@ -251,9 +280,34 @@ def run_archive_pass(
 
     backfill=True ignores the hold window — moves everything local right now.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     start_ts = time.time()
+    if not _archive_pass_lock.acquire(blocking=False):
+        return {
+            "running": True,
+            "scanned": 0,
+            "moved": 0,
+            "skipped_young": 0,
+            "failed": 0,
+            "bytes_moved": 0,
+            "milvus_rows_updated": 0,
+            "backfill": backfill,
+            "dry_run": dry_run,
+            "elapsed_s": 0.0,
+            "finished_at": start_ts,
+        }
+    try:
+        return _run_archive_pass_locked(backfill=backfill, dry_run=dry_run, limit=limit, start_ts=start_ts)
+    finally:
+        _archive_pass_lock.release()
+
+
+def _run_archive_pass_locked(
+    backfill: bool = False,
+    dry_run: bool = False,
+    limit: Optional[int] = None,
+    start_ts: Optional[float] = None,
+) -> dict:
+    start_ts = time.time() if start_ts is None else start_ts
     cap = limit if limit is not None else ARCHIVE_MAX_MOVES_PER_PASS
     scanned = 0
     skipped_young = 0

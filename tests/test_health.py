@@ -67,7 +67,7 @@ class TestRuntimeConfiguration:
 
         assert env["TRANSCRIBE_REQUIRE_CUDA"] == "${TRANSCRIBE_REQUIRE_CUDA:-true}"
         assert env["NVIDIA_VISIBLE_DEVICES"] == "${ARCHIVIST_NVIDIA_VISIBLE_DEVICES:-0}"
-        assert env["NVIDIA_DRIVER_CAPABILITIES"] == "${ARCHIVIST_NVIDIA_DRIVER_CAPABILITIES:-compute,utility}"
+        assert env["NVIDIA_DRIVER_CAPABILITIES"] == "${ARCHIVIST_NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video}"
         assert env["ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS"] == "${ARCHIVIST_ENABLE_WEB_BACKGROUND_TASKS:-true}"
 
         gpu_requests = service.get("gpus") or []

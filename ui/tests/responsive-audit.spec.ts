@@ -35,15 +35,6 @@ const ROUTES: RouteContract[] = [
     },
   },
   {
-    label: "Focus",
-    path: "/focus",
-    assertReady: async (page) => {
-      await expect(page.getByRole("heading", { name: "Focus", exact: true })).toBeVisible();
-      await expect(page.getByRole("tablist", { name: "Focus lanes" })).toBeVisible();
-      await expect(page.locator(".focus-lane-tab-panel")).toBeVisible();
-    },
-  },
-  {
     label: "Backup",
     path: "/backup",
     assertReady: async (page) => {
@@ -63,7 +54,7 @@ const ROUTES: RouteContract[] = [
     label: "Media",
     path: "/media",
     assertReady: async (page) => {
-      await expect(page.getByRole("heading", { name: "Media Processing", exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Live Ingest & Processing", exact: true })).toBeVisible();
       await expect(page.getByRole("list", { name: "Processed media assets" })).toBeVisible();
     },
   },
@@ -76,15 +67,6 @@ const ROUTES: RouteContract[] = [
     },
   },
   {
-    label: "Journal",
-    path: "/journal",
-    assertReady: async (page) => {
-      await expect(page.getByRole("heading", { name: "Journal", exact: true })).toBeVisible();
-      await expect(page.locator(".journal-calendar-board")).toBeVisible();
-      await expect(page.getByRole("slider", { name: "Journal timeline slider" })).toBeVisible();
-    },
-  },
-  {
     label: "Console",
     path: "/console",
     assertReady: async (page) => {
@@ -92,7 +74,7 @@ const ROUTES: RouteContract[] = [
       await page.getByRole("tab", { name: "Fleet", exact: true }).click({ force: true });
       await expect(page.locator("[data-testid='fleet-agent-grid']")).toBeVisible();
       await page.getByRole("tab", { name: "System", exact: true }).click({ force: true });
-      await expect(page.locator("[data-testid='system-regression-focus-priorities']")).toBeVisible();
+      await expect(page.getByText("Service Health", { exact: true })).toBeVisible();
       await page.getByRole("tab", { name: "Tests", exact: true }).click({ force: true });
       await expect(page.locator("[data-testid='tests-header']")).toBeVisible();
       await page.getByRole("tab", { name: "Chat", exact: true }).click({ force: true });
@@ -165,9 +147,6 @@ test("mobile drawer exposes the full primary route set", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
 
   await page.goto("/collections");
-  await clickSidebarNav(page, "Focus");
-  await expect(page).toHaveURL(/\/focus$/);
-
   await clickSidebarNav(page, "Backup");
   await expect(page).toHaveURL(/\/backup$/);
 
@@ -176,9 +155,6 @@ test("mobile drawer exposes the full primary route set", async ({ page }) => {
 
   await clickSidebarNav(page, "Media");
   await expect(page).toHaveURL(/\/media$/);
-
-  await clickSidebarNav(page, "Journal");
-  await expect(page).toHaveURL(/\/journal$/);
 
   await clickSidebarNav(page, "Console");
   await expect(page).toHaveURL(/\/console$/);

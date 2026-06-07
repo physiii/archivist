@@ -7,9 +7,7 @@ import Grid from '@mui/material/Grid2'
 import CloseIcon from '@mui/icons-material/Close'
 import { PageHeader } from '../components/PageHeader'
 import { postJson, getJson } from '../lib/api'
-import { useApi } from '../lib/useApi'
 import { consoleEndpoints } from '../config/endpoints'
-import { StatusChip } from '../components/StatusChip'
 import type {
   GoogleAccountStatus,
   GoogleIntegrationsSummary,
@@ -36,50 +34,6 @@ type AgentRuntime = {
   errors?: string[]
 }
 
-type VerificationTicket = {
-  ticket_id: string
-  summary?: string
-  severity?: string
-  status?: string
-  authority?: string
-  last_seen_at?: string
-  details?: { examples?: string[] } | Record<string, unknown>
-}
-
-type VerificationSnapshot = {
-  label?: string
-  status?: string
-  owner_agents?: string[]
-  stale_after_minutes?: number
-  latest?: {
-    run_id?: string
-    timestamp?: string
-    passed?: number
-    failed?: number
-    total_tests?: number
-    pass_rate?: number
-    age_minutes?: number | null
-  } | null
-  tickets?: VerificationTicket[]
-  auto_run?: {
-    scheduled?: boolean
-    reason?: string | null
-    run_id?: string | null
-  }
-  task?: {
-    running?: boolean
-    trigger?: string
-    run_id?: string
-  }
-}
-
-type AutomationsStatus = {
-  tickets_open?: number
-  verification?: {
-    'focus-priorities'?: VerificationSnapshot
-  }
-}
-
 export type SystemPanelStatus = {
     integrations?: { probes?: Probe[] }
     mcp?: { tools?: McpTool[] }
@@ -97,25 +51,6 @@ type FlagsResponse = { flags?: { system_enabled?: boolean; speech_input_enabled?
 type AuthorizationResponse = { auth_url?: string; message?: string }
 type GoogleImportResponse = { message?: string }
 
-function verificationSeverity(status: string | undefined): 'ok' | 'warn' | 'bad' | 'default' {
-  const value = String(status || '').toLowerCase()
-  if (value === 'ok') return 'ok'
-  if (value === 'failing') return 'bad'
-  if (value === 'critical' || value === 'failed' || value === 'error') return 'bad'
-  if (value === 'high' || value === 'warning' || value === 'running') return 'warn'
-  if (value === 'missing' || value === 'stale') return 'warn'
-  return 'default'
-}
-
-function formatAgeMinutes(ageMinutes: number | null | undefined): string | null {
-  if (ageMinutes == null || !Number.isFinite(ageMinutes)) return null
-  if (ageMinutes < 1) return '<1 min old'
-  if (ageMinutes < 60) return `${ageMinutes.toFixed(1)} min old`
-  const hours = ageMinutes / 60
-  if (hours < 24) return `${hours.toFixed(1)} hr old`
-  return `${(hours / 24).toFixed(1)} d old`
-}
-
 export default function SystemPanel({ status }: Props) {
   const [searchQ, setSearchQ] = useState('')
   const [activeTool, setActiveTool] = useState<string | null>(null)
@@ -128,7 +63,6 @@ export default function SystemPanel({ status }: Props) {
   const [integrationAuthUrl, setIntegrationAuthUrl] = useState<string | null>(null)
   const [importMessage, setImportMessage] = useState<string | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
-  const { data: automations } = useApi<AutomationsStatus>(consoleEndpoints.automationsStatus, { pollMs: 10000 })
 
   const flags = status?.flags || {}
   useEffect(() => {
@@ -262,19 +196,6 @@ export default function SystemPanel({ status }: Props) {
   const googleNeedsReauth = googleAccounts.some((account) =>
     account.services.some((service) => service.status === 'needs_auth')
   )
-  const focusVerification = automations?.verification?.['focus-priorities'] || null
-  const focusLatest = focusVerification?.latest || null
-  const focusTickets = focusVerification?.tickets || []
-  const focusRunning = Boolean(focusVerification?.task?.running)
-  const focusAutoScheduled = Boolean(focusVerification?.auto_run?.scheduled)
-  const focusExamples = focusTickets
-    .flatMap((ticket) => Array.isArray(ticket.details?.examples) ? ticket.details.examples : [])
-    .slice(0, 2)
-  const focusSummary = [
-    focusLatest?.total_tests != null ? `${focusLatest.passed || 0}/${focusLatest.total_tests} passing` : null,
-    typeof focusLatest?.pass_rate === 'number' ? `${focusLatest.pass_rate.toFixed(0)}% pass rate` : null,
-    formatAgeMinutes(focusLatest?.age_minutes),
-  ].filter(Boolean).join(' · ')
 
   return (
     <Box>
@@ -316,76 +237,6 @@ export default function SystemPanel({ status }: Props) {
                     </Typography>
                   </Box>
                 ))}
-              </Box>
-
-              <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-                <Typography variant="overline" color="text.secondary" sx={{ mb: 1, display: 'block' }}>Regression Checks</Typography>
-                <Box
-                  data-testid="system-regression-focus-priorities"
-                  sx={{ border: '1px solid', borderColor: 'divider', borderRadius: '8px', p: 1.25, bgcolor: alpha('#020617', 0.28) }}
-                >
-                  <Stack direction="row" justifyContent="space-between" alignItems="center">
-                    <Box>
-                      <Typography variant="body2" sx={{ fontWeight: 800, fontSize: '0.8125rem' }}>
-                        {focusVerification?.label || 'Focus Priority Evals'}
-                      </Typography>
-                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.35 }}>
-                        Manual-priority add/remove/reorder/query behavior and route-budget checks for the focus lane.
-                      </Typography>
-                    </Box>
-                    <StatusChip
-                      severity={verificationSeverity(focusVerification?.status)}
-                      label={String(focusVerification?.status || 'unknown').toUpperCase()}
-                    />
-                  </Stack>
-                  <Typography variant="caption" color="text.secondary" sx={{ mt: 0.9, display: 'block' }}>
-                    {focusSummary || 'No verification report has been captured yet.'}
-                  </Typography>
-                  <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
-                    {focusVerification?.owner_agents?.map((agentId) => (
-                      <Chip key={agentId} size="small" label={`Owner ${agentId}`} variant="outlined" />
-                    ))}
-                    {focusRunning && <StatusChip severity="warn" label="Run active" />}
-                    {focusAutoScheduled && (
-                      <StatusChip severity="warn" label={`Auto-run ${focusVerification?.auto_run?.reason || 'scheduled'}`} />
-                    )}
-                    {typeof automations?.tickets_open === 'number' && (
-                      <Chip size="small" label={`${automations.tickets_open} open ticket${automations.tickets_open === 1 ? '' : 's'}`} variant="outlined" />
-                    )}
-                  </Stack>
-                  {focusTickets.length > 0 && (
-                    <Stack spacing={0.75} sx={{ mt: 1.1 }}>
-                      {focusTickets.slice(0, 3).map((ticket) => (
-                        <Box
-                          key={ticket.ticket_id}
-                          sx={{
-                            border: '1px solid',
-                            borderColor: alpha('#94a3b8', 0.18),
-                            borderRadius: '8px',
-                            px: 1,
-                            py: 0.85,
-                            bgcolor: alpha('#0f172a', 0.32),
-                          }}
-                        >
-                          <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-                            <Typography variant="caption" sx={{ fontWeight: 700, color: '#e2e8f0' }}>
-                              {ticket.summary || ticket.ticket_id}
-                            </Typography>
-                            <StatusChip severity={verificationSeverity(ticket.severity || ticket.status)} label={ticket.severity || ticket.status || 'open'} />
-                          </Stack>
-                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.35 }}>
-                            {[ticket.authority, ticket.last_seen_at ? new Date(ticket.last_seen_at).toLocaleString() : null].filter(Boolean).join(' · ')}
-                          </Typography>
-                        </Box>
-                      ))}
-                    </Stack>
-                  )}
-                  {focusExamples.length > 0 && (
-                    <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-                      Examples: {focusExamples.join(' · ')}
-                    </Typography>
-                  )}
-                </Box>
               </Box>
 
               <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>

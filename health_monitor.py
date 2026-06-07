@@ -49,9 +49,14 @@ class _SourceState:
     last_event_wall_ts: float = 0.0
     last_health_state: str = "unknown"  # "up" | "down" | "connecting" | "unknown"
     last_error: Optional[str] = None
-    status: str = "unknown"              # derived: "healthy" | "stale" | "down" | "unknown"
+    status: str = "unknown"              # derived: "healthy" | "degraded" | "stale" | "down" | "unknown"
     first_bad_wall_ts: float = 0.0
     last_notified_wall_ts: float = 0.0
+    last_segment_health: str = "unknown"
+    last_segment_path: Optional[str] = None
+    last_segment_written_ts: float = 0.0
+    last_segment_video_packets_per_s: Optional[float] = None
+    last_segment_video_duration_ratio: Optional[float] = None
 
 
 _sources: dict[str, _SourceState] = {}
@@ -72,13 +77,26 @@ def mark_event(topic: str, source: str, payload: dict) -> None:
         s = _get_source_state(source)
         if topic == "segment.written":
             s.last_event_wall_ts = now
+            s.last_segment_written_ts = now
+            s.last_segment_health = str(payload.get("capture_health") or "unknown")
+            s.last_segment_path = payload.get("path") or None
+            try:
+                s.last_segment_video_packets_per_s = float(payload["video_packets_per_s"])
+            except Exception:
+                s.last_segment_video_packets_per_s = None
+            try:
+                wall = float(payload.get("duration_s") or 0.0)
+                video = float(payload.get("video_duration_s") or 0.0)
+                s.last_segment_video_duration_ratio = (video / wall) if wall > 0 else None
+            except Exception:
+                s.last_segment_video_duration_ratio = None
         elif topic == "source.health":
             state = str(payload.get("state") or "unknown")
             s.last_health_state = state
             if state == "up":
                 s.last_event_wall_ts = now
                 s.last_error = None
-            elif state == "down":
+            elif state in ("down", "reconnecting"):
                 s.last_error = str(payload.get("error") or "")
         _recompute_status_locked(s, now)
 
@@ -87,14 +105,18 @@ def _recompute_status_locked(s: _SourceState, now: float) -> None:
     """Derive `status` from the most recent signals."""
     if s.last_health_state == "down":
         new_status = "down"
+    elif s.last_health_state == "reconnecting":
+        new_status = "degraded"
     elif s.last_event_wall_ts == 0.0:
         new_status = "unknown"
     elif (now - s.last_event_wall_ts) > HEALTH_SOURCE_STALE_S:
         new_status = "stale"
+    elif s.last_segment_health not in ("ok", "unknown", ""):
+        new_status = "degraded"
     else:
         new_status = "healthy"
     if new_status != s.status:
-        if new_status in ("down", "stale") and s.first_bad_wall_ts == 0.0:
+        if new_status in ("down", "stale", "degraded") and s.first_bad_wall_ts == 0.0:
             s.first_bad_wall_ts = now
         if new_status == "healthy":
             s.first_bad_wall_ts = 0.0
@@ -126,7 +148,7 @@ def _probe_tick(now: float) -> None:
     with _state_lock:
         for s in _sources.values():
             _recompute_status_locked(s, now)
-            if s.status in ("down", "stale"):
+            if s.status in ("down", "stale", "degraded"):
                 since_last = now - s.last_notified_wall_ts
                 if s.last_notified_wall_ts == 0.0 or since_last >= HEALTH_REPEAT_S:
                     to_notify.append((s, s.status))
@@ -149,6 +171,12 @@ def _dispatch_alert(s: _SourceState, status: str) -> None:
         f"Status: {status}",
         f"Last event: {_fmt_age(time.time() - s.last_event_wall_ts) if s.last_event_wall_ts else 'never'}",
     ]
+    if s.last_segment_health not in ("ok", "unknown", ""):
+        body_lines.append(f"Last segment health: {s.last_segment_health}")
+    if s.last_segment_video_packets_per_s is not None:
+        body_lines.append(f"Last video packets/s: {s.last_segment_video_packets_per_s:.2f}")
+    if s.last_segment_path:
+        body_lines.append(f"Last segment: {s.last_segment_path}")
     if s.last_error:
         body_lines.append(f"Error: {s.last_error}")
     body = "\n".join(body_lines)
@@ -210,12 +238,21 @@ def status() -> dict:
                 "last_event_age_s": round(now - s.last_event_wall_ts, 1) if s.last_event_wall_ts else None,
                 "last_health_state": s.last_health_state,
                 "error": s.last_error,
+                "last_segment_health": s.last_segment_health,
+                "last_segment_path": s.last_segment_path,
+                "last_segment_age_s": round(now - s.last_segment_written_ts, 1) if s.last_segment_written_ts else None,
+                "last_segment_video_packets_per_s": s.last_segment_video_packets_per_s,
+                "last_segment_video_duration_ratio": (
+                    round(s.last_segment_video_duration_ratio, 3)
+                    if s.last_segment_video_duration_ratio is not None
+                    else None
+                ),
             }
     overall = "healthy"
     for info in sources.values():
         if info["status"] == "down":
             overall = "error"; break
-        if info["status"] in ("stale", "unknown") and overall != "error":
+        if info["status"] in ("degraded", "stale", "unknown") and overall != "error":
             overall = "warning"
     return {
         "status": overall,

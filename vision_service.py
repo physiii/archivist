@@ -18,6 +18,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any, Deque, Optional
 
 import numpy as np
@@ -34,6 +35,7 @@ YOLO_IMG_SIZE = int(os.getenv("YOLO_IMG_SIZE", "320"))
 YOLO_DEFAULT_CONF = float(os.getenv("YOLO_DEFAULT_CONF", "0.5"))
 VISION_HISTORY_S = float(os.getenv("VISION_HISTORY_S", "600"))
 VISION_QUEUE_MAX = int(os.getenv("VISION_QUEUE_MAX", "64"))
+VISION_WORKERS = max(1, int(os.getenv("VISION_WORKERS", "1")))
 
 CLIP_ENABLED = (os.getenv("CLIP_ENABLED") or "true").strip().lower() in ("1", "true", "yes", "on")
 CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "ViT-B-32")
@@ -87,6 +89,20 @@ class _SourceState:
 
 _states: dict[str, _SourceState] = {}
 _states_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _VisionJob:
+    source: Source
+    frame: np.ndarray
+    wall_ts: float
+    segment_path: Optional[str]
+
+
+_vision_queue: Queue = Queue(maxsize=VISION_QUEUE_MAX)
+_vision_threads: list[threading.Thread] = []
+_vision_queue_lock = threading.Lock()
+_vision_dropped = 0
 
 
 _yolo_device: str = "cpu"
@@ -384,10 +400,6 @@ def _run_clip_if_due(source: Source, frame_bgr: np.ndarray, wall_ts: float, segm
             pks = getattr(res, "primary_keys", None) or []
             if pks:
                 vec_id = int(pks[0])
-            try:
-                col.flush()
-            except Exception:
-                pass
         except Exception:
             logger.exception("Milvus insert failed for %s", source.id)
     state.last_embed_wall = wall_ts
@@ -495,6 +507,82 @@ def process_frame(
     return published
 
 
+def _vision_worker_loop(worker_id: int) -> None:
+    while True:
+        try:
+            job = _vision_queue.get(timeout=1.0)
+        except Empty:
+            continue
+        try:
+            process_frame(
+                job.source,
+                job.frame,
+                wall_ts=job.wall_ts,
+                segment_path=job.segment_path,
+            )
+        except Exception:
+            logger.exception("async vision worker %d failed for %s", worker_id, job.source.id)
+        finally:
+            _vision_queue.task_done()
+
+
+def _ensure_vision_workers() -> None:
+    with _vision_queue_lock:
+        while len(_vision_threads) < VISION_WORKERS:
+            worker_id = len(_vision_threads) + 1
+            t = threading.Thread(
+                target=_vision_worker_loop,
+                args=(worker_id,),
+                daemon=True,
+                name=f"vision-worker-{worker_id}",
+            )
+            _vision_threads.append(t)
+            t.start()
+            logger.info("started async vision worker %d", worker_id)
+
+
+def enqueue_frame(
+    source: Source,
+    frame: np.ndarray,
+    wall_ts: Optional[float] = None,
+    segment_path: Optional[str] = None,
+) -> bool:
+    """Queue a keyframe for vision work without blocking RTSP ingest."""
+    global _vision_dropped
+    if frame is None or frame.size == 0:
+        return False
+    _ensure_vision_workers()
+    job = _VisionJob(
+        source=source,
+        frame=frame.copy(),
+        wall_ts=time.time() if wall_ts is None else float(wall_ts),
+        segment_path=segment_path,
+    )
+    try:
+        _vision_queue.put_nowait(job)
+        return True
+    except Full:
+        try:
+            _vision_queue.get_nowait()
+            _vision_queue.task_done()
+            _vision_dropped += 1
+        except Empty:
+            pass
+        try:
+            _vision_queue.put_nowait(job)
+            return True
+        except Full:
+            _vision_dropped += 1
+            if _vision_dropped <= 5 or _vision_dropped % 50 == 0:
+                logger.warning(
+                    "dropping vision keyframe for %s: queue full (size=%d dropped=%d)",
+                    source.id,
+                    _vision_queue.qsize(),
+                    _vision_dropped,
+                )
+            return False
+
+
 def search_by_text(query: str, top_k: int = 10, sources: Optional[list[str]] = None) -> list[dict]:
     """Encode text with CLIP, search Milvus collection, return top-k results."""
     vec = clip_embed_text(query)
@@ -563,11 +651,16 @@ def status() -> list[dict]:
         "clip_available": _clip_available,
         "clip_dim": _clip_dim,
         "init_error": _init_error,
+        "queue_size": _vision_queue.qsize(),
+        "queue_max": VISION_QUEUE_MAX,
+        "queue_dropped": _vision_dropped,
+        "workers": len(_vision_threads),
     }]
 
 
 def start() -> None:
     """Initialize YOLO + CLIP eagerly. Safe to call once at boot."""
+    _ensure_vision_workers()
     _init_yolo()
     if CLIP_ENABLED:
         _init_clip()

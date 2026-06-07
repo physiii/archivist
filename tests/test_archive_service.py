@@ -182,3 +182,19 @@ def test_missing_segment_file_cleans_up_stale_sidecar(staged):
     arc.run_archive_pass(backfill=True, dry_run=False)
     # Stale sidecar was cleaned up
     assert not sidecar.exists()
+
+
+def test_optional_keyframe_move_is_idempotent(staged):
+    arc, _local, _kfs, nas, _, _ = staged
+    src = nas / "already_moved.jpg.local"
+    dst = nas / "2026" / "06" / "07" / "office" / "already_moved.jpg"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"frame")
+    dst.write_bytes(b"frame")
+
+    assert arc._move_optional_keyframe(src, dst) == 0
+    assert not src.exists()
+    assert dst.read_bytes() == b"frame"
+
+    assert arc._move_optional_keyframe(src, dst) == 0
